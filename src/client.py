@@ -217,6 +217,7 @@ class ClobClient(ApiClient):
         self.chain_id = chain_id
         self.signature_type = signature_type
         self.funder = funder
+        self.signer_address = ""  # Set after derive_api_key
         self.api_creds = api_creds
         self.builder_creds = builder_creds
 
@@ -281,8 +282,10 @@ class ClobClient(ApiClient):
                     hashlib.sha256
                 ).hexdigest()
 
+            # Use signer (EOA) address for L2 auth - creds are tied to EOA
+            l2_address = self.signer_address or self.funder
             headers.update({
-                "POLY_ADDRESS": self.funder,
+                "POLY_ADDRESS": l2_address,
                 "POLY_API_KEY": self.api_creds.api_key,
                 "POLY_TIMESTAMP": timestamp,
                 "POLY_PASSPHRASE": self.api_creds.passphrase,

@@ -238,6 +238,8 @@ class TradingBot:
             logger.info("Deriving L2 API credentials...")
             self._api_creds = self.clob_client.create_or_derive_api_key(self.signer)
             self.clob_client.set_api_creds(self._api_creds)
+            # Store signer address so L2 auth uses EOA, not safe address
+            self.clob_client.signer_address = self.signer.address
             logger.info("L2 API credentials derived successfully")
         except Exception as e:
             logger.warning(f"Failed to derive API credentials: {e}")
