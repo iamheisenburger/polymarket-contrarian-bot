@@ -41,6 +41,7 @@ credentials/
 
 # Logs and local data
 *.log
+data/
 
 # Node / frontend artifacts (docs examples)
 node_modules/

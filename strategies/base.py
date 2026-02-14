@@ -29,7 +29,7 @@ from typing import Optional, Dict, List
 from lib.console import LogBuffer, log
 from lib.market_manager import MarketManager, MarketInfo
 from lib.price_tracker import PriceTracker
-from lib.position_manager import PositionManager
+from lib.position_manager import PositionManager, Position
 from src.bot import TradingBot
 from src.websocket_client import OrderbookSnapshot
 
@@ -47,6 +47,7 @@ class StrategyConfig:
     # Market settings
     market_check_interval: float = 30.0
     auto_switch_market: bool = True
+    timeframe: str = "15m"  # "5m" or "15m"
 
     # Price tracking
     price_lookback_seconds: int = 10
@@ -84,6 +85,7 @@ class BaseStrategy(ABC):
             coin=config.coin,
             market_check_interval=config.market_check_interval,
             auto_switch_market=config.auto_switch_market,
+            timeframe=config.timeframe,
         )
 
         self.prices = PriceTracker(

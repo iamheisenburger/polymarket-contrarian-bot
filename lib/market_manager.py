@@ -151,6 +151,7 @@ class MarketManager:
         coin: str = "BTC",
         market_check_interval: float = 30.0,
         auto_switch_market: bool = True,
+        timeframe: str = "15m",
     ):
         """
         Initialize market manager.
@@ -159,10 +160,12 @@ class MarketManager:
             coin: Coin symbol (BTC, ETH, SOL, XRP)
             market_check_interval: Seconds between market checks
             auto_switch_market: Auto switch when market changes
+            timeframe: Market timeframe ("5m" or "15m")
         """
         self.coin = coin.upper()
         self.market_check_interval = market_check_interval
         self.auto_switch_market = auto_switch_market
+        self.timeframe = timeframe
 
         # Clients
         self.gamma = GammaClient()
@@ -296,7 +299,7 @@ class MarketManager:
         Returns:
             MarketInfo if found, None otherwise
         """
-        market_data = self.gamma.get_market_info(self.coin)
+        market_data = self.gamma.get_market_info(self.coin, self.timeframe)
 
         if not market_data:
             return None
