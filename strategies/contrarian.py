@@ -54,7 +54,7 @@ class ContrarianConfig(StrategyConfig):
     estimated_win_rate: float = 0.088  # 8.8% from historical data
     starting_bankroll: float = 10.0  # Starting capital in USDC
     min_bet_size: float = 1.00  # Polymarket minimum for marketable orders is $1
-    max_bet_fraction: float = 0.10  # Never risk more than 10% of bankroll per trade
+    max_bet_fraction: float = 1.0  # Kelly is the safety - let it trade until balance runs out
 
     # Rate limiting
     max_trades_per_hour: int = 10
