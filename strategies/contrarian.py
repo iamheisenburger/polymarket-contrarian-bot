@@ -53,7 +53,7 @@ class ContrarianConfig(StrategyConfig):
     kelly_fraction: float = 0.25  # Fractional Kelly (1/4 = conservative)
     estimated_win_rate: float = 0.088  # 8.8% from historical data
     starting_bankroll: float = 10.0  # Starting capital in USDC
-    min_bet_size: float = 0.25  # Minimum bet (Polymarket min ~5 tokens * $0.05)
+    min_bet_size: float = 0.01  # Minimum bet in USDC (Polymarket allows very small orders)
     max_bet_fraction: float = 0.10  # Never risk more than 10% of bankroll per trade
 
     # Rate limiting

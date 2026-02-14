@@ -126,6 +126,12 @@ def main():
         help="Estimated win rate for Kelly sizing (default: 0.088)"
     )
     parser.add_argument(
+        "--min-bet",
+        type=float,
+        default=0.01,
+        help="Minimum bet size in USDC (default: 0.01)"
+    )
+    parser.add_argument(
         "--observe",
         action="store_true",
         help="Observe-only mode - detect opportunities but don't trade"
@@ -190,6 +196,7 @@ def main():
         kelly_fraction=args.kelly,
         estimated_win_rate=args.win_rate,
         starting_bankroll=args.bankroll,
+        min_bet_size=args.min_bet,
     )
 
     # Print configuration
