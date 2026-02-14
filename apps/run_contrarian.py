@@ -128,8 +128,8 @@ def main():
     parser.add_argument(
         "--min-bet",
         type=float,
-        default=0.01,
-        help="Minimum bet size in USDC (default: 0.01)"
+        default=1.0,
+        help="Minimum bet size in USDC (default: 1.0, Polymarket minimum)"
     )
     parser.add_argument(
         "--observe",
