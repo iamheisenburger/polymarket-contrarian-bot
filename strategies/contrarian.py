@@ -295,7 +295,9 @@ class ContrarianStrategy(BaseStrategy):
         if result.success:
             self.log(f"Order filled: {result.order_id}", "success")
 
-            # Log trade
+            # Log trade with current bankroll
+            live_balance = self.bot.get_usdc_balance()
+            current_bankroll = live_balance if live_balance is not None else (self.cc.starting_bankroll + self._daily_pnl)
             self.logger.log_trade(
                 market_slug=market.slug,
                 coin=self.cc.coin,
@@ -304,6 +306,7 @@ class ContrarianStrategy(BaseStrategy):
                 entry_price=price,
                 bet_size_usdc=bet_size,
                 num_tokens=num_tokens,
+                bankroll=current_bankroll,
             )
 
             # Track position (for display purposes)

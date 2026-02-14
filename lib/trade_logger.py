@@ -43,6 +43,7 @@ class TradeRecord:
     outcome: str = "pending"  # "pending", "won", "lost"
     payout: float = 0.0
     pnl: float = 0.0
+    bankroll: float = 0.0
 
 
 @dataclass
@@ -112,7 +113,7 @@ class TradeLogger:
     CSV_HEADERS = [
         "timestamp", "market_slug", "coin", "timeframe", "side",
         "entry_price", "bet_size_usdc", "num_tokens",
-        "outcome", "payout", "pnl",
+        "outcome", "payout", "pnl", "bankroll",
     ]
 
     def __init__(self, filepath: str = "data/trades.csv"):
@@ -180,6 +181,7 @@ class TradeLogger:
         entry_price: float,
         bet_size_usdc: float,
         num_tokens: float,
+        bankroll: float = 0.0,
     ) -> TradeRecord:
         """
         Log a new trade entry.
@@ -205,6 +207,7 @@ class TradeLogger:
             entry_price=entry_price,
             bet_size_usdc=bet_size_usdc,
             num_tokens=num_tokens,
+            bankroll=bankroll,
         )
 
         # Track as pending
@@ -272,6 +275,7 @@ class TradeLogger:
                     record.outcome,
                     f"{record.payout:.2f}",
                     f"{record.pnl:.2f}",
+                    f"{record.bankroll:.2f}",
                 ])
         except Exception:
             pass
