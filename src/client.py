@@ -493,7 +493,7 @@ class ClobClient(ApiClient):
         Submit a signed order.
 
         Args:
-            signed_order: Order with signature
+            signed_order: Order with signature (from OrderSigner.sign_order)
             order_type: Order type (GTC, GTD, FOK)
 
         Returns:
@@ -501,10 +501,10 @@ class ClobClient(ApiClient):
         """
         endpoint = "/order"
 
-        # Build request body
+        # Build request body - order already contains all required fields
         body = {
-            "order": signed_order.get("order", signed_order),
-            "owner": self.funder,
+            "order": signed_order["order"],
+            "owner": signed_order.get("owner", self.funder),
             "orderType": order_type,
         }
 
@@ -512,15 +512,32 @@ class ClobClient(ApiClient):
         if "signature" in signed_order:
             body["signature"] = signed_order["signature"]
 
+        # Use compact JSON for HMAC computation, then send as raw string
+        # to ensure the body matches the HMAC exactly
         body_json = json.dumps(body, separators=(',', ':'))
         headers = self._build_headers("POST", endpoint, body_json)
+        headers["Content-Type"] = "application/json"
 
-        return self._request(
-            "POST",
-            endpoint,
-            data=body,
-            headers=headers
-        )
+        # Send raw string body to match HMAC computation
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        session = self.session
+
+        last_error = None
+        for attempt in range(self.retry_count):
+            try:
+                response = session.post(
+                    url, headers=headers,
+                    data=body_json, timeout=self.timeout
+                )
+                response.raise_for_status()
+                return response.json() if response.text else {}
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                if attempt < self.retry_count - 1:
+                    import time as _time
+                    _time.sleep(2 ** attempt)
+
+        raise ApiError(f"Request failed after {self.retry_count} attempts: {last_error}")
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """

@@ -252,19 +252,24 @@ class OrderSigner:
 
             signed = self.wallet.sign_message(signable)
 
+            # Return order in Polymarket CLOB API format (must match signed EIP-712 data)
             return {
                 "order": {
+                    "salt": str(order_message["salt"]),
+                    "maker": to_checksum_address(order.maker),
+                    "signer": self.address,
+                    "taker": "0x0000000000000000000000000000000000000000",
                     "tokenId": order.token_id,
-                    "price": order.price,
-                    "size": order.size,
-                    "side": order.side,
-                    "maker": order.maker,
-                    "nonce": order.nonce,
-                    "feeRateBps": order.fee_rate_bps,
+                    "makerAmount": order.maker_amount,
+                    "takerAmount": order.taker_amount,
+                    "expiration": "0",
+                    "nonce": str(order.nonce),
+                    "feeRateBps": str(order.fee_rate_bps),
+                    "side": str(order.side_value),
                     "signatureType": order.signature_type,
                 },
                 "signature": "0x" + signed.signature.hex(),
-                "signer": self.address,
+                "owner": to_checksum_address(order.maker),
             }
 
         except Exception as e:
