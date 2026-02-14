@@ -53,7 +53,7 @@ class ContrarianConfig(StrategyConfig):
     kelly_fraction: float = 0.25  # Fractional Kelly (1/4 = conservative)
     estimated_win_rate: float = 0.088  # 8.8% from historical data
     starting_bankroll: float = 10.0  # Starting capital in USDC
-    min_bet_size: float = 0.01  # Minimum bet in USDC (Polymarket allows very small orders)
+    min_bet_size: float = 1.00  # Polymarket minimum for marketable orders is $1
     max_bet_fraction: float = 0.10  # Never risk more than 10% of bankroll per trade
 
     # Rate limiting
@@ -226,14 +226,18 @@ class ContrarianStrategy(BaseStrategy):
         # Bet size = Kelly fraction * bankroll
         bet = kelly_f * bankroll
 
-        # Cap at max_bet_fraction of bankroll
+        # Kelly confirms edge exists — enforce platform minimum ($1)
+        # This bets more than pure Kelly suggests, but it's the Polymarket floor
+        bet = max(bet, self.cc.min_bet_size)
+
+        # Cap at max_bet_fraction of bankroll (hard safety limit)
         max_bet = self.cc.max_bet_fraction * bankroll
         bet = min(bet, max_bet)
 
         # Cap at configured max bet_size
         bet = min(bet, self.cc.bet_size)
 
-        # Floor at minimum bet
+        # Final sanity: if caps pushed bet below minimum, no trade
         if bet < self.cc.min_bet_size:
             return 0.0
 
