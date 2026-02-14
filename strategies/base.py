@@ -220,9 +220,9 @@ class BaseStrategy(ABC):
             self.running = False
             return False
 
-        # Wait for initial data
-        if not await self.market.wait_for_data(timeout=5.0):
-            self.log("Timeout waiting for market data", "warning")
+        # Wait for initial data (longer timeout for first connection)
+        if not await self.market.wait_for_data(timeout=15.0):
+            self.log("Timeout waiting for market data - continuing anyway", "warning")
 
         return True
 
