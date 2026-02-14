@@ -41,6 +41,15 @@ from .signer import OrderSigner, Order
 from .client import ClobClient, RelayerClient, ApiCredentials
 from .crypto import KeyManager, CryptoError, InvalidPasswordError
 
+# Official Polymarket client for order placement
+try:
+    from py_clob_client.client import ClobClient as OfficialClobClient
+    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+    from py_clob_client.order_builder.constants import BUY as CLOB_BUY, SELL as CLOB_SELL
+    HAS_OFFICIAL_CLIENT = True
+except ImportError:
+    HAS_OFFICIAL_CLIENT = False
+
 
 # Configure logging
 logging.basicConfig(
@@ -204,6 +213,11 @@ class TradingBot:
         if self.signer and not self._api_creds:
             self._derive_api_creds()
 
+        # Initialize official Polymarket client for order placement
+        self._official_client = None
+        if HAS_OFFICIAL_CLIENT and self.signer:
+            self._init_official_client()
+
         logger.info(f"TradingBot initialized (gasless: {self.config.use_gasless})")
 
     def _load_encrypted_key(self, filepath: str, password: str) -> None:
@@ -244,6 +258,32 @@ class TradingBot:
         except Exception as e:
             logger.warning(f"Failed to derive API credentials: {e}")
             logger.warning("Some API endpoints may not be accessible")
+
+    def _init_official_client(self) -> None:
+        """Initialize the official py-clob-client for order placement."""
+        if not HAS_OFFICIAL_CLIENT:
+            return
+        try:
+            pk = self.signer.wallet.key.hex()
+            if pk.startswith("0x"):
+                pk = pk[2:]
+            host = self.config.clob.host
+            chain_id = self.config.clob.chain_id
+            funder = self.config.safe_address
+
+            # Init and derive creds
+            temp_client = OfficialClobClient(host, key=pk, chain_id=chain_id)
+            creds = temp_client.create_or_derive_api_creds()
+
+            # Reinit with full auth (signature_type=2 for Gnosis Safe)
+            self._official_client = OfficialClobClient(
+                host, key=pk, chain_id=chain_id,
+                creds=creds, signature_type=2, funder=funder
+            )
+            logger.info("Official py-clob-client initialized for order placement")
+        except Exception as e:
+            logger.warning(f"Failed to initialize official client: {e}")
+            self._official_client = None
 
     def _init_clients(self) -> None:
         """Initialize API clients."""
@@ -297,7 +337,7 @@ class TradingBot:
         fee_rate_bps: int = 0
     ) -> OrderResult:
         """
-        Place a limit order.
+        Place a limit order using the official py-clob-client.
 
         Args:
             token_id: Market token ID
@@ -310,35 +350,41 @@ class TradingBot:
         Returns:
             OrderResult with order status
         """
-        signer = self.require_signer()
+        if not self._official_client:
+            return OrderResult(
+                success=False,
+                message="Official client not initialized"
+            )
 
         try:
-            # Create order
-            order = Order(
-                token_id=token_id,
-                price=price,
-                size=size,
-                side=side,
-                maker=self.config.safe_address,
-                fee_rate_bps=fee_rate_bps,
-            )
+            clob_side = CLOB_BUY if side.upper() == "BUY" else CLOB_SELL
 
-            # Sign order
-            signed = signer.sign_order(order)
-
-            # Submit to CLOB
             response = await self._run_in_thread(
-                self.clob_client.post_order,
-                signed,
-                order_type,
+                self._official_client.create_and_post_order,
+                OrderArgs(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    side=clob_side,
+                ),
+                PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
             )
+
+            success = response.get("success", False)
+            order_id = response.get("orderID", "")
 
             logger.info(
                 f"Order placed: {side} {size}@{price} "
-                f"(token: {token_id[:16]}...)"
+                f"(token: {token_id[:16]}...) -> {order_id[:20]}..."
             )
 
-            return OrderResult.from_response(response)
+            return OrderResult(
+                success=success,
+                order_id=order_id,
+                status=response.get("status", ""),
+                message=response.get("errorMsg", "") if not success else "Order placed",
+                data=response,
+            )
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")

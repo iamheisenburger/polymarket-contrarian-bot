@@ -26,10 +26,8 @@ websockets>=12.0               # WebSocket client for market data
 # Polymarket API Clients (Optional - for advanced usage)
 # =============================================================================
 
-# Official Polymarket clients (uncomment if needed)
-# py-clob-client>=0.1.0
-# py-builder-relayer-client>=0.1.0
-# py-builder-signing-sdk>=0.1.0
+# Official Polymarket client (required for order placement)
+py-clob-client>=0.1.0
 
 # =============================================================================
 # Development & Testing
