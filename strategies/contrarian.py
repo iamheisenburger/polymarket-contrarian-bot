@@ -213,8 +213,12 @@ class ContrarianStrategy(BaseStrategy):
         # Apply fractional Kelly (e.g., 1/4 Kelly)
         kelly_f = full_kelly * self.cc.kelly_fraction
 
-        # Current bankroll = starting capital + session PnL
-        bankroll = self.cc.starting_bankroll + self._daily_pnl
+        # Current bankroll = real USDC balance from Polymarket (or fallback to estimate)
+        live_balance = self.bot.get_usdc_balance()
+        if live_balance is not None:
+            bankroll = live_balance
+        else:
+            bankroll = self.cc.starting_bankroll + self._daily_pnl
 
         if bankroll <= 0:
             return 0.0
@@ -443,7 +447,8 @@ class ContrarianStrategy(BaseStrategy):
                 )
 
         # Risk status with Kelly info
-        bankroll = self.cc.starting_bankroll + self._daily_pnl
+        live_balance = self.bot.get_usdc_balance()
+        bankroll = live_balance if live_balance is not None else (self.cc.starting_bankroll + self._daily_pnl)
         avg_price = (self.cc.min_entry_price + self.cc.max_entry_price) / 2
         kelly_bet = self._kelly_bet_size(avg_price)
         d.add_separator()
