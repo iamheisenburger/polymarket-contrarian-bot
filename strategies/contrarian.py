@@ -270,13 +270,14 @@ class ContrarianStrategy(BaseStrategy):
         """
         self.prices.clear()
         self.vol_tracker.clear()
+        # Clear positions from expired market (they settled)
+        self.positions.clear()
 
         # Check if we had a trade in the old market
         if old_slug in self._traded_slugs:
-            # We can't easily check settlement result from here,
-            # but the position manager tracks PnL. Log as pending
-            # and the trade logger will be updated when we verify.
             self.log(f"Market settled: {old_slug}", "info")
+
+        self.log(f"New market: {new_slug}", "success")
 
     def render_status(self, prices: Dict[str, float]) -> None:
         """Render TUI status display."""
