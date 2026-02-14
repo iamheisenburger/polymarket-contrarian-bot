@@ -98,8 +98,8 @@ def main():
     parser.add_argument(
         "--daily-loss-limit",
         type=float,
-        default=10.0,
-        help="Stop trading after losing this much (default: 10.0)"
+        default=0.0,
+        help="Stop trading after losing this much (0=disabled, default: 0)"
     )
     parser.add_argument(
         "--min-volatility",
@@ -116,8 +116,8 @@ def main():
     parser.add_argument(
         "--kelly",
         type=float,
-        default=0.25,
-        help="Kelly fraction (0.25=quarter Kelly, 0.5=half, 1.0=full) (default: 0.25)"
+        default=0.50,
+        help="Kelly fraction (0.25=quarter Kelly, 0.5=half, 1.0=full) (default: 0.50)"
     )
     parser.add_argument(
         "--win-rate",
@@ -212,7 +212,10 @@ def main():
     print(f"  Max bet size:    ${strategy_config.bet_size:.2f} per trade")
     print(f"  Entry range:     ${strategy_config.min_entry_price:.2f} - ${strategy_config.max_entry_price:.2f}")
     print(f"  Max trades/hr:   {strategy_config.max_trades_per_hour}")
-    print(f"  Daily loss limit: ${strategy_config.daily_loss_limit:.2f}")
+    if strategy_config.daily_loss_limit > 0:
+        print(f"  Daily loss limit: ${strategy_config.daily_loss_limit:.2f}")
+    else:
+        print(f"  Daily loss limit: disabled (Kelly manages risk)")
     print(f"  Trade log:       {strategy_config.log_file}")
     print()
 
@@ -232,7 +235,6 @@ def main():
         print(f"{Colors.YELLOW}  WARNING: This will place REAL trades with REAL money.{Colors.RESET}")
         print(f"  Kelly will size bets dynamically based on bankroll + edge")
         print(f"  Max risk per trade: ${min(strategy_config.bet_size, strategy_config.max_bet_fraction * strategy_config.starting_bankroll):.2f}")
-        print(f"  Max daily risk: ${strategy_config.daily_loss_limit:.2f}")
         print()
 
     # Payout math

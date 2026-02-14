@@ -50,7 +50,7 @@ class ContrarianConfig(StrategyConfig):
     bet_size: float = 1.0  # Max USDC per trade
 
     # Kelly Criterion position sizing
-    kelly_fraction: float = 0.25  # Fractional Kelly (1/4 = conservative)
+    kelly_fraction: float = 0.50  # Fractional Kelly (1/2 = half Kelly)
     estimated_win_rate: float = 0.088  # 8.8% from historical data
     starting_bankroll: float = 10.0  # Starting capital in USDC
     min_bet_size: float = 1.00  # Polymarket minimum for marketable orders is $1
@@ -66,8 +66,8 @@ class ContrarianConfig(StrategyConfig):
     # Observe-only mode (detect but don't execute)
     observe_only: bool = False
 
-    # Daily loss limit
-    daily_loss_limit: float = 10.0  # Stop trading after losing this much
+    # Daily loss limit (0 = disabled)
+    daily_loss_limit: float = 0.0  # Disabled - Kelly Criterion is the risk manager
 
     # Trade log file
     log_file: str = "data/trades.csv"
@@ -111,6 +111,13 @@ class ContrarianStrategy(BaseStrategy):
         # Track which markets we already traded in (don't double-enter)
         self._traded_slugs: set = set()
 
+        # Track trade details per slug for outcome logging
+        # slug -> {side, entry_price, bet_size, num_tokens}
+        self._trade_details: Dict[str, dict] = {}
+
+        # Last known prices (updated every tick, used to determine win/loss on settlement)
+        self._last_prices: Dict[str, float] = {}
+
         # Display
         self._display = StatusDisplay()
 
@@ -133,8 +140,11 @@ class ContrarianStrategy(BaseStrategy):
         if not prices:
             return
 
-        # Check daily loss limit
-        if self._daily_pnl <= -self.cc.daily_loss_limit:
+        # Save last known prices for settlement outcome detection
+        self._last_prices = dict(prices)
+
+        # Check daily loss limit (if enabled)
+        if self.cc.daily_loss_limit > 0 and self._daily_pnl <= -self.cc.daily_loss_limit:
             return
 
         # Check both sides for cheap tokens
@@ -318,6 +328,14 @@ class ContrarianStrategy(BaseStrategy):
                 order_id=result.order_id,
             )
 
+            # Store trade details for outcome logging on settlement
+            self._trade_details[market.slug] = {
+                "side": side,
+                "entry_price": price,
+                "bet_size": bet_size,
+                "num_tokens": num_tokens,
+            }
+
             # Update rate limit tracking
             self._trades_this_hour.append(time.time())
             self._last_trade_time = time.time()
@@ -346,16 +364,20 @@ class ContrarianStrategy(BaseStrategy):
         Handle market expiry.
 
         When a market changes, the old one has settled. We check if
-        we had a position and log the outcome.
+        we had a position and log the outcome using last known prices.
+
+        In binary markets, settlement is clear: the winning side goes to ~$1.00
+        and the losing side goes to ~$0.00. We use the last observed prices
+        (saved every tick) to determine which side won.
         """
+        # Resolve trade outcomes BEFORE clearing state
+        if old_slug in self._trade_details:
+            self._resolve_trade(old_slug)
+
         self.prices.clear()
         self.vol_tracker.clear()
-        # Clear positions from expired market (they settled)
+        self._last_prices.clear()
         self.positions.clear()
-
-        # Check if we had a trade in the old market
-        if old_slug in self._traded_slugs:
-            self.log(f"Market settled: {old_slug}", "info")
 
         # Auto-redeem any winning positions back to USDC
         try:
@@ -366,6 +388,64 @@ class ContrarianStrategy(BaseStrategy):
             self.log(f"Redeem check failed: {e}", "info")
 
         self.log(f"New market: {new_slug}", "success")
+
+    def _resolve_trade(self, slug: str) -> None:
+        """
+        Determine trade outcome and log it.
+
+        Uses last known prices to determine if our side won or lost.
+        In 5-min binary markets, the winning side trends toward $1.00
+        and the losing side toward $0.00 before settlement.
+        """
+        trade = self._trade_details.pop(slug, None)
+        if not trade:
+            return
+
+        side = trade["side"]
+        entry_price = trade["entry_price"]
+        bet_size = trade["bet_size"]
+        num_tokens = trade["num_tokens"]
+
+        # Determine outcome from last known prices
+        # Our side > $0.50 means it's winning (heading to $1.00)
+        our_price = self._last_prices.get(side, 0)
+
+        if our_price > 0.50:
+            # WIN - token settles at $1.00
+            won = True
+            payout = num_tokens * 1.0  # Each token pays $1.00
+            pnl = payout - bet_size
+            self.log(
+                f"WIN: {side.upper()} settled @ $1.00 | "
+                f"Payout: ${payout:.2f} | PnL: +${pnl:.2f} | "
+                f"Entry: ${entry_price:.4f}",
+                "success"
+            )
+        elif our_price > 0:
+            # LOSS - token settles at $0.00
+            won = False
+            payout = 0.0
+            pnl = -bet_size
+            self.log(
+                f"LOSS: {side.upper()} settled @ $0.00 | "
+                f"Lost: ${bet_size:.2f} | Entry: ${entry_price:.4f} | "
+                f"Last seen: ${our_price:.4f}",
+                "info"
+            )
+        else:
+            # No price data - can't determine (shouldn't happen normally)
+            self.log(f"Market settled: {slug} (no price data for outcome)", "warning")
+            return
+
+        # Update daily PnL tracker
+        self._daily_pnl += pnl
+
+        # Log outcome to CSV
+        self.logger.log_outcome(
+            market_slug=slug,
+            won=won,
+            payout=payout,
+        )
 
     def render_status(self, prices: Dict[str, float]) -> None:
         """Render TUI status display."""
@@ -472,8 +552,9 @@ class ContrarianStrategy(BaseStrategy):
             f"Bankroll: ${bankroll:.2f} | "
             f"Next bet ~${kelly_bet:.2f} @ ${avg_price:.2f}"
         )
+        daily_limit_str = f"-${self.cc.daily_loss_limit:.2f} limit" if self.cc.daily_loss_limit > 0 else "no limit"
         d.add_line(
-            f"  Daily PnL: ${self._daily_pnl:+.2f} / -${self.cc.daily_loss_limit:.2f} limit | "
+            f"  Daily PnL: ${self._daily_pnl:+.2f} / {daily_limit_str} | "
             f"Trades/hr: {len(self._trades_this_hour)}/{self.cc.max_trades_per_hour}"
         )
 
