@@ -108,6 +108,24 @@ def main():
         help="Minimum volatility std dev to trade (0=disabled, default: 0)"
     )
     parser.add_argument(
+        "--bankroll",
+        type=float,
+        default=10.0,
+        help="Starting bankroll in USDC (default: 10.0)"
+    )
+    parser.add_argument(
+        "--kelly",
+        type=float,
+        default=0.25,
+        help="Kelly fraction (0.25=quarter Kelly, 0.5=half, 1.0=full) (default: 0.25)"
+    )
+    parser.add_argument(
+        "--win-rate",
+        type=float,
+        default=0.088,
+        help="Estimated win rate for Kelly sizing (default: 0.088)"
+    )
+    parser.add_argument(
         "--observe",
         action="store_true",
         help="Observe-only mode - detect opportunities but don't trade"
@@ -169,6 +187,9 @@ def main():
         log_file=args.log_file,
         market_check_interval=market_check_interval,
         size=args.size,  # base class size
+        kelly_fraction=args.kelly,
+        estimated_win_rate=args.win_rate,
+        starting_bankroll=args.bankroll,
     )
 
     # Print configuration
@@ -181,27 +202,38 @@ def main():
     print(f"  Mode:            {mode_str}")
     print(f"  Coin:            {strategy_config.coin}")
     print(f"  Timeframe:       {strategy_config.timeframe}")
-    print(f"  Bet size:        ${strategy_config.bet_size:.2f} per trade")
+    print(f"  Max bet size:    ${strategy_config.bet_size:.2f} per trade")
     print(f"  Entry range:     ${strategy_config.min_entry_price:.2f} - ${strategy_config.max_entry_price:.2f}")
     print(f"  Max trades/hr:   {strategy_config.max_trades_per_hour}")
     print(f"  Daily loss limit: ${strategy_config.daily_loss_limit:.2f}")
-    print(f"  Volatility filter: {'OFF' if strategy_config.min_volatility <= 0 else f'{strategy_config.min_volatility:.4f}'}")
     print(f"  Trade log:       {strategy_config.log_file}")
+    print()
+
+    # Kelly Criterion info
+    print(f"  Kelly Criterion Sizing:")
+    print(f"    Bankroll:      ${strategy_config.starting_bankroll:.2f}")
+    print(f"    Kelly fraction: {strategy_config.kelly_fraction:.0%} (fractional Kelly)")
+    print(f"    Est. win rate: {strategy_config.estimated_win_rate:.1%}")
+    print(f"    Max per trade: {strategy_config.max_bet_fraction:.0%} of bankroll")
+    avg_entry = (strategy_config.min_entry_price + strategy_config.max_entry_price) / 2
+    kelly_f = strategy_config.kelly_fraction * (strategy_config.estimated_win_rate - avg_entry) / (1 - avg_entry)
+    sample_bet = kelly_f * strategy_config.starting_bankroll
+    print(f"    Sample bet:    ${max(sample_bet, 0):.2f} at ${avg_entry:.2f} entry")
     print()
 
     if not args.observe:
         print(f"{Colors.YELLOW}  WARNING: This will place REAL trades with REAL money.{Colors.RESET}")
-        print(f"  Max risk per trade: ${strategy_config.bet_size:.2f}")
+        print(f"  Kelly will size bets dynamically based on bankroll + edge")
+        print(f"  Max risk per trade: ${min(strategy_config.bet_size, strategy_config.max_bet_fraction * strategy_config.starting_bankroll):.2f}")
         print(f"  Max daily risk: ${strategy_config.daily_loss_limit:.2f}")
         print()
 
     # Payout math
-    avg_entry = (strategy_config.min_entry_price + strategy_config.max_entry_price) / 2
     payout_mult = 1.0 / avg_entry
     breakeven_wr = avg_entry * 100
 
     print(f"  Strategy math (at avg entry ${avg_entry:.2f}):")
-    print(f"    Payout per win: ${strategy_config.bet_size * payout_mult:.2f} ({payout_mult:.0f}x)")
+    print(f"    Payout per win: {payout_mult:.0f}x")
     print(f"    Breakeven win rate: {breakeven_wr:.1f}%")
     print(f"    Expected win rate (data): ~8-15%")
     print()

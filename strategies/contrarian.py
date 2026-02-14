@@ -46,8 +46,15 @@ class ContrarianConfig(StrategyConfig):
     min_entry_price: float = 0.03  # Don't buy below this (too unlikely)
     max_entry_price: float = 0.07  # Don't buy above this (edge decreases)
 
-    # Bet sizing
-    bet_size: float = 1.0  # Fixed USDC per trade
+    # Bet sizing (used as max when Kelly is enabled)
+    bet_size: float = 1.0  # Max USDC per trade
+
+    # Kelly Criterion position sizing
+    kelly_fraction: float = 0.25  # Fractional Kelly (1/4 = conservative)
+    estimated_win_rate: float = 0.088  # 8.8% from historical data
+    starting_bankroll: float = 10.0  # Starting capital in USDC
+    min_bet_size: float = 0.25  # Minimum bet (Polymarket min ~5 tokens * $0.05)
+    max_bet_fraction: float = 0.10  # Never risk more than 10% of bankroll per trade
 
     # Rate limiting
     max_trades_per_hour: int = 10
@@ -180,9 +187,57 @@ class ContrarianStrategy(BaseStrategy):
             else:
                 await self._execute_contrarian_buy(side, execution_price)
 
+    def _kelly_bet_size(self, market_price: float) -> float:
+        """
+        Calculate bet size using fractional Kelly Criterion.
+
+        Formula: F = kelly_fraction * (p - P) / (1 - P)
+        Where:
+            p = estimated probability of winning
+            P = market price (what we pay)
+            F = fraction of bankroll to bet
+
+        Returns:
+            Bet size in USDC, or 0 if no edge.
+        """
+        p = self.cc.estimated_win_rate
+        P = market_price
+
+        # No edge = no bet
+        if p <= P:
+            return 0.0
+
+        # Full Kelly fraction
+        full_kelly = (p - P) / (1 - P)
+
+        # Apply fractional Kelly (e.g., 1/4 Kelly)
+        kelly_f = full_kelly * self.cc.kelly_fraction
+
+        # Current bankroll = starting capital + session PnL
+        bankroll = self.cc.starting_bankroll + self._daily_pnl
+
+        if bankroll <= 0:
+            return 0.0
+
+        # Bet size = Kelly fraction * bankroll
+        bet = kelly_f * bankroll
+
+        # Cap at max_bet_fraction of bankroll
+        max_bet = self.cc.max_bet_fraction * bankroll
+        bet = min(bet, max_bet)
+
+        # Cap at configured max bet_size
+        bet = min(bet, self.cc.bet_size)
+
+        # Floor at minimum bet
+        if bet < self.cc.min_bet_size:
+            return 0.0
+
+        return round(bet, 2)
+
     async def _execute_contrarian_buy(self, side: str, price: float) -> None:
         """
-        Execute a contrarian buy order.
+        Execute a contrarian buy order with Kelly Criterion sizing.
 
         Args:
             side: "up" or "down"
@@ -196,15 +251,29 @@ class ContrarianStrategy(BaseStrategy):
         if not token_id:
             return
 
-        # Calculate token quantity: bet_size / price
-        num_tokens = self.cc.bet_size / price
+        # Calculate Kelly-optimal bet size
+        bet_size = self._kelly_bet_size(price)
+        if bet_size <= 0:
+            self.log(
+                f"Kelly says no bet at ${price:.4f} "
+                f"(edge too small or bankroll depleted)",
+                "info"
+            )
+            return
+
+        # Calculate token quantity
+        num_tokens = bet_size / price
         # Buy price slightly above ask to ensure fill
         buy_price = min(price + 0.01, 0.99)
 
+        # Kelly sizing info
+        bankroll = self.cc.starting_bankroll + self._daily_pnl
+        kelly_pct = (bet_size / bankroll * 100) if bankroll > 0 else 0
+
         self.log(
             f"BUY {side.upper()} @ ${price:.4f} | "
-            f"${self.cc.bet_size:.2f} -> {num_tokens:.1f} tokens | "
-            f"Payout if win: ${num_tokens:.2f}",
+            f"${bet_size:.2f} ({kelly_pct:.1f}% of ${bankroll:.2f}) -> "
+            f"{num_tokens:.1f} tokens | Payout: ${num_tokens:.2f}",
             "trade"
         )
 
@@ -225,7 +294,7 @@ class ContrarianStrategy(BaseStrategy):
                 timeframe=self.cc.timeframe,
                 side=side,
                 entry_price=price,
-                bet_size_usdc=self.cc.bet_size,
+                bet_size_usdc=bet_size,
                 num_tokens=num_tokens,
             )
 
@@ -373,11 +442,18 @@ class ContrarianStrategy(BaseStrategy):
                     f"{trades} trades, {wr:.0f}% win rate ({wins}/{trades})"
                 )
 
-        # Risk status
+        # Risk status with Kelly info
+        bankroll = self.cc.starting_bankroll + self._daily_pnl
+        avg_price = (self.cc.min_entry_price + self.cc.max_entry_price) / 2
+        kelly_bet = self._kelly_bet_size(avg_price)
         d.add_separator()
         d.add_line(
-            f"  Bet size: ${self.cc.bet_size:.2f} | "
-            f"Daily PnL: ${self._daily_pnl:+.2f} / -${self.cc.daily_loss_limit:.2f} limit | "
+            f"  Kelly: {self.cc.kelly_fraction:.0%} frac | "
+            f"Bankroll: ${bankroll:.2f} | "
+            f"Next bet ~${kelly_bet:.2f} @ ${avg_price:.2f}"
+        )
+        d.add_line(
+            f"  Daily PnL: ${self._daily_pnl:+.2f} / -${self.cc.daily_loss_limit:.2f} limit | "
             f"Trades/hr: {len(self._trades_this_hour)}/{self.cc.max_trades_per_hour}"
         )
 
