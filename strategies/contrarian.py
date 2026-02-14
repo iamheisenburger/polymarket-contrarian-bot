@@ -350,6 +350,14 @@ class ContrarianStrategy(BaseStrategy):
         if old_slug in self._traded_slugs:
             self.log(f"Market settled: {old_slug}", "info")
 
+        # Auto-redeem any winning positions back to USDC
+        try:
+            results = self.bot.redeem_all()
+            if results:
+                self.log(f"Auto-redeemed {len(results)} position(s) to USDC", "success")
+        except Exception as e:
+            self.log(f"Redeem check failed: {e}", "info")
+
         self.log(f"New market: {new_slug}", "success")
 
     def render_status(self, prices: Dict[str, float]) -> None:

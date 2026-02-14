@@ -50,6 +50,13 @@ try:
 except ImportError:
     HAS_OFFICIAL_CLIENT = False
 
+# poly-web3 for on-chain operations (redemption)
+try:
+    from poly_web3 import PolyWeb3Service
+    HAS_POLY_WEB3 = True
+except ImportError:
+    HAS_POLY_WEB3 = False
+
 
 # Configure logging
 logging.basicConfig(
@@ -215,6 +222,7 @@ class TradingBot:
 
         # Initialize official Polymarket client for order placement
         self._official_client = None
+        self._web3_service = None
         if HAS_OFFICIAL_CLIENT and self.signer:
             self._init_official_client()
 
@@ -281,9 +289,34 @@ class TradingBot:
                 creds=creds, signature_type=2, funder=funder
             )
             logger.info("Official py-clob-client initialized for order placement")
+
+            # Initialize poly-web3 service for on-chain operations (redemption)
+            if HAS_POLY_WEB3:
+                try:
+                    self._web3_service = PolyWeb3Service(clob_client=self._official_client)
+                    logger.info(f"poly-web3 service initialized ({type(self._web3_service).__name__})")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize poly-web3: {e}")
+                    self._web3_service = None
+            else:
+                self._web3_service = None
+
         except Exception as e:
             logger.warning(f"Failed to initialize official client: {e}")
             self._official_client = None
+
+    def redeem_all(self) -> list:
+        """Redeem all settled winning positions back to USDC."""
+        if not hasattr(self, '_web3_service') or not self._web3_service:
+            return []
+        try:
+            results = self._web3_service.redeem_all(batch_size=10)
+            if results:
+                logger.info(f"Redeemed {len(results)} position(s)")
+            return results
+        except Exception as e:
+            logger.debug(f"Redemption check: {e}")
+            return []
 
     def get_usdc_balance(self) -> Optional[float]:
         """Query actual USDC balance from Polymarket."""
