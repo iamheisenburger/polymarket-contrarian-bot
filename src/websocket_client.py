@@ -478,12 +478,23 @@ class MarketWebSocket:
     async def _run_loop(self) -> None:
         """Main message processing loop."""
         msg_count = 0
+        empty_count = 0  # Track consecutive empty/bad messages
+        MAX_EMPTY_BEFORE_RECONNECT = 10  # Force reconnect after this many
         while self._running and self.is_connected:
             try:
                 message = await asyncio.wait_for(
                     self._ws.recv(),
                     timeout=self.ping_interval + 5
                 )
+
+                # Skip empty messages (Polymarket sends these on market transitions)
+                if not message or not message.strip():
+                    empty_count += 1
+                    if empty_count >= MAX_EMPTY_BEFORE_RECONNECT:
+                        logger.warning(f"Got {empty_count} consecutive empty messages, forcing reconnect")
+                        break
+                    continue
+
                 msg_count += 1
 
                 # Log first 5 messages, then every 1000
@@ -491,6 +502,9 @@ class MarketWebSocket:
                     logger.info(f"WS message #{msg_count}: {message[:200] if len(message) > 200 else message}")
 
                 data = json.loads(message)
+
+                # Reset empty counter on successful parse
+                empty_count = 0
 
                 # Handle array of messages
                 if isinstance(data, list):
@@ -501,11 +515,19 @@ class MarketWebSocket:
 
             except asyncio.TimeoutError:
                 logger.warning("WebSocket receive timeout")
+                empty_count += 1
+                if empty_count >= MAX_EMPTY_BEFORE_RECONNECT:
+                    logger.warning(f"Too many timeouts ({empty_count}), forcing reconnect")
+                    break
             except self._connection_closed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 break
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse message: {e}")
+                empty_count += 1
+                if empty_count >= MAX_EMPTY_BEFORE_RECONNECT:
+                    logger.warning(f"Too many parse failures ({empty_count}), forcing reconnect")
+                    break
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 if self._on_error:
