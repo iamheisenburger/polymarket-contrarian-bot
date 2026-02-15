@@ -297,15 +297,16 @@ class TradingBot:
             if HAS_POLY_WEB3:
                 try:
                     # Build the RelayClient that poly-web3 needs for Safe redemptions
+                    # Use the CLOB-derived API creds as builder creds (same format)
                     poly_relay = None
-                    if self.config.use_gasless and self.config.builder:
-                        builder_creds = BuilderApiKeyCreds(
-                            key=self.config.builder.api_key,
-                            secret=self.config.builder.api_secret,
-                            passphrase=self.config.builder.api_passphrase,
+                    if creds:
+                        api_creds = BuilderApiKeyCreds(
+                            key=creds.api_key,
+                            secret=creds.api_secret,
+                            passphrase=creds.api_passphrase,
                         )
                         poly_builder_cfg = PolyBuilderConfig(
-                            local_builder_creds=builder_creds,
+                            local_builder_creds=api_creds,
                         )
                         poly_relay = PolyRelayClient(
                             relayer_url="https://relayer-v2.polymarket.com",
