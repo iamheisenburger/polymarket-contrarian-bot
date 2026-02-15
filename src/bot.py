@@ -53,6 +53,9 @@ except ImportError:
 # poly-web3 for on-chain operations (redemption)
 try:
     from poly_web3 import PolyWeb3Service
+    from py_builder_relayer_client.client import RelayClient as PolyRelayClient
+    from py_builder_signing_sdk.config import BuilderConfig as PolyBuilderConfig
+    from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
     HAS_POLY_WEB3 = True
 except ImportError:
     HAS_POLY_WEB3 = False
@@ -293,7 +296,29 @@ class TradingBot:
             # Initialize poly-web3 service for on-chain operations (redemption)
             if HAS_POLY_WEB3:
                 try:
-                    self._web3_service = PolyWeb3Service(clob_client=self._official_client)
+                    # Build the RelayClient that poly-web3 needs for Safe redemptions
+                    poly_relay = None
+                    if self.config.use_gasless and self.config.builder:
+                        builder_creds = BuilderApiKeyCreds(
+                            key=self.config.builder.api_key,
+                            secret=self.config.builder.api_secret,
+                            passphrase=self.config.builder.api_passphrase,
+                        )
+                        poly_builder_cfg = PolyBuilderConfig(
+                            local_builder_creds=builder_creds,
+                        )
+                        poly_relay = PolyRelayClient(
+                            relayer_url="https://relayer-v2.polymarket.com",
+                            chain_id=chain_id,
+                            private_key=pk,
+                            builder_config=poly_builder_cfg,
+                        )
+                        logger.info("poly-web3 RelayClient created for redemption")
+
+                    self._web3_service = PolyWeb3Service(
+                        clob_client=self._official_client,
+                        relayer_client=poly_relay,
+                    )
                     logger.info(f"poly-web3 service initialized ({type(self._web3_service).__name__})")
                 except Exception as e:
                     logger.warning(f"Failed to initialize poly-web3: {e}")
