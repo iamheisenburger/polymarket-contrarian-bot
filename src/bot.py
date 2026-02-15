@@ -296,14 +296,17 @@ class TradingBot:
             # Initialize poly-web3 service for on-chain operations (redemption)
             if HAS_POLY_WEB3:
                 try:
-                    # Build the RelayClient that poly-web3 needs for Safe redemptions
-                    # Use the CLOB-derived API creds as builder creds (same format)
+                    # Build the RelayClient using Builder Program credentials
                     poly_relay = None
-                    if creds:
+                    builder_key = os.environ.get("POLY_BUILDER_API_KEY")
+                    builder_secret = os.environ.get("POLY_BUILDER_API_SECRET")
+                    builder_passphrase = os.environ.get("POLY_BUILDER_API_PASSPHRASE")
+
+                    if builder_key and builder_secret and builder_passphrase:
                         api_creds = BuilderApiKeyCreds(
-                            key=creds.api_key,
-                            secret=creds.api_secret,
-                            passphrase=creds.api_passphrase,
+                            key=builder_key,
+                            secret=builder_secret,
+                            passphrase=builder_passphrase,
                         )
                         poly_builder_cfg = PolyBuilderConfig(
                             local_builder_creds=api_creds,
@@ -314,7 +317,9 @@ class TradingBot:
                             private_key=pk,
                             builder_config=poly_builder_cfg,
                         )
-                        logger.info("poly-web3 RelayClient created for redemption")
+                        logger.info("poly-web3 RelayClient created with Builder credentials")
+                    else:
+                        logger.warning("Builder API credentials not found - auto-redemption disabled")
 
                     self._web3_service = PolyWeb3Service(
                         clob_client=self._official_client,
