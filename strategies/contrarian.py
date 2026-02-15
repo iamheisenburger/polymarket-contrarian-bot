@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
 from lib.console import Colors, format_countdown, StatusDisplay
+from lib.price_feed import PriceFeed
 from lib.trade_logger import TradeLogger
 from lib.volatility_tracker import VolatilityTracker
 from strategies.base import BaseStrategy, StrategyConfig
@@ -97,6 +98,9 @@ class ContrarianStrategy(BaseStrategy):
 
         # Volatility tracker
         self.vol_tracker = VolatilityTracker(window_seconds=1800)
+
+        # BTC spot price feed (for trade logging / regime analysis)
+        self.price_feed = PriceFeed(symbol=f"{config.coin}USDT")
 
         # Rate limiting state
         self._trades_this_hour: List[float] = []
@@ -305,9 +309,10 @@ class ContrarianStrategy(BaseStrategy):
         if result.success:
             self.log(f"Order filled: {result.order_id}", "success")
 
-            # Log trade with current bankroll
+            # Log trade with current bankroll and enriched data
             live_balance = self.bot.get_usdc_balance()
             current_bankroll = live_balance if live_balance is not None else (self.cc.starting_bankroll + self._daily_pnl)
+            other_side = "down" if side == "up" else "up"
             self.logger.log_trade(
                 market_slug=market.slug,
                 coin=self.cc.coin,
@@ -317,6 +322,9 @@ class ContrarianStrategy(BaseStrategy):
                 bet_size_usdc=bet_size,
                 num_tokens=num_tokens,
                 bankroll=current_bankroll,
+                btc_price=self.price_feed.get_price(),
+                other_side_price=self._last_prices.get(other_side, 0.0),
+                volatility_std=self.vol_tracker.get_std_dev(),
             )
 
             # Track position (for display purposes)

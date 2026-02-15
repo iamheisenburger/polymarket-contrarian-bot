@@ -44,6 +44,9 @@ class TradeRecord:
     payout: float = 0.0
     pnl: float = 0.0
     bankroll: float = 0.0
+    btc_price: float = 0.0
+    other_side_price: float = 0.0
+    volatility_std: float = 0.0
 
 
 @dataclass
@@ -114,6 +117,7 @@ class TradeLogger:
         "timestamp", "market_slug", "coin", "timeframe", "side",
         "entry_price", "bet_size_usdc", "num_tokens",
         "outcome", "payout", "pnl", "bankroll",
+        "btc_price", "other_side_price", "volatility_std",
     ]
 
     def __init__(self, filepath: str = "data/trades.csv"):
@@ -182,6 +186,9 @@ class TradeLogger:
         bet_size_usdc: float,
         num_tokens: float,
         bankroll: float = 0.0,
+        btc_price: float = 0.0,
+        other_side_price: float = 0.0,
+        volatility_std: float = 0.0,
     ) -> TradeRecord:
         """
         Log a new trade entry.
@@ -208,6 +215,9 @@ class TradeLogger:
             bet_size_usdc=bet_size_usdc,
             num_tokens=num_tokens,
             bankroll=bankroll,
+            btc_price=btc_price,
+            other_side_price=other_side_price,
+            volatility_std=volatility_std,
         )
 
         # Track as pending
@@ -276,6 +286,9 @@ class TradeLogger:
                     f"{record.payout:.2f}",
                     f"{record.pnl:.2f}",
                     f"{record.bankroll:.2f}",
+                    f"{record.btc_price:.2f}",
+                    f"{record.other_side_price:.4f}",
+                    f"{record.volatility_std:.6f}",
                 ])
         except Exception:
             pass
