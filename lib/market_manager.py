@@ -409,10 +409,13 @@ class MarketManager:
             self._update_current_market(market)
 
             # Fire market change callbacks in main thread
-            if old_slug and old_slug != market.slug:
+            # Use empty string for old_slug on first discovery so strategy
+            # can set startup_slug protection for the coin.
+            effective_old_slug = old_slug or ""
+            if effective_old_slug != market.slug:
                 for callback in self._on_market_change_callbacks:
                     try:
-                        callback(old_slug, market.slug)
+                        callback(effective_old_slug, market.slug)
                     except Exception:
                         pass
 
