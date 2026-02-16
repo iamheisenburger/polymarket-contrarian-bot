@@ -197,6 +197,10 @@ class MomentumSniperStrategy:
         # Log buffer for display
         self._log_buffer = LogBuffer(max_size=8)
 
+        # Redemption tracking
+        self._last_redeem_time: float = 0.0
+        self._redeem_interval: float = 60.0  # Check every 60 seconds
+
         # Running state
         self.running = False
 
@@ -579,6 +583,45 @@ class MomentumSniperStrategy:
             self.log(f"Order failed ({state.coin} {side}): {result.message}", "error")
             return False
 
+    def _determine_winner(self, state: CoinMarketState, old_slug: str) -> Optional[str]:
+        """
+        Determine the winning side of a settled market.
+
+        Primary: Query Gamma API for actual outcomePrices (authoritative).
+        Fallback: Compare Binance spot price to strike price.
+        """
+        # Primary: Gamma API resolution
+        if old_slug:
+            try:
+                market_data = state.manager.gamma.get_market_by_slug(old_slug)
+                if market_data:
+                    prices = state.manager.gamma.parse_prices(market_data)
+                    up_price = prices.get("up", 0)
+                    down_price = prices.get("down", 0)
+
+                    # After resolution, winning side price → 1.0, losing → 0.0
+                    if up_price > 0.9:
+                        self.log(f"{state.coin} Gamma API: UP won (up={up_price:.2f})")
+                        return "up"
+                    elif down_price > 0.9:
+                        self.log(f"{state.coin} Gamma API: DOWN won (down={down_price:.2f})")
+                        return "down"
+                    # Market not yet fully resolved in API — fall through to spot
+            except Exception as e:
+                self.log(f"{state.coin} Gamma API check failed: {e}", "warning")
+
+        # Fallback: Binance spot vs strike
+        spot = self.binance.get_price(state.coin)
+        if spot > 0 and state.strike_price > 0:
+            winner = "up" if spot >= state.strike_price else "down"
+            self.log(
+                f"{state.coin} spot fallback: {winner.upper()} "
+                f"(spot=${spot:,.2f} vs strike=${state.strike_price:,.2f})"
+            )
+            return winner
+
+        return None
+
     def _handle_market_change(self, coin: str, old_slug: str, new_slug: str):
         """Handle market settlement and transition."""
         state = self.coin_states.get(coin)
@@ -587,13 +630,9 @@ class MomentumSniperStrategy:
 
         # Settle positions
         if state.up_tokens > 0 or state.down_tokens > 0:
-            # Determine winner from last known prices
-            up_price = state.last_up_price
-            down_price = state.last_down_price
+            winning_side = self._determine_winner(state, old_slug)
 
-            if up_price > 0 or down_price > 0:
-                winning_side = "up" if up_price > 0.50 else "down"
-
+            if winning_side:
                 # Calculate PnL
                 if winning_side == "up":
                     pnl = state.up_tokens * 1.0 - state.up_cost - state.down_cost
@@ -625,14 +664,8 @@ class MomentumSniperStrategy:
                     f"Session: ${self.stats.realized_pnl:+.2f}",
                     "success" if pnl >= 0 else "warning"
                 )
-
-        # Auto-redeem winning tokens
-        try:
-            results = self.bot.redeem_all()
-            if results:
-                self.log(f"Redeemed {len(results)} position(s)", "success")
-        except Exception as e:
-            self.log(f"Redeem: {e}", "info")
+            else:
+                self.log(f"WARNING: Could not determine winner for {coin} {old_slug}", "error")
 
         # Refresh balance
         self._last_balance_check = 0
@@ -660,8 +693,37 @@ class MomentumSniperStrategy:
         except RuntimeError:
             self._set_strike(state)
 
+    def _periodic_redeem(self):
+        """Periodically attempt to redeem settled winning positions.
+
+        The UMA oracle takes minutes to resolve markets after they expire.
+        Calling redeem_all() only on market change is too early — the market
+        isn't resolved yet. This periodic check catches them once the oracle
+        has reported payouts.
+        """
+        now = time.time()
+        if now - self._last_redeem_time < self._redeem_interval:
+            return
+        self._last_redeem_time = now
+
+        if self.config.observe_only:
+            return
+
+        try:
+            results = self.bot.redeem_all()
+            if results:
+                self.log(f"Redeemed {len(results)} position(s) to USDC", "success")
+                # Refresh balance after successful redemption
+                self._last_balance_check = 0
+                self._refresh_balance()
+        except Exception as e:
+            self.log(f"Periodic redeem failed: {e}", "warning")
+
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
+        # Periodic redemption of settled winning positions
+        self._periodic_redeem()
+
         # Update last known prices for all coins
         for coin, state in self.coin_states.items():
             up = state.manager.get_mid_price("up")

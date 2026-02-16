@@ -346,7 +346,7 @@ class TradingBot:
                 logger.info(f"Redeemed {len(results)} position(s)")
             return results
         except Exception as e:
-            logger.debug(f"Redemption check: {e}")
+            logger.warning(f"Redemption failed: {e}")
             return []
 
     def get_usdc_balance(self) -> Optional[float]:
