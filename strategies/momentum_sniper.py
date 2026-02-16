@@ -403,10 +403,15 @@ class MomentumSniperStrategy:
             if not fv:
                 continue
 
-            # Check both sides — no restriction on having existing positions.
-            # If edge exists on a side we already hold, Kelly will size
-            # the additional bet correctly against our available balance.
+            # Check both sides — one entry per side per market.
+            # Buying BTC UP 5 times at $0.57 in the same market is the
+            # same trade repeated, not 5 different opportunities.
             for side in ["up", "down"]:
+                if side == "up" and state.has_up_position:
+                    continue
+                if side == "down" and state.has_down_position:
+                    continue
+
                 fair_prob = fv.fair_up if side == "up" else fv.fair_down
 
                 # Get best ask (cheapest price we can buy at)
