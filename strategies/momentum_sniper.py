@@ -200,9 +200,9 @@ class MomentumSniperStrategy:
         self._log_buffer.add(msg, level)
 
     def _refresh_balance(self):
-        """Query USDC balance (rate-limited to every 60s)."""
+        """Query USDC balance (rate-limited to every 10s)."""
         now = time.time()
-        if now - self._last_balance_check < 60:
+        if now - self._last_balance_check < 10:
             return
         self._last_balance_check = now
         bal = self.bot.get_usdc_balance()
@@ -210,9 +210,13 @@ class MomentumSniperStrategy:
             self._balance = bal
 
     def _available_balance(self) -> float:
-        """USDC available for new trades (balance minus positions)."""
-        tied_up = sum(s.total_cost for s in self.coin_states.values())
-        return max(0, self._balance - tied_up)
+        """USDC available for new trades.
+
+        After each trade, we deduct cost from self._balance immediately,
+        so no need to subtract tied_up (that would double-count).
+        On-chain refresh also reflects spent USDC, keeping things in sync.
+        """
+        return max(0, self._balance)
 
     async def start(self) -> bool:
         """Start the strategy: Binance feed + market managers for each coin."""
@@ -438,8 +442,9 @@ class MomentumSniperStrategy:
                     if avg_up_price + best_ask >= 1.0:
                         continue  # Would guarantee a loss
 
-                # Calculate edge: how much cheaper than fair value
-                edge = fair_prob - best_ask
+                # Calculate edge using actual buy price (we pay ask + 1 cent for fill)
+                buy_price = min(round(best_ask + 0.01, 2), 0.99)
+                edge = fair_prob - buy_price
 
                 if edge >= self.config.min_edge:
                     opportunities.append((state, side, best_ask, edge, fv))
@@ -475,9 +480,10 @@ class MomentumSniperStrategy:
         if bet_usdc < self.config.min_bet_usdc:
             return False
 
-        # Calculate token count
+        # Calculate token count (Polymarket minimum is 5 tokens)
         num_tokens = round(bet_usdc / entry_price, 2)
-        if num_tokens < 1.0:
+        if num_tokens < 5.0:
+            # Not enough for Polymarket minimum order size
             return False
 
         # Get token ID
@@ -497,6 +503,10 @@ class MomentumSniperStrategy:
 
         if result.success:
             actual_cost = buy_price * num_tokens
+
+            # Immediately deduct from balance so next Kelly calculation
+            # sees the correct available capital (no stale balance)
+            self._balance -= actual_cost
 
             # Record position
             if side == "up":
