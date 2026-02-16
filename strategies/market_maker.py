@@ -839,7 +839,7 @@ class MarketMakerStrategy(BaseStrategy):
         lines.append(f"{'=' * 60}")
 
         # Recent log messages
-        for msg in self._log_buffer.messages[-3:]:
+        for msg in self._log_buffer.get_messages()[-3:]:
             lines.append(f"  {msg}")
 
         output = "\n".join(lines)
