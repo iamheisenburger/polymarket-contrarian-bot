@@ -143,8 +143,8 @@ class LagCollector:
 
                 assets = list(self.token_ids.values())
                 subscribe_msg = {
-                    "type": "Market",
                     "assets_ids": assets,
+                    "type": "MARKET",
                 }
 
                 async with websockets.connect(CLOB_WS) as ws:
