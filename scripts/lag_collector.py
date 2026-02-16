@@ -67,42 +67,51 @@ class LagCollector:
             self.csv_writer.writerow(CSV_HEADERS)
 
     def _find_active_market(self):
-        """Find the current active BTC 5-min up/down market."""
+        """Find the current active BTC 5-min up/down market via slug pattern."""
         try:
-            resp = requests.get(f"{GAMMA_API}/markets", params={
-                "active": "true",
-                "closed": "false",
-                "limit": 100,
-                "tag": "crypto",
-            }, timeout=10)
-            for m in resp.json():
-                q = m.get("question", "").lower()
-                slug = m.get("slug", "")
-                if "btc" in q and ("5" in q or "five" in q) and ("up" in q or "down" in q):
-                    self.current_market_slug = slug
-                    end = m.get("endDate", "")
-                    if end:
-                        try:
-                            self.market_end_time = datetime.fromisoformat(
-                                end.replace("Z", "+00:00")
-                            ).timestamp()
-                        except Exception:
-                            pass
-                    print(f"Found market: {slug}")
+            now = datetime.now(timezone.utc)
+            minute = (now.minute // 5) * 5
+            current_window = now.replace(minute=minute, second=0, microsecond=0)
+            current_ts = int(current_window.timestamp())
 
-                    clob_ids = m.get("clobTokenIds", "")
-                    outcomes_raw = m.get("outcomes", "[]")
-                    if clob_ids:
-                        try:
-                            ids = json.loads(clob_ids)
-                            outcomes = json.loads(outcomes_raw)
-                            self.token_ids = {
-                                o.lower(): tid for o, tid in zip(outcomes, ids)
-                            }
-                        except Exception:
-                            self.token_ids = {}
-                    print(f"Token IDs: {list(self.token_ids.keys())}")
-                    return
+            # Try current, next, and previous 5-min windows
+            for offset in [0, 300, -300]:
+                ts = current_ts + offset
+                slug = f"btc-updown-5m-{ts}"
+                resp = requests.get(
+                    f"{GAMMA_API}/markets/{slug}",
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    continue
+                m = resp.json()
+                if not m.get("acceptingOrders"):
+                    continue
+
+                self.current_market_slug = slug
+                end = m.get("endDate", "")
+                if end:
+                    try:
+                        self.market_end_time = datetime.fromisoformat(
+                            end.replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        self.market_end_time = ts + 300
+
+                clob_ids = m.get("clobTokenIds", "")
+                outcomes_raw = m.get("outcomes", "[]")
+                if clob_ids:
+                    try:
+                        ids = json.loads(clob_ids)
+                        outcomes = json.loads(outcomes_raw)
+                        self.token_ids = {
+                            o.lower(): tid for o, tid in zip(outcomes, ids)
+                        }
+                    except Exception:
+                        self.token_ids = {}
+                print(f"Found market: {slug} | tokens: {list(self.token_ids.keys())}")
+                return
+
             print("No active BTC 5-min market found, will retry...")
         except Exception as e:
             print(f"Error finding market: {e}")
