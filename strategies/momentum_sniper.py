@@ -103,6 +103,7 @@ class CoinMarketState:
     # Timing
     last_trade_time: float = 0.0
     market_start_time: float = 0.0
+    last_fail_time: Dict[str, float] = field(default_factory=dict)  # side -> timestamp
 
     # Startup safety: skip the market that was active when bot started.
     # Only trade on markets the bot saw freshly transition to.
@@ -139,6 +140,7 @@ class CoinMarketState:
         self.down_tokens = 0.0
         self.up_cost = 0.0
         self.down_cost = 0.0
+        self.last_fail_time.clear()
 
 
 @dataclass
@@ -462,6 +464,11 @@ class MomentumSniperStrategy:
                 if side == "down" and state.has_down_position:
                     continue
 
+                # Skip if recently failed (60s cooldown to prevent retry spam)
+                fail_time = state.last_fail_time.get(side, 0)
+                if fail_time > 0 and (time.time() - fail_time) < 60:
+                    continue
+
                 fair_prob = fv.fair_up if side == "up" else fv.fair_down
 
                 # Get best ask (cheapest price we can buy at)
@@ -527,6 +534,9 @@ class MomentumSniperStrategy:
             # Cheapest way to get data on whether the edge is real.
             num_tokens = 5.0
             bet_usdc = num_tokens * entry_price
+            # Polymarket rejects orders below $1.00 USDC
+            if bet_usdc < 1.0:
+                return False
             if bet_usdc > self._available_balance():
                 return False
         else:
@@ -608,6 +618,8 @@ class MomentumSniperStrategy:
             return True
         else:
             self.log(f"Order failed ({state.coin} {side}): {result.message}", "error")
+            # Cooldown: don't retry this coin/side for 60 seconds
+            state.last_fail_time[side] = time.time()
             return False
 
     def _determine_winner(self, state: CoinMarketState, old_slug: str) -> Optional[str]:
