@@ -326,6 +326,20 @@ class MarketWebSocket:
             if self._on_disconnect:
                 self._on_disconnect()
 
+    async def force_reconnect(self) -> None:
+        """Force close the connection to trigger auto-reconnect in run loop.
+
+        Unlike disconnect(), this keeps _running=True so the run() loop
+        will reconnect and re-subscribe to current _subscribed_assets.
+        """
+        logger.info("Force reconnecting WebSocket...")
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
     async def subscribe(self, asset_ids: List[str], replace: bool = False) -> bool:
         """
         Subscribe to market data for assets.
@@ -676,6 +690,10 @@ class OrderbookManager:
     async def unsubscribe(self, asset_ids: List[str]) -> bool:
         """Unsubscribe from assets."""
         return await self._ws.unsubscribe(asset_ids)
+
+    async def force_reconnect(self) -> None:
+        """Force reconnect the underlying websocket."""
+        await self._ws.force_reconnect()
 
     def stop(self) -> None:
         """Stop the manager."""

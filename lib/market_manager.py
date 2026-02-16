@@ -400,8 +400,12 @@ class MarketManager:
             if not self._should_switch_market(old_market, market):
                 continue
 
-            # Market changed - resubscribe to new tokens
+            # Market changed - force reconnect and resubscribe to new tokens.
+            # Polymarket websockets break on market transitions (garbled messages,
+            # then timeouts). Simply sending a subscribe on the dead connection
+            # doesn't work. We must close and reconnect.
             await self.ws.subscribe(list(new_tokens), replace=True)
+            await self.ws.force_reconnect()
             self._update_current_market(market)
 
             # Fire market change callbacks in main thread
