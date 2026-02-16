@@ -323,8 +323,15 @@ class MomentumSniperStrategy:
         else:
             state.strike_price = spot
 
+        # Format strike with appropriate precision
+        if state.strike_price < 10:
+            strike_str = f"${state.strike_price:,.4f}"
+        elif state.strike_price < 1000:
+            strike_str = f"${state.strike_price:,.2f}"
+        else:
+            strike_str = f"${state.strike_price:,.0f}"
         self.log(
-            f"{state.coin} strike: ${state.strike_price:,.0f} | "
+            f"{state.coin} strike: {strike_str} | "
             f"expiry: {state.seconds_to_expiry():.0f}s"
         )
 
@@ -709,9 +716,15 @@ class MomentumSniperStrategy:
             up_ask = state.manager.get_best_ask("up")
             down_ask = state.manager.get_best_ask("down")
 
-            waiting = " [WAITING]" if state.current_slug == state.startup_slug else ""
+            waiting = " [WAITING]" if (not state.startup_slug or state.current_slug == state.startup_slug) else ""
+            if state.strike_price < 10:
+                strike_fmt = f"${state.strike_price:>,.4f}"
+            elif state.strike_price < 1000:
+                strike_fmt = f"${state.strike_price:>,.2f}"
+            else:
+                strike_fmt = f"${state.strike_price:>,.0f}"
             lines.append(f"  {coin}  ${spot:>10,.2f}  vol={vol*100:.0f}%  "
-                         f"strike=${state.strike_price:>,.0f}  "
+                         f"strike={strike_fmt}  "
                          f"expiry={mins}m{s:02d}s{waiting}")
 
             if fv:
