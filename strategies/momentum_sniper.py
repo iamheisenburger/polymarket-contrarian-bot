@@ -409,7 +409,8 @@ class MomentumSniperStrategy:
 
             # Never trade on the market that was active at startup.
             # We might have unknown positions from a previous run.
-            if state.current_slug == state.startup_slug:
+            # Also skip if startup_slug was never set (coin discovered late).
+            if not state.startup_slug or state.current_slug == state.startup_slug:
                 continue
 
             # Only skip if market is literally expired (0 seconds left)
@@ -557,7 +558,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
             )
 
-            kelly_pct = (actual_cost / self._available_balance() * 100) if self._available_balance() > 0 else 0
+            kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
             strength = "STRONG" if is_strong else "NORMAL"
 
             self.log(
@@ -635,6 +636,12 @@ class MomentumSniperStrategy:
         state.last_up_price = 0.0
         state.last_down_price = 0.0
         self.stats.markets_seen += 1
+
+        # If startup_slug was never set (coin wasn't discovered at boot),
+        # treat this first-discovered market as the startup market — skip it.
+        if not state.startup_slug:
+            state.startup_slug = new_slug
+            self.log(f"{coin} first discovery: {new_slug} (skipping — treat as startup)", "warning")
 
         # Set new strike (delay to let data arrive)
         state.current_slug = new_slug
