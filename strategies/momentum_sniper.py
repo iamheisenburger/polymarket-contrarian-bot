@@ -102,6 +102,10 @@ class CoinMarketState:
     last_trade_time: float = 0.0
     market_start_time: float = 0.0
 
+    # Startup safety: skip the market that was active when bot started.
+    # Only trade on markets the bot saw freshly transition to.
+    startup_slug: str = ""  # The slug active at boot — never trade on this
+
     # Last known prices (for settlement)
     last_up_price: float = 0.0
     last_down_price: float = 0.0
@@ -261,7 +265,12 @@ class MomentumSniperStrategy:
 
             # Set initial strike
             self._set_strike(state)
-            self.log(f"{coin} market ready: {state.current_slug}", "success")
+
+            # Mark this as the startup market — we will NOT trade on it.
+            # We might have positions from a previous run on this market.
+            # Only trade on markets we see freshly transition to.
+            state.startup_slug = state.current_slug
+            self.log(f"{coin} market ready: {state.current_slug} (skipping until next cycle)", "success")
 
         if not any(s.current_slug for s in self.coin_states.values()):
             self.log("No markets found for any coin", "error")
@@ -396,6 +405,11 @@ class MomentumSniperStrategy:
 
         for coin, state in self.coin_states.items():
             if not state.current_slug:
+                continue
+
+            # Never trade on the market that was active at startup.
+            # We might have unknown positions from a previous run.
+            if state.current_slug == state.startup_slug:
                 continue
 
             # Only skip if market is literally expired (0 seconds left)
@@ -688,9 +702,10 @@ class MomentumSniperStrategy:
             up_ask = state.manager.get_best_ask("up")
             down_ask = state.manager.get_best_ask("down")
 
+            waiting = " [WAITING]" if state.current_slug == state.startup_slug else ""
             lines.append(f"  {coin}  ${spot:>10,.2f}  vol={vol*100:.0f}%  "
                          f"strike=${state.strike_price:>,.0f}  "
-                         f"expiry={mins}m{s:02d}s")
+                         f"expiry={mins}m{s:02d}s{waiting}")
 
             if fv:
                 up_edge = fv.fair_up - up_ask if up_ask > 0 else 0
