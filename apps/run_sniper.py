@@ -99,6 +99,10 @@ def main():
         help="Conservative mode — always bet minimum 5 tokens per trade for data gathering"
     )
     parser.add_argument(
+        "--max-entry-price", type=float, default=0.85,
+        help="Max entry price to trade at (default: 0.85). Lower = cheaper trades, more survival."
+    )
+    parser.add_argument(
         "--observe", action="store_true",
         help="Observe-only mode — show signals but don't trade"
     )
@@ -151,6 +155,7 @@ def main():
         kelly_strong=args.kelly_strong,
         bankroll=args.bankroll,
         max_bet_usdc=args.max_bet,
+        max_entry_price=args.max_entry_price,
         min_size_mode=args.min_size,
         observe_only=args.observe,
         log_file=args.log_file,
