@@ -36,7 +36,9 @@ CSV_HEADERS = [
     "btc_delta_pct",
     "poly_up_mid",
     "poly_down_mid",
+    "poly_up_best_bid",
     "poly_up_best_ask",
+    "poly_down_best_bid",
     "poly_down_best_ask",
     "market_slug",
     "market_seconds_left",
@@ -47,15 +49,18 @@ class LagCollector:
     def __init__(self):
         self.btc_price = 0.0
         self.btc_price_prev = 0.0
-        self.poly_up_mid = 0.0
-        self.poly_down_mid = 0.0
+        # Sticky prices — only overwritten by actual WS updates
+        self.poly_up_bid = 0.0
         self.poly_up_ask = 0.0
+        self.poly_down_bid = 0.0
         self.poly_down_ask = 0.0
         self.current_market_slug = ""
         self.market_end_time = 0
         self.token_ids = {}
         self.running = True
         self.rows_written = 0
+        # Event to signal polymarket_listener to reconnect with new tokens
+        self._reconnect_poly = asyncio.Event()
 
         self._find_active_market()
 
@@ -88,6 +93,7 @@ class LagCollector:
                 if not m.get("acceptingOrders"):
                     continue
 
+                old_slug = self.current_market_slug
                 self.current_market_slug = slug
                 end = m.get("endDate", "")
                 if end:
@@ -109,6 +115,16 @@ class LagCollector:
                         }
                     except Exception:
                         self.token_ids = {}
+
+                # Reset poly prices for new market
+                if slug != old_slug:
+                    self.poly_up_bid = 0.0
+                    self.poly_up_ask = 0.0
+                    self.poly_down_bid = 0.0
+                    self.poly_down_ask = 0.0
+                    # Signal websocket to reconnect with new tokens
+                    self._reconnect_poly.set()
+
                 print(f"Found market: {slug} | tokens: {list(self.token_ids.keys())}")
                 return
 
@@ -133,7 +149,7 @@ class LagCollector:
                 await asyncio.sleep(2)
 
     async def polymarket_listener(self):
-        """Listen to Polymarket orderbook updates."""
+        """Listen to Polymarket orderbook updates. Reconnects on market transition."""
         while self.running:
             try:
                 if not self.token_ids:
@@ -141,6 +157,7 @@ class LagCollector:
                     self._find_active_market()
                     continue
 
+                self._reconnect_poly.clear()
                 assets = list(self.token_ids.values())
                 subscribe_msg = {
                     "assets_ids": assets,
@@ -151,7 +168,11 @@ class LagCollector:
                     await ws.send(json.dumps(subscribe_msg))
                     print(f"Polymarket WS connected, subscribed to {len(assets)} assets")
 
-                    async for msg in ws:
+                    while not self._reconnect_poly.is_set():
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
                         if not self.running:
                             break
                         if not msg or msg == "[]":
@@ -165,12 +186,15 @@ class LagCollector:
                                 self._process_poly_update(data)
                         except json.JSONDecodeError:
                             continue
+
+                    print("Polymarket WS: reconnecting for new market...")
+
             except Exception as e:
                 print(f"Polymarket WS error: {e}")
                 await asyncio.sleep(2)
 
     def _process_poly_update(self, update):
-        """Process a Polymarket orderbook update."""
+        """Process a Polymarket orderbook update. Prices are sticky."""
         asset_id = update.get("asset_id", "")
 
         side = None
@@ -185,16 +209,34 @@ class LagCollector:
         bids = update.get("bids", [])
         asks = update.get("asks", [])
 
-        best_bid = float(bids[0].get("price", 0)) if bids else 0
-        best_ask = float(asks[0].get("price", 0)) if asks else 0
-        mid = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0
+        # Only update if data is present (sticky — keep last known value)
+        if bids:
+            best_bid = float(bids[0].get("price", 0))
+            if best_bid > 0:
+                if "yes" in side or "up" in side:
+                    self.poly_up_bid = best_bid
+                elif "no" in side or "down" in side:
+                    self.poly_down_bid = best_bid
 
-        if "yes" in side or "up" in side:
-            self.poly_up_mid = mid
-            self.poly_up_ask = best_ask
-        elif "no" in side or "down" in side:
-            self.poly_down_mid = mid
-            self.poly_down_ask = best_ask
+        if asks:
+            best_ask = float(asks[0].get("price", 0))
+            if best_ask > 0:
+                if "yes" in side or "up" in side:
+                    self.poly_up_ask = best_ask
+                elif "no" in side or "down" in side:
+                    self.poly_down_ask = best_ask
+
+    @property
+    def poly_up_mid(self):
+        if self.poly_up_bid > 0 and self.poly_up_ask > 0:
+            return (self.poly_up_bid + self.poly_up_ask) / 2
+        return self.poly_up_bid or self.poly_up_ask
+
+    @property
+    def poly_down_mid(self):
+        if self.poly_down_bid > 0 and self.poly_down_ask > 0:
+            return (self.poly_down_bid + self.poly_down_ask) / 2
+        return self.poly_down_bid or self.poly_down_ask
 
     async def ticker(self):
         """Write a row every second."""
@@ -222,7 +264,9 @@ class LagCollector:
                 f"{delta_pct:.6f}",
                 f"{self.poly_up_mid:.4f}",
                 f"{self.poly_down_mid:.4f}",
+                f"{self.poly_up_bid:.4f}",
                 f"{self.poly_up_ask:.4f}",
+                f"{self.poly_down_bid:.4f}",
                 f"{self.poly_down_ask:.4f}",
                 self.current_market_slug,
                 f"{secs_left:.0f}",
@@ -236,7 +280,8 @@ class LagCollector:
                 print(
                     f"[{now.strftime('%H:%M:%S')}] "
                     f"BTC: ${self.btc_price:.2f} | "
-                    f"UP: {self.poly_up_mid:.4f} DOWN: {self.poly_down_mid:.4f} | "
+                    f"UP: {self.poly_up_mid:.4f} (b:{self.poly_up_bid:.2f} a:{self.poly_up_ask:.2f}) "
+                    f"DOWN: {self.poly_down_mid:.4f} (b:{self.poly_down_bid:.2f} a:{self.poly_down_ask:.2f}) | "
                     f"{self.rows_written} rows"
                 )
 
