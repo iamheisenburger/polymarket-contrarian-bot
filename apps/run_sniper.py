@@ -95,6 +95,10 @@ def main():
         help="Max USDC per single trade — Kelly handles sizing (default: 100)"
     )
     parser.add_argument(
+        "--min-size", action="store_true",
+        help="Conservative mode — always bet minimum 5 tokens per trade for data gathering"
+    )
+    parser.add_argument(
         "--observe", action="store_true",
         help="Observe-only mode — show signals but don't trade"
     )
@@ -137,7 +141,7 @@ def main():
         print(f"{Colors.RED}Error: Failed to initialize bot{Colors.RESET}")
         sys.exit(1)
 
-    # Create strategy config — Kelly is the only risk management
+    # Create strategy config
     strategy_config = SniperConfig(
         coins=coins,
         timeframe=args.timeframe,
@@ -147,6 +151,7 @@ def main():
         kelly_strong=args.kelly_strong,
         bankroll=args.bankroll,
         max_bet_usdc=args.max_bet,
+        min_size_mode=args.min_size,
         observe_only=args.observe,
         log_file=args.log_file,
     )
@@ -169,30 +174,35 @@ def main():
     print(f"    Strong edge:  {args.strong_edge:.2f} ({args.strong_edge*100:.0f} cents)")
     print()
 
-    # Kelly info
-    print(f"  Position Sizing (Kelly Criterion — the ONLY risk management):")
-    print(f"    Normal Kelly: {args.kelly:.0%}")
-    print(f"    Strong Kelly: {args.kelly_strong:.0%}")
-    print(f"    Min per trade: $1.00 (Polymarket floor)")
-    print(f"    No loss limits. No trade caps. Kelly sizes everything.")
+    # Position sizing info
+    if args.min_size:
+        print(f"  Position Sizing: MINIMUM SIZE MODE (conservative)")
+        print(f"    Every trade: 5 tokens (Polymarket minimum)")
+        print(f"    Cost per trade: ~$1.00-$4.25 depending on entry price")
+        print(f"    Purpose: gather data on whether edge is real")
+        print()
+        print(f"  Example trade (10c edge):")
+        print(f"    Buy 5 tokens at $0.40 = $2.00 cost")
+        print(f"    Win: $5.00 payout (+$3.00 profit)")
+        print(f"    Loss: $0.00 payout (-$2.00 loss)")
+    else:
+        print(f"  Position Sizing (Kelly Criterion):")
+        print(f"    Normal Kelly: {args.kelly:.0%}")
+        print(f"    Strong Kelly: {args.kelly_strong:.0%}")
+        print(f"    Min per trade: $1.00 (Polymarket floor)")
+        print()
+        ex_price = 0.40
+        ex_fair = 0.50
+        b = (1.0 / ex_price) - 1.0
+        kelly_f = (ex_fair * b - 0.50) / b
+        ex_bet = kelly_f * args.kelly * args.bankroll
+        print(f"  Example trade (10c edge):")
+        print(f"    Buy at $0.40, fair value $0.50")
+        print(f"    Payout if win: ${1.0/ex_price:.2f} per token (2.5x)")
+        print(f"    Kelly fraction: {kelly_f:.3f}, bet = ${max(1.0, ex_bet):.2f}")
     print()
 
-    # Example: buying at 0.40 when fair is 0.50 (10 cent edge)
-    ex_price = 0.40
-    ex_fair = 0.50
-    b = (1.0 / ex_price) - 1.0
-    kelly_f = (ex_fair * b - 0.50) / b
-    ex_bet = kelly_f * args.kelly * args.bankroll
-    print(f"  Example trade (10c edge):")
-    print(f"    Buy at $0.40, fair value $0.50")
-    print(f"    Payout if win: ${1.0/ex_price:.2f} per token (2.5x)")
-    print(f"    Kelly fraction: {kelly_f:.3f}, bet = ${max(1.0, ex_bet):.2f}")
-    print()
-
-    print(f"  How it compounds:")
-    print(f"    Win at 2.5x → bankroll grows → Kelly sizes up → bigger bets → faster growth")
-    print(f"    Loss → bankroll shrinks → Kelly sizes down → smaller bets → protects capital")
-    print(f"    Auto-redeems winning tokens to USDC on every market settlement")
+    print(f"  Auto-redeems winning tokens to USDC on every market settlement")
     print()
 
     if not args.observe:

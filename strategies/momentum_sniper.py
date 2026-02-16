@@ -61,15 +61,17 @@ class SniperConfig:
     min_edge: float = 0.05        # Minimum edge to enter (5 cents)
     strong_edge: float = 0.10     # Strong edge — use larger Kelly (10 cents)
 
-    # Kelly Criterion position sizing — the ONLY risk management
+    # Position sizing
     kelly_fraction: float = 0.50    # Normal: half Kelly
     kelly_strong: float = 0.75      # Strong edge: 3/4 Kelly
     bankroll: float = 20.0          # Starting capital in USDC
     min_bet_usdc: float = 1.0       # Polymarket minimum ($1 floor)
-    max_bet_usdc: float = 100.0     # No practical cap — Kelly handles sizing
+    max_bet_usdc: float = 100.0     # Cap per trade
 
-    # No artificial trade limits. Kelly is the only protection.
-    # If there's edge, trade. Volume is how we make money.
+    # Conservative mode: always bet minimum (5 tokens) to gather data.
+    # Use this when bankroll is small and you need statistical significance
+    # before committing to full Kelly sizing.
+    min_size_mode: bool = False
 
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
@@ -519,13 +521,20 @@ class MomentumSniperStrategy:
         # Calculate bet size
         fair_prob = fv.fair_up if side == "up" else fv.fair_down
         is_strong = edge >= self.config.strong_edge
-        bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
 
-        if bet_usdc < self.config.min_bet_usdc:
-            return False
+        if self.config.min_size_mode:
+            # Conservative: always bet exactly 5 tokens (Polymarket minimum).
+            # Cheapest way to get data on whether the edge is real.
+            num_tokens = 5.0
+            bet_usdc = num_tokens * entry_price
+            if bet_usdc > self._available_balance():
+                return False
+        else:
+            bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
+            if bet_usdc < self.config.min_bet_usdc:
+                return False
+            num_tokens = round(bet_usdc / entry_price, 2)
 
-        # Calculate token count (Polymarket minimum is 5 tokens)
-        num_tokens = round(bet_usdc / entry_price, 2)
         if num_tokens < 5.0:
             # Not enough for Polymarket minimum order size
             return False
@@ -855,9 +864,10 @@ class MomentumSniperStrategy:
         )
 
         # Edge settings
+        sizing = "MIN-SIZE (5 tok)" if self.config.min_size_mode else f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
         lines.append(
             f"  Settings: edge>={self.config.min_edge:.2f} | "
-            f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%} | "
+            f"{sizing} | "
             f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}]"
         )
 
