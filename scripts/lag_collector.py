@@ -79,7 +79,7 @@ class LagCollector:
                 ts = current_ts + offset
                 slug = f"btc-updown-5m-{ts}"
                 resp = requests.get(
-                    f"{GAMMA_API}/markets/{slug}",
+                    f"{GAMMA_API}/markets/slug/{slug}",
                     timeout=10,
                 )
                 if resp.status_code != 200:
