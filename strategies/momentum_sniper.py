@@ -289,7 +289,15 @@ class MomentumSniperStrategy:
             self._handle_market_change(_coin, old_slug, new_slug)
 
     def _set_strike(self, state: CoinMarketState):
-        """Determine strike price for the current market."""
+        """Determine strike price for the current market.
+
+        Primary: Use Binance spot at window open (first 60s of market).
+        Binance closely tracks Chainlink at the start of the window,
+        so this is the most reliable approximation of the actual strike.
+
+        Fallback: If joining mid-window (startup), back-solve from
+        Polymarket mid price + Binance spot + volatility.
+        """
         market = state.manager.current_market
         if not market:
             return
@@ -298,7 +306,8 @@ class MomentumSniperStrategy:
         state.current_slug = slug
         state.market_start_time = time.time()
 
-        # Parse market end time from slug
+        # Parse market start/end time from slug
+        market_start_ts = 0
         try:
             ts_str = slug.rsplit("-", 1)[-1]
             market_start_ts = int(ts_str)
@@ -311,21 +320,30 @@ class MomentumSniperStrategy:
         if spot <= 0:
             return
 
-        # Use market mid price to back-solve for strike
-        up_price = state.manager.get_mid_price("up")
-        if 0.1 < up_price < 0.9:
-            vol = self.binance.get_volatility(state.coin)
-            secs_left = state.seconds_to_expiry()
-            if secs_left > 30 and vol > 0:
-                from lib.fair_value import SECONDS_PER_YEAR
-                T = secs_left / SECONDS_PER_YEAR
-                sigma_sqrt_t = vol * math.sqrt(T)
-                d = self._approx_inv_normal(up_price)
-                state.strike_price = spot * math.exp(-d * sigma_sqrt_t)
+        secs_since_window_open = time.time() - market_start_ts if market_start_ts > 0 else 999
+
+        if secs_since_window_open < 60:
+            # Early in window — Binance spot ≈ Chainlink opening price ≈ strike.
+            # This is more reliable than back-solving from a potentially stale orderbook.
+            state.strike_price = spot
+            self.log(f"{state.coin} strike from Binance spot (window {secs_since_window_open:.0f}s old)")
+        else:
+            # Joined mid-window — back-solve from Polymarket mid price.
+            up_price = state.manager.get_mid_price("up")
+            if 0.1 < up_price < 0.9:
+                vol = self.binance.get_volatility(state.coin)
+                secs_left = state.seconds_to_expiry()
+                if secs_left > 30 and vol > 0:
+                    from lib.fair_value import SECONDS_PER_YEAR
+                    T = secs_left / SECONDS_PER_YEAR
+                    sigma_sqrt_t = vol * math.sqrt(T)
+                    d = self._approx_inv_normal(up_price)
+                    state.strike_price = spot * math.exp(-d * sigma_sqrt_t)
+                    self.log(f"{state.coin} strike back-solved from mid={up_price:.2f} (window {secs_since_window_open:.0f}s old)")
+                else:
+                    state.strike_price = spot
             else:
                 state.strike_price = spot
-        else:
-            state.strike_price = spot
 
         # Format strike with appropriate precision
         if state.strike_price < 10:
