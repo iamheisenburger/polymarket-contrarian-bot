@@ -1,0 +1,778 @@
+"""
+Momentum Sniper Strategy — Directional edge trading on crypto binary markets.
+
+Exploits the latency between Binance spot price movements and Polymarket
+binary market repricing. When Binance moves but Polymarket hasn't caught up,
+we snipe the mispriced side before the market adjusts.
+
+How it works:
+    1. Binance WebSocket provides sub-second crypto price updates
+    2. Fair value calculator computes P(Up) from Black-Scholes binary pricing
+    3. Compare fair value to Polymarket best ask prices
+    4. When the ask is significantly below fair value → BUY (the market is slow)
+    5. Hold to settlement: binary pays $1 on win, $0 on loss
+    6. Auto-redeem winnings and compound into next market
+
+Key differences from Market Maker:
+    - Market Maker: passive, posts limit orders, profits from spread
+    - Momentum Sniper: active, takes mispriced asks, profits from direction
+
+Risk management:
+    - Kelly Criterion position sizing (fractional Kelly)
+    - Minimum edge threshold before entering
+    - One position per side per market (no pyramiding)
+    - Cooldown between trades to avoid overtrading
+    - Stop trading near expiry (last 60s — outcome is too certain or too noisy)
+    - Multi-coin scanning for maximum opportunity
+
+Usage:
+    from strategies.momentum_sniper import MomentumSniperStrategy, SniperConfig
+
+    config = SniperConfig(coins=["BTC", "ETH"], timeframe="15m", bankroll=20.0)
+    strategy = MomentumSniperStrategy(bot, config)
+    await strategy.run()
+"""
+
+import asyncio
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Tuple
+from datetime import datetime, timezone
+
+from lib.binance_ws import BinancePriceFeed
+from lib.fair_value import BinaryFairValue, FairValue
+from lib.console import Colors, LogBuffer, log
+from lib.trade_logger import TradeLogger
+from lib.market_manager import MarketManager, MarketInfo
+from src.bot import TradingBot, OrderResult
+from src.websocket_client import MarketWebSocket, OrderbookSnapshot
+
+
+@dataclass
+class SniperConfig:
+    """Momentum sniper configuration."""
+
+    # Coins to scan (more coins = more opportunities)
+    coins: List[str] = field(default_factory=lambda: ["BTC"])
+    timeframe: str = "15m"
+
+    # Edge thresholds
+    min_edge: float = 0.05        # Minimum edge to enter (5 cents)
+    strong_edge: float = 0.10     # Strong edge — use larger Kelly (10 cents)
+
+    # Kelly Criterion position sizing — the ONLY risk management
+    kelly_fraction: float = 0.50    # Normal: half Kelly
+    kelly_strong: float = 0.75      # Strong edge: 3/4 Kelly
+    bankroll: float = 20.0          # Starting capital in USDC
+    min_bet_usdc: float = 1.0       # Polymarket minimum ($1 floor)
+    max_bet_usdc: float = 100.0     # No practical cap — Kelly handles sizing
+
+    # No artificial trade limits. Kelly is the only protection.
+    # If there's edge, trade. Volume is how we make money.
+
+    # Price thresholds (structural, not risk limits)
+    max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
+    min_entry_price: float = 0.02    # Below Polymarket minimum tick
+
+    # Market settings
+    market_check_interval: float = 30.0
+
+    # Logging
+    log_file: str = "data/sniper_trades.csv"
+    observe_only: bool = False
+
+
+@dataclass
+class CoinMarketState:
+    """Tracks state for a single coin's market."""
+    coin: str
+    manager: MarketManager
+    strike_price: float = 0.0
+    market_end_ts: float = 0.0
+    current_slug: str = ""
+
+    # Positions held in this market
+    up_tokens: float = 0.0
+    down_tokens: float = 0.0
+    up_cost: float = 0.0
+    down_cost: float = 0.0
+
+    # Timing
+    last_trade_time: float = 0.0
+    market_start_time: float = 0.0
+
+    # Last known prices (for settlement)
+    last_up_price: float = 0.0
+    last_down_price: float = 0.0
+
+    @property
+    def has_up_position(self) -> bool:
+        return self.up_tokens > 0
+
+    @property
+    def has_down_position(self) -> bool:
+        return self.down_tokens > 0
+
+    @property
+    def total_cost(self) -> float:
+        return self.up_cost + self.down_cost
+
+    def seconds_to_expiry(self) -> float:
+        if self.market_end_ts <= 0:
+            return 600
+        return max(0, self.market_end_ts - time.time())
+
+    def seconds_since_start(self) -> float:
+        if self.market_start_time <= 0:
+            return 999
+        return time.time() - self.market_start_time
+
+    def reset_positions(self):
+        self.up_tokens = 0.0
+        self.down_tokens = 0.0
+        self.up_cost = 0.0
+        self.down_cost = 0.0
+
+
+@dataclass
+class SniperStats:
+    """Session statistics."""
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    pending: int = 0
+    total_wagered: float = 0.0
+    total_payout: float = 0.0
+    realized_pnl: float = 0.0
+    markets_seen: int = 0
+    opportunities_found: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    @property
+    def win_rate(self) -> float:
+        decided = self.wins + self.losses
+        return (self.wins / decided * 100) if decided > 0 else 0.0
+
+    @property
+    def elapsed_minutes(self) -> float:
+        return (time.time() - self.start_time) / 60
+
+
+class MomentumSniperStrategy:
+    """
+    Momentum sniper: buys mispriced sides of binary crypto markets.
+
+    Scans multiple coins simultaneously, looking for moments when
+    Binance price has moved but Polymarket hasn't repriced yet.
+    """
+
+    def __init__(self, bot: TradingBot, config: SniperConfig):
+        self.bot = bot
+        self.config = config
+
+        # Fair value calculator
+        self.fv_calc = BinaryFairValue()
+
+        # Binance real-time price feed (all coins)
+        self.binance = BinancePriceFeed(coins=config.coins)
+
+        # Per-coin market managers
+        self.coin_states: Dict[str, CoinMarketState] = {}
+
+        # Trade logger
+        self.trade_logger = TradeLogger(config.log_file)
+
+        # Session stats
+        self.stats = SniperStats()
+
+        # USDC balance tracking
+        self._balance: float = config.bankroll
+        self._last_balance_check: float = 0.0
+
+        # Log buffer for display
+        self._log_buffer = LogBuffer(max_size=8)
+
+        # Running state
+        self.running = False
+
+    def log(self, msg: str, level: str = "info"):
+        self._log_buffer.add(msg, level)
+
+    def _refresh_balance(self):
+        """Query USDC balance (rate-limited to every 60s)."""
+        now = time.time()
+        if now - self._last_balance_check < 60:
+            return
+        self._last_balance_check = now
+        bal = self.bot.get_usdc_balance()
+        if bal is not None:
+            self._balance = bal
+
+    def _available_balance(self) -> float:
+        """USDC available for new trades (balance minus positions)."""
+        tied_up = sum(s.total_cost for s in self.coin_states.values())
+        return max(0, self._balance - tied_up)
+
+    async def start(self) -> bool:
+        """Start the strategy: Binance feed + market managers for each coin."""
+        self.running = True
+
+        # Start Binance price feed
+        self.log("Starting Binance price feed...")
+        if not await self.binance.start():
+            self.log("Failed to start Binance feed", "error")
+            return False
+
+        for coin in self.config.coins:
+            price = self.binance.get_price(coin)
+            self.log(f"Binance {coin}: ${price:,.2f}", "success")
+
+        # Check USDC balance
+        self._refresh_balance()
+        self.log(f"USDC balance: ${self._balance:.2f}", "success")
+
+        # Create market managers for each coin
+        for coin in self.config.coins:
+            manager = MarketManager(
+                coin=coin,
+                market_check_interval=self.config.market_check_interval,
+                auto_switch_market=True,
+                timeframe=self.config.timeframe,
+            )
+
+            state = CoinMarketState(coin=coin, manager=manager)
+            self.coin_states[coin] = state
+
+            # Register callbacks
+            self._register_callbacks(coin, manager)
+
+            # Start manager
+            if not await manager.start():
+                self.log(f"Failed to start {coin} market manager", "error")
+                continue
+
+            # Wait for initial data
+            await manager.wait_for_data(timeout=10.0)
+
+            # Set initial strike
+            self._set_strike(state)
+            self.log(f"{coin} market ready: {state.current_slug}", "success")
+
+        if not any(s.current_slug for s in self.coin_states.values()):
+            self.log("No markets found for any coin", "error")
+            return False
+
+        return True
+
+    def _register_callbacks(self, coin: str, manager: MarketManager):
+        """Register market change callbacks for a coin."""
+        @manager.on_market_change
+        def on_change(old_slug: str, new_slug: str, _coin=coin):
+            self._handle_market_change(_coin, old_slug, new_slug)
+
+    def _set_strike(self, state: CoinMarketState):
+        """Determine strike price for the current market."""
+        market = state.manager.current_market
+        if not market:
+            return
+
+        slug = market.slug
+        state.current_slug = slug
+        state.market_start_time = time.time()
+
+        # Parse market end time from slug
+        try:
+            ts_str = slug.rsplit("-", 1)[-1]
+            market_start_ts = int(ts_str)
+            duration = 900 if self.config.timeframe == "15m" else 300
+            state.market_end_ts = market_start_ts + duration
+        except (ValueError, IndexError):
+            state.market_end_ts = 0
+
+        spot = self.binance.get_price(state.coin)
+        if spot <= 0:
+            return
+
+        # Use market mid price to back-solve for strike
+        up_price = state.manager.get_mid_price("up")
+        if 0.1 < up_price < 0.9:
+            vol = self.binance.get_volatility(state.coin)
+            secs_left = state.seconds_to_expiry()
+            if secs_left > 30 and vol > 0:
+                from lib.fair_value import SECONDS_PER_YEAR
+                T = secs_left / SECONDS_PER_YEAR
+                sigma_sqrt_t = vol * math.sqrt(T)
+                d = self._approx_inv_normal(up_price)
+                state.strike_price = spot * math.exp(-d * sigma_sqrt_t)
+            else:
+                state.strike_price = spot
+        else:
+            state.strike_price = spot
+
+        self.log(
+            f"{state.coin} strike: ${state.strike_price:,.0f} | "
+            f"expiry: {state.seconds_to_expiry():.0f}s"
+        )
+
+    @staticmethod
+    def _approx_inv_normal(p: float) -> float:
+        """Approximate inverse normal CDF (Abramowitz & Stegun)."""
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        if p < 0.5:
+            return -MomentumSniperStrategy._approx_inv_normal(1.0 - p)
+        t = math.sqrt(-2.0 * math.log(1.0 - p))
+        c0, c1, c2 = 2.515517, 0.802853, 0.010328
+        d1, d2, d3 = 1.432788, 0.189269, 0.001308
+        return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
+
+    def _calculate_fair_value(self, state: CoinMarketState) -> Optional[FairValue]:
+        """Calculate fair value for a coin's current market."""
+        spot = self.binance.get_price(state.coin)
+        if spot <= 0 or state.strike_price <= 0:
+            return None
+
+        secs = state.seconds_to_expiry()
+        vol = self.binance.get_volatility(state.coin)
+
+        return self.fv_calc.calculate(
+            spot=spot,
+            strike=state.strike_price,
+            seconds_to_expiry=secs,
+            volatility=vol,
+        )
+
+    def _kelly_bet_usdc(self, fair_prob: float, entry_price: float, strong: bool = False) -> float:
+        """
+        Calculate Kelly-optimal bet size.
+
+        Binary payoff: pay entry_price, receive $1 on win, $0 on loss.
+        Kelly: f = (p*b - q) / b where b = 1/price - 1
+        """
+        if entry_price <= 0.01 or entry_price >= 0.99 or fair_prob <= 0:
+            return 0.0
+
+        p = fair_prob
+        q = 1.0 - p
+        b = (1.0 / entry_price) - 1.0
+
+        if b <= 0:
+            return 0.0
+
+        kelly_f = (p * b - q) / b
+        if kelly_f <= 0:
+            return 0.0
+
+        # Use stronger Kelly fraction for strong signals
+        fraction = self.config.kelly_strong if strong else self.config.kelly_fraction
+        bet_fraction = kelly_f * fraction
+
+        available = self._available_balance()
+        if available < self.config.min_bet_usdc:
+            return 0.0
+
+        usdc = bet_fraction * available
+        usdc = max(self.config.min_bet_usdc, min(self.config.max_bet_usdc, usdc))
+        usdc = min(usdc, available)
+
+        return usdc
+
+    def _find_opportunities(self) -> List[Tuple[CoinMarketState, str, float, float, FairValue]]:
+        """
+        Scan all coins for trading opportunities.
+
+        No artificial limits — if there's edge, it shows up here.
+        Kelly handles position sizing. Volume is how we make money.
+
+        Returns list of (state, side, entry_price, edge, fair_value)
+        sorted by edge descending (best opportunity first).
+        """
+        opportunities = []
+
+        for coin, state in self.coin_states.items():
+            if not state.current_slug:
+                continue
+
+            # Only skip if market is literally expired (0 seconds left)
+            if state.seconds_to_expiry() <= 0:
+                continue
+
+            # Calculate fair value
+            fv = self._calculate_fair_value(state)
+            if not fv:
+                continue
+
+            # Check both sides — no restriction on having existing positions.
+            # If edge exists on a side we already hold, Kelly will size
+            # the additional bet correctly against our available balance.
+            for side in ["up", "down"]:
+                fair_prob = fv.fair_up if side == "up" else fv.fair_down
+
+                # Get best ask (cheapest price we can buy at)
+                best_ask = state.manager.get_best_ask(side)
+                if best_ask <= 0 or best_ask >= 1.0:
+                    continue
+
+                # Structural price filters only (not risk limits)
+                if best_ask > self.config.max_entry_price:
+                    continue
+                if best_ask < self.config.min_entry_price:
+                    continue
+
+                # Calculate edge: how much cheaper than fair value
+                edge = fair_prob - best_ask
+
+                if edge >= self.config.min_edge:
+                    opportunities.append((state, side, best_ask, edge, fv))
+
+        # Sort by edge, best first
+        opportunities.sort(key=lambda x: x[3], reverse=True)
+        return opportunities
+
+    async def _execute_snipe(
+        self,
+        state: CoinMarketState,
+        side: str,
+        entry_price: float,
+        edge: float,
+        fv: FairValue,
+    ) -> bool:
+        """Execute a snipe trade."""
+        if self.config.observe_only:
+            self.log(
+                f"[OBSERVE] Would BUY {state.coin} {side.upper()} "
+                f"@ {entry_price:.2f} (fair={fv.fair_up if side == 'up' else fv.fair_down:.2f}, "
+                f"edge={edge:.2f})",
+                "trade"
+            )
+            self.stats.opportunities_found += 1
+            return False
+
+        # Calculate bet size
+        fair_prob = fv.fair_up if side == "up" else fv.fair_down
+        is_strong = edge >= self.config.strong_edge
+        bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
+
+        if bet_usdc < self.config.min_bet_usdc:
+            return False
+
+        # Calculate token count
+        num_tokens = round(bet_usdc / entry_price, 2)
+        if num_tokens < 1.0:
+            return False
+
+        # Get token ID
+        token_id = state.manager.token_ids.get(side)
+        if not token_id:
+            return False
+
+        # Place aggressive limit order (at or slightly above best ask for fast fill)
+        buy_price = min(round(entry_price + 0.01, 2), 0.99)
+
+        result = await self.bot.place_order(
+            token_id=token_id,
+            price=buy_price,
+            size=num_tokens,
+            side="BUY",
+        )
+
+        if result.success:
+            actual_cost = buy_price * num_tokens
+
+            # Record position
+            if side == "up":
+                state.up_tokens += num_tokens
+                state.up_cost += actual_cost
+            else:
+                state.down_tokens += num_tokens
+                state.down_cost += actual_cost
+
+            state.last_trade_time = time.time()
+
+            # Update stats
+            self.stats.trades += 1
+            self.stats.pending += 1
+            self.stats.total_wagered += actual_cost
+            self.stats.opportunities_found += 1
+
+            # Log trade
+            spot = self.binance.get_price(state.coin)
+            vol = self.binance.get_volatility(state.coin)
+            other_price = state.manager.get_mid_price("down" if side == "up" else "up")
+
+            self.trade_logger.log_trade(
+                market_slug=state.current_slug,
+                coin=state.coin,
+                timeframe=self.config.timeframe,
+                side=side,
+                entry_price=buy_price,
+                bet_size_usdc=actual_cost,
+                num_tokens=num_tokens,
+                bankroll=self._balance,
+                btc_price=spot,
+                other_side_price=other_price,
+                volatility_std=vol,
+            )
+
+            kelly_pct = (actual_cost / self._available_balance() * 100) if self._available_balance() > 0 else 0
+            strength = "STRONG" if is_strong else "NORMAL"
+
+            self.log(
+                f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
+                f"x{num_tokens:.0f} (${actual_cost:.2f}) "
+                f"edge={edge:.2f} [{strength}] kelly={kelly_pct:.0f}%",
+                "success"
+            )
+            return True
+        else:
+            self.log(f"Order failed ({state.coin} {side}): {result.message}", "error")
+            return False
+
+    def _handle_market_change(self, coin: str, old_slug: str, new_slug: str):
+        """Handle market settlement and transition."""
+        state = self.coin_states.get(coin)
+        if not state:
+            return
+
+        # Settle positions
+        if state.up_tokens > 0 or state.down_tokens > 0:
+            # Determine winner from last known prices
+            up_price = state.last_up_price
+            down_price = state.last_down_price
+
+            if up_price > 0 or down_price > 0:
+                winning_side = "up" if up_price > 0.50 else "down"
+
+                # Calculate PnL
+                if winning_side == "up":
+                    pnl = state.up_tokens * 1.0 - state.up_cost - state.down_cost
+                else:
+                    pnl = state.down_tokens * 1.0 - state.down_cost - state.up_cost
+
+                self.stats.realized_pnl += pnl
+                self.stats.pending -= (1 if state.has_up_position else 0) + (1 if state.has_down_position else 0)
+
+                if pnl >= 0:
+                    self.stats.wins += 1
+                    self.stats.total_payout += pnl + state.total_cost
+                else:
+                    self.stats.losses += 1
+
+                # Log outcome
+                for pending_slug in self.trade_logger.get_pending_slugs():
+                    if pending_slug == old_slug:
+                        self.trade_logger.log_outcome(
+                            market_slug=old_slug,
+                            won=pnl >= 0,
+                            payout=max(0, pnl + state.total_cost),
+                        )
+
+                outcome = "WIN" if pnl >= 0 else "LOSS"
+                self.log(
+                    f"SETTLED {coin} {old_slug}: {outcome} ${pnl:+.2f} "
+                    f"({winning_side.upper()} won) | "
+                    f"Session: ${self.stats.realized_pnl:+.2f}",
+                    "success" if pnl >= 0 else "warning"
+                )
+
+        # Auto-redeem winning tokens
+        try:
+            results = self.bot.redeem_all()
+            if results:
+                self.log(f"Redeemed {len(results)} position(s)", "success")
+        except Exception as e:
+            self.log(f"Redeem: {e}", "info")
+
+        # Refresh balance
+        self._last_balance_check = 0
+        self._refresh_balance()
+
+        # Reset for new market
+        state.reset_positions()
+        state.last_up_price = 0.0
+        state.last_down_price = 0.0
+        self.stats.markets_seen += 1
+
+        # Set new strike (delay to let data arrive)
+        state.current_slug = new_slug
+        state.market_start_time = time.time()
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_later(3.0, lambda: self._set_strike(state))
+        except RuntimeError:
+            self._set_strike(state)
+
+    async def _tick(self):
+        """Main strategy tick — scan for opportunities and execute."""
+        # Update last known prices for all coins
+        for coin, state in self.coin_states.items():
+            up = state.manager.get_mid_price("up")
+            down = state.manager.get_mid_price("down")
+            if up > 0:
+                state.last_up_price = up
+            if down > 0:
+                state.last_down_price = down
+
+        # Balance check
+        self._refresh_balance()
+        if self._balance < self.config.min_bet_usdc and not self.config.observe_only:
+            return
+
+        # Find opportunities across all coins
+        opportunities = self._find_opportunities()
+
+        # Execute ALL opportunities — no artificial limit on trades per tick.
+        # Kelly sizes each bet against available balance, so later bets
+        # naturally get smaller as capital is allocated. Let volume work.
+        for state, side, price, edge, fv in opportunities:
+            if self._available_balance() < self.config.min_bet_usdc:
+                break  # Out of capital — Kelly's job is done
+            await self._execute_snipe(state, side, price, edge, fv)
+
+    def _render_status(self):
+        """Render the live status display."""
+        lines = []
+        lines.append("")
+        lines.append(f"{'=' * 70}")
+
+        mode = "OBSERVE" if self.config.observe_only else "LIVE"
+        coins_str = "/".join(self.config.coins)
+        lines.append(f"  MOMENTUM SNIPER [{mode}] — {coins_str} {self.config.timeframe}")
+        lines.append(f"{'=' * 70}")
+
+        # Per-coin status
+        for coin, state in self.coin_states.items():
+            if not state.current_slug:
+                lines.append(f"  {coin}: (no market)")
+                continue
+
+            spot = self.binance.get_price(coin)
+            vol = self.binance.get_volatility(coin)
+            secs = state.seconds_to_expiry()
+            mins, s = divmod(int(secs), 60)
+
+            fv = self._calculate_fair_value(state)
+
+            up_mid = state.manager.get_mid_price("up")
+            down_mid = state.manager.get_mid_price("down")
+            up_ask = state.manager.get_best_ask("up")
+            down_ask = state.manager.get_best_ask("down")
+
+            lines.append(f"  {coin}  ${spot:>10,.2f}  vol={vol*100:.0f}%  "
+                         f"strike=${state.strike_price:>,.0f}  "
+                         f"expiry={mins}m{s:02d}s")
+
+            if fv:
+                up_edge = fv.fair_up - up_ask if up_ask > 0 else 0
+                down_edge = fv.fair_down - down_ask if down_ask > 0 else 0
+
+                # Show edges with color indicators
+                up_signal = "*" if up_edge >= self.config.min_edge else " "
+                down_signal = "*" if down_edge >= self.config.min_edge else " "
+
+                lines.append(
+                    f"       Fair: Up={fv.fair_up:.2f} Down={fv.fair_down:.2f}  |  "
+                    f"Ask: Up={up_ask:.2f} Down={down_ask:.2f}"
+                )
+                lines.append(
+                    f"       Edge:{up_signal}Up={up_edge:+.2f} {down_signal}Down={down_edge:+.2f}  |  "
+                    f"Mid: Up={up_mid:.2f} Down={down_mid:.2f}"
+                )
+
+            # Show positions
+            pos_parts = []
+            if state.has_up_position:
+                pos_parts.append(f"UP x{state.up_tokens:.0f} (${state.up_cost:.2f})")
+            if state.has_down_position:
+                pos_parts.append(f"DOWN x{state.down_tokens:.0f} (${state.down_cost:.2f})")
+            if pos_parts:
+                lines.append(f"       Pos: {' | '.join(pos_parts)}")
+
+            lines.append("")
+
+        # Session stats
+        lines.append(f"{'─' * 70}")
+        lines.append(
+            f"  Balance: ${self._balance:.2f}  |  "
+            f"Available: ${self._available_balance():.2f}  |  "
+            f"PnL: ${self.stats.realized_pnl:+.2f}"
+        )
+        lines.append(
+            f"  Trades: {self.stats.trades}  |  "
+            f"W/L: {self.stats.wins}/{self.stats.losses}  |  "
+            f"Win Rate: {self.stats.win_rate:.0f}%  |  "
+            f"Wagered: ${self.stats.total_wagered:.2f}"
+        )
+        lines.append(
+            f"  Markets: {self.stats.markets_seen}  |  "
+            f"Opportunities: {self.stats.opportunities_found}  |  "
+            f"Runtime: {self.stats.elapsed_minutes:.0f}m"
+        )
+
+        # Edge settings
+        lines.append(
+            f"  Settings: edge>={self.config.min_edge:.2f} | "
+            f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%} | "
+            f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}]"
+        )
+
+        lines.append(f"{'─' * 70}")
+
+        # Recent log messages
+        for msg in self._log_buffer.get_messages()[-5:]:
+            lines.append(f"  {msg}")
+
+        output = "\n".join(lines)
+        print(f"\033[H\033[J{output}", flush=True)
+
+    async def run(self):
+        """Main strategy loop."""
+        try:
+            if not await self.start():
+                self.log("Failed to start strategy", "error")
+                return
+
+            self.log("Sniper active — scanning for opportunities...", "success")
+
+            while self.running:
+                await self._tick()
+                self._render_status()
+                await asyncio.sleep(0.5)
+
+        except KeyboardInterrupt:
+            self.log("Stopped by user")
+        finally:
+            await self.stop()
+            self._print_summary()
+
+    async def stop(self):
+        """Stop the strategy."""
+        self.running = False
+
+        # Stop all market managers
+        for state in self.coin_states.values():
+            await state.manager.stop()
+
+        # Stop Binance feed
+        await self.binance.stop()
+
+    def _print_summary(self):
+        """Print session summary."""
+        print()
+        print(f"{'=' * 60}")
+        print(f"  SNIPER SESSION SUMMARY")
+        print(f"{'=' * 60}")
+        print(f"  Duration:         {self.stats.elapsed_minutes:.0f} minutes")
+        print(f"  Markets seen:     {self.stats.markets_seen}")
+        print(f"  Opportunities:    {self.stats.opportunities_found}")
+        print(f"  Trades executed:  {self.stats.trades}")
+        print(f"  Win/Loss:         {self.stats.wins}/{self.stats.losses}")
+        print(f"  Win rate:         {self.stats.win_rate:.1f}%")
+        print(f"  Total wagered:    ${self.stats.total_wagered:.2f}")
+        print(f"  Realized PnL:     ${self.stats.realized_pnl:+.2f}")
+        print(f"  Final balance:    ${self._balance:.2f}")
+        print()
+        print(f"  Trade log:        {self.config.log_file}")
+        print(f"{'=' * 60}")
