@@ -667,8 +667,10 @@ class OrderbookManager:
         await self._ws.subscribe(asset_ids)
         await self._ws.run(auto_reconnect=True)
 
-    async def subscribe(self, asset_ids: List[str]) -> bool:
-        """Subscribe to additional assets."""
+    async def subscribe(self, asset_ids: List[str], replace: bool = False) -> bool:
+        """Subscribe to assets. If replace=True, clear old subscriptions first."""
+        if replace:
+            return await self._ws.subscribe(asset_ids, replace=True)
         return await self._ws.subscribe_more(asset_ids)
 
     async def unsubscribe(self, asset_ids: List[str]) -> bool:
