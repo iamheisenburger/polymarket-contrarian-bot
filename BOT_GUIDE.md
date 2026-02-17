@@ -1,53 +1,108 @@
-# Polymarket Contrarian Bot - Management Guide
+# Polymarket Trading Bot - Management Guide
+
+## Strategy Overview
+
+We trade Polymarket crypto binary markets (BTC/ETH/SOL/XRP Up/Down, 15-minute) by
+exploiting the latency between Binance spot price movements and Polymarket orderbook
+repricing. Black-Scholes calculates the true probability; when the market price lags
+behind, we buy the mispriced side and hold to settlement ($1.00 on win, $0.00 on loss).
+
+Both strategies use the same engine (`strategies/momentum_sniper.py`) but target
+different price regimes:
+
+### Strategy 1: LONGSHOT (live)
+- **Buys the CHEAP side** — entry price < $0.20 (execution ~$0.21)
+- Payout: **4.76x** | Breakeven WR: **21%**
+- Per trade: risk $1.05, win $3.95 (5 tokens at $0.21)
+- Fires when crypto trends strongly (one side gets pushed cheap)
+- Trade log: `data/longshot_trades.csv`
+
+### Strategy 2: MIDSHOT (not yet live)
+- **Buys the MIDRANGE side** — entry price ~$0.40-$0.60
+- Payout: **~2x** | Breakeven WR: **50%**
+- Per trade: risk ~$2.50, win ~$2.50 (5 tokens at ~$0.50)
+- Fires when markets are uncertain (near 50/50), higher frequency
+- Trade log: `data/midshot_trades.csv` (to be created)
+
+### Binary Payoff Math
+- Breakeven win rate = entry price (e.g., $0.21 entry → 21% breakeven)
+- Edge comes from Binance moving in ms while Polymarket reprices in seconds
+- Kelly Criterion sizes bets; currently locked to min-size (5 tokens) for data collection
+- Both strategies hold to settlement — no early exits
+
+## Master Plan (7 Steps)
+
+1. **[CURRENT]** Collect 50 trades/coin on Longshot (BTC/ETH/SOL/XRP = 200 total)
+2. If profitable (WR > 21%), remove `--min-size` and let Kelly scale
+3. Grow account to fund Midshot campaign
+4. Start Midshot at `--min-size` (50 trades/coin data collection)
+5. Determine if Midshot is profitable (WR > 50%)
+6. If profitable, remove `--min-size` on Midshot too
+7. Explore 5m markets for both strategies
+
+**Rules during data collection:** No strategy changes. No parameter tweaking. Let
+the data come in. Losing streaks are mathematically expected. Quiet periods mean
+no edge is available, not a bug.
 
 ## Server Details
 - **Provider:** DigitalOcean
-- **Region:** Amsterdam (AMS3)
+- **Region:** Amsterdam (AMS3) — must be non-US
 - **IP:** 209.38.36.107
 - **OS:** Ubuntu 24.04 LTS
 - **Plan:** $6/month (1GB RAM, 1 vCPU)
 - **SSH Key:** `~/.ssh/polymarket_bot`
 
-## Quick Commands (run from any Claude Code session)
+## Data Integrity & Baseline
 
-### Check if bot is running
+### Single source of truth: `data/longshot_trades.csv`
+- Contains ONLY min-size trades (5 tokens, entry ~$0.21)
+- Every outcome is settled on-chain via Chainlink oracle — wins and losses are factual
+- To judge longshot profitability: **use win rate vs 21% breakeven**, not account balance
+
+### Baseline (established 2026-02-17)
+- **Trade #80, balance $43.17** — all pre-min-size positions fully settled
+- Before trade #80: account balance was polluted by old pre-min-size losses settling
+  in the background (~$53 absorbed). The per-trade PnL was correct but didn't match
+  the balance delta.
+- **After trade #80: balance delta = longshot PnL**. No more outside interference.
+- The stats script (`scripts/longshot_stats.py`) has a post-baseline balance check
+  that verifies this.
+
+### Archived files (in `data/`)
+- `archive_pre_minsize_trades.csv` — old pre-min-size era trades (do not use)
+- `archive_sniper_trades_old_logger.csv` — old logger duplicate (do not use)
+- `trades.csv` — old contrarian log (retired)
+
+## Quick Commands
+
+### Run longshot stats (THE command for checking performance)
 ```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "systemctl status polymarket-bot --no-pager | head -10"
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "python3 /opt/polymarket-bot/scripts/longshot_stats.py"
 ```
 
-### View live logs (last 30 lines)
+### Check running processes
 ```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "tail -30 /var/log/polymarket-bot.log"
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "ps aux | grep python | grep -v grep"
+```
+
+### View sniper logs (last 50 lines)
+```bash
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "tail -50 /var/log/polymarket-sniper.log"
+```
+
+### View raw longshot trade log
+```bash
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cat /opt/polymarket-bot/data/longshot_trades.csv"
 ```
 
 ### Check for errors
 ```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "grep -iE 'error|failed|403|401' /var/log/polymarket-bot.log | tail -10"
-```
-
-### Check trade stats
-```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "grep 'Trades:' /var/log/polymarket-bot.log | tail -1"
-```
-
-### View trade log CSV
-```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cat /opt/polymarket-bot/data/trades.csv 2>/dev/null || echo 'No trades yet'"
-```
-
-### Restart the bot
-```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "systemctl restart polymarket-bot && echo 'Restarted'"
-```
-
-### Stop the bot
-```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "systemctl stop polymarket-bot && echo 'Stopped'"
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "grep -iE 'error|failed' /var/log/polymarket-sniper.log | tail -10"
 ```
 
 ### Update bot code (after pushing to GitHub)
 ```bash
-ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cd /opt/polymarket-bot && git pull && systemctl restart polymarket-bot && echo 'Updated'"
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cd /opt/polymarket-bot && git pull"
 ```
 
 ### Check server resources
@@ -55,67 +110,59 @@ ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cd /opt/polymarket-bot && git p
 ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "free -h && echo '---' && df -h / && echo '---' && uptime"
 ```
 
-## Prompts for New Chat Sessions
+## Active Processes on VPS
 
-### Verify everything is working
-> "Check the status of my Polymarket trading bot on 209.38.36.107. SSH key is at ~/.ssh/polymarket_bot. Check if the service is running, look for recent errors in /var/log/polymarket-bot.log, and show me the latest trade stats."
+1. **Longshot sniper** (main bot):
+   `apps/run_sniper.py --coins BTC ETH SOL XRP --timeframe 15m --bankroll 25 --min-edge 0.05 --min-size --max-entry-price 0.20`
+   Log: `/var/log/polymarket-sniper.log`
 
-### Check trade performance
-> "SSH into my Polymarket bot at 209.38.36.107 (key: ~/.ssh/polymarket_bot) and show me: 1) trade log from /opt/polymarket-bot/data/trades.csv, 2) current session stats from the log, 3) any errors in the last hour."
+2. **Market maker** (observe only, separate from Longshot/Midshot):
+   `apps/run_market_maker.py --coin BTC --timeframe 15m --bankroll 19 --observe`
+   Log: `/var/log/polymarket-mm.log`
 
-### Update the bot
-> "I need to update my Polymarket bot. The code is in this directory and the bot runs on 209.38.36.107 (SSH key: ~/.ssh/polymarket_bot). Push the changes to GitHub and update the server."
+3. **Lag collector** (research data):
+   `scripts/lag_collector.py` (screen session)
 
-### Debug issues
-> "My Polymarket bot on 209.38.36.107 might have issues. SSH in (key: ~/.ssh/polymarket_bot) and check: systemctl status, recent errors in /var/log/polymarket-bot.log, memory usage, and whether WebSocket is connected."
+4. **Old contrarian service**: STOPPED (systemd configured but inactive)
 
 ## Architecture
 
 ```
 Project Root/
-├── apps/run_contrarian.py    # CLI entry point
-├── strategies/contrarian.py  # Core strategy logic
-├── src/bot.py                # Order execution
-├── src/client.py             # Polymarket API client
-├── src/signer.py             # EIP-712 order signing
-├── src/websocket_client.py   # Real-time price feeds
-├── src/gamma_client.py       # Market discovery
-├── lib/trade_logger.py       # CSV trade logging
-├── lib/volatility_tracker.py # BTC volatility tracking
-├── lib/market_manager.py     # Market lifecycle management
-├── lib/console.py            # Terminal UI
-├── scripts/deploy.sh         # VPS deployment script
-└── data/trades.csv           # Trade log (on server)
+├── apps/
+│   ├── run_sniper.py          # CLI entry point for Longshot/Midshot
+│   ├── run_market_maker.py    # Market maker entry point
+│   ├── run_contrarian.py      # Old contrarian (retired)
+│   └── run_flash_crash.py     # Flash crash (unused)
+├── strategies/
+│   ├── momentum_sniper.py     # Core strategy for Longshot & Midshot
+│   ├── market_maker.py        # Market maker strategy
+│   ├── contrarian.py          # Old contrarian (retired)
+│   └── flash_crash.py         # Flash crash (unused)
+├── src/
+│   ├── bot.py                 # Order execution, balance, auto-redemption
+│   ├── client.py              # Polymarket API client
+│   ├── signer.py              # EIP-712 order signing
+│   ├── websocket_client.py    # Real-time orderbook feeds
+│   └── gamma_client.py        # Market discovery
+├── lib/
+│   ├── fair_value.py          # Black-Scholes binary pricing
+│   ├── binance_ws.py          # Binance real-time price feed
+│   ├── trade_logger.py        # CSV trade logging
+│   ├── market_manager.py      # Market lifecycle management
+│   └── console.py             # Terminal UI
+├── data/
+│   ├── longshot_trades.csv    # Longshot trade log (ONLY source of truth)
+│   ├── longshot_trades.pending.json  # Pending trade tracker
+│   ├── mm_trades.csv          # Market maker log (empty, observe only)
+│   ├── archive_*.csv          # Old files, do not use
+│   └── trades.csv             # Old contrarian log (retired)
+└── scripts/
+    ├── longshot_stats.py       # Stats script — run this to check performance
+    ├── lag_collector.py        # Binance vs Polymarket lag research
+    ├── analyze_top_traders.py  # Leaderboard wallet analysis
+    └── scan_daily_crypto.py    # Daily crypto market scanner
 ```
-
-## Strategy Thesis & Research Foundation
-
-**Source:** Analysis of 684 historical Polymarket crypto binary markets (BTC/ETH Up/Down 5-min and 15-min markets). The article found that tokens priced at ~$0.05 (the cheap/unpopular side) won approximately **8.8% of the time**.
-
-**The Edge:**
-- At $0.05 entry, payout is 20x ($1.00 per token on a $0.05 buy)
-- Breakeven win rate at $0.05 = 5.0%
-- Observed win rate from data = ~8.8%
-- **Excess edge = 3.8%** (8.8% - 5.0%)
-- Every trade has positive expected value: EV = +$0.76 per $1 bet at $0.05
-
-**Why it works:** In short-duration BTC binary markets, the crowd overreacts to recent price momentum. When BTC is trending up, "Up" gets pushed to $0.90+ and "Down" drops to $0.03-$0.07. But BTC reverses direction ~8.8% of the time within 5 minutes, paying 14-20x on the cheap side.
-
-**Key principle:** This is a high-volume, small-edge strategy. Each individual trade is likely to lose (91.2% of the time), but the wins are so large (14-20x) that they more than cover all losses over hundreds of trades. Consistency and volume are everything.
-
-**Kelly Criterion:** Bets are sized using half Kelly (50% fractional) based on live Polymarket balance. This scales automatically — small bets on small bankrolls, larger bets as bankroll grows. Platform minimum is $1/trade.
-
-**IMPORTANT:** The 8.8% win rate is from one historical study. Our own trade log (data/trades.csv) tracks every trade with bankroll snapshots. After ~200 trades we can statistically validate whether the real win rate matches. The CSV is the ground truth.
-
-## Strategy Parameters
-- **Coin:** BTC
-- **Timeframe:** 5-minute markets
-- **Entry range:** $0.03 - $0.07 (buy when token is cheap)
-- **Bet size:** $1.00 minimum (Kelly scales up with bankroll)
-- **Kelly fraction:** 50% (half Kelly - conservative)
-- **Max trades/hour:** 10
-- **Payout:** Hold to settlement for $1.00 (14-20x return)
-- **Auto-redemption:** Winning tokens auto-redeemed to USDC via poly-web3
 
 ## Credentials
 - **GitHub repo:** https://github.com/iamheisenburger/polymarket-contrarian-bot
@@ -125,16 +172,18 @@ Project Root/
 
 ## Statistical Validation
 
-The 8.8% win rate needs to be validated with our own data. Sample size requirements:
-- **50 trades:** Too early. Wide confidence interval. Don't draw conclusions.
-- **100 trades:** Starting to be useful. Expected ~9 wins. If you see 5-13, you're in range.
-- **200 trades:** Statistically significant. If win rate is above 5%, the edge is confirmed at 95% confidence.
-- **500 trades:** Strong conclusions. Can refine entry price buckets and optimize parameters.
+Each strategy needs 50 trades per coin (200 total) before conclusions:
+- **50/coin:** Minimum for directional confidence
+- Compare observed WR to breakeven WR
+- If WR > breakeven with margin, remove `--min-size` and let Kelly scale
+- If WR < breakeven, strategy is unprofitable — stop or retune
 
-**How to check:** `cat /opt/polymarket-bot/data/trades.csv` on the server. The CSV now tracks bankroll at each trade for equity curve analysis.
+**Ground truth is always the CSV trade log.** Not the terminal display, not gut feel.
 
 ## Important Notes
 - Server MUST be in a non-US, non-blocked region (Amsterdam works)
-- Bot auto-restarts on crash (systemd Restart=always)
-- Bot auto-starts on server reboot
-- Destroy the old NYC droplet to save costs (if not already done)
+- The sniper process is NOT managed by systemd — it runs directly
+- Market maker (observe mode) is a SEPARATE concept from Longshot/Midshot
+- Both Longshot and Midshot use the same `momentum_sniper.py` engine
+- Polymarket uses Chainlink BTC/USD for settlement (not Binance/spot directly)
+- USDC has 6 decimal places; Polymarket minimum order is $1.00 / 5 tokens
