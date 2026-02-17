@@ -81,7 +81,7 @@ class SniperConfig:
     market_check_interval: float = 30.0
 
     # Logging
-    log_file: str = "data/sniper_trades.csv"
+    log_file: str = "data/longshot_trades.csv"
     observe_only: bool = False
 
 

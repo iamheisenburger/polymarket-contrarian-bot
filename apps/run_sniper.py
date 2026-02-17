@@ -107,8 +107,8 @@ def main():
         help="Observe-only mode — show signals but don't trade"
     )
     parser.add_argument(
-        "--log-file", type=str, default="data/sniper_trades.csv",
-        help="Trade log CSV file (default: data/sniper_trades.csv)"
+        "--log-file", type=str, default="data/longshot_trades.csv",
+        help="Trade log CSV file (default: data/longshot_trades.csv)"
     )
     parser.add_argument(
         "--debug", action="store_true",
