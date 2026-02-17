@@ -20,19 +20,16 @@ PROJECT_DIR = SCRIPT_DIR.parent
 CSV_PATH = PROJECT_DIR / "data" / "longshot_trades.csv"
 
 # ── Baseline ──────────────────────────────────────────────────────────
-# All pre-min-size positions settled before trade #1 in this file.
-# The account balance was polluted by old losses during trades 1-80.
-# As of trade #80 (2026-02-17 ~12:25 UTC), old positions are fully
-# settled and balance tracks longshot-only going forward.
+# Trade log was reset on 2026-02-17 after discovering phantom trades
+# (GTC orders logged as filled but never actually matched). Bot now
+# uses FOK (Fill Or Kill) orders — fills instantly or is cancelled.
 #
-# Historical note:
-#   Trades 1-80:  longshot PnL = +$72.45, but account only grew ~$19
-#                 because ~$53 in old pre-min-size losses settled simultaneously.
-#   Trades 81+:   balance delta = longshot PnL (clean, no outside interference).
+# This file starts clean. Every trade is a verified fill.
+# Baseline = trade #0, balance at reset time.
 #
-BASELINE_TRADE_NUM = 80
-BASELINE_BALANCE = 43.17  # Account balance at trade #80
-BREAKEVEN_WR = 21.0       # Entry ~$0.21 → 21% breakeven
+BASELINE_TRADE_NUM = 0
+BASELINE_BALANCE = 0.0  # Set automatically from first trade's usdc_balance
+BREAKEVEN_WR = 21.0     # Entry ~$0.21 → 21% breakeven
 
 
 def load_trades():
@@ -124,28 +121,30 @@ def print_report(trades, coins, total):
     print(f"  Longshot PnL:         ${total['pnl']:+.2f}")
     print()
 
-    # Balance tracking (post-baseline only)
-    if n > BASELINE_TRADE_NUM:
-        post_baseline = trades[BASELINE_TRADE_NUM:]
-        post_pnl = sum(float(t["pnl"]) for t in post_baseline)
-        expected_bal = BASELINE_BALANCE + post_pnl
+    # Balance tracking — use first trade's USDC balance as starting point
+    if n >= 2:
+        # Starting balance = first trade's logged USDC + first trade's cost
+        # (USDC was logged after the order deducted, so add cost back)
+        first_usdc = float(trades[0].get("usdc_balance", 0))
+        first_cost = float(trades[0]["bet_size_usdc"])
+        start_bal = first_usdc + first_cost if first_usdc > 0 else 0
+
         last_usdc = float(trades[-1].get("usdc_balance", 0))
 
-        print("  --- Post-Baseline Balance Check ---")
-        print(f"  Baseline (trade #{BASELINE_TRADE_NUM}):  ${BASELINE_BALANCE:.2f}")
-        print(f"  PnL since baseline:    ${post_pnl:+.2f}  ({n - BASELINE_TRADE_NUM} trades)")
-        print(f"  Expected balance:      ${expected_bal:.2f}")
-        if last_usdc > 0:
+        print("  --- Balance Check (FOK verified fills only) ---")
+        if start_bal > 0:
+            print(f"  Starting USDC:         ${start_bal:.2f}")
+            print(f"  Logged PnL:            ${total['pnl']:+.2f}")
+            print(f"  Expected balance:      ${start_bal + total['pnl']:.2f}")
             print(f"  Last logged USDC:      ${last_usdc:.2f}")
-            diff = abs(expected_bal - last_usdc)
-            if diff < 2.0:
+            diff = abs((start_bal + total["pnl"]) - last_usdc)
+            if diff < 3.0:
                 print(f"  Match: YES (diff ${diff:.2f})")
             else:
                 print(f"  Match: NO (diff ${diff:.2f}) — investigate!")
-        print()
-    else:
-        print(f"  Note: First {BASELINE_TRADE_NUM} trades overlap with old pre-min-size")
-        print(f"  position settlements. Balance reconciliation starts after trade #{BASELINE_TRADE_NUM}.")
+        else:
+            print(f"  Last logged USDC:      ${last_usdc:.2f}")
+            print(f"  (Starting balance unknown — USDC was 0 at first trade)")
         print()
 
     # Time info

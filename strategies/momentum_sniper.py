@@ -607,7 +607,8 @@ class MomentumSniperStrategy:
         if not token_id:
             return False
 
-        # Place aggressive limit order (at or slightly above best ask for fast fill)
+        # Place FOK (Fill Or Kill) order — fills immediately or is cancelled.
+        # This prevents phantom positions from unfilled GTC orders sitting on the book.
         buy_price = min(round(entry_price + 0.01, 2), 0.99)
 
         result = await self.bot.place_order(
@@ -615,9 +616,12 @@ class MomentumSniperStrategy:
             price=buy_price,
             size=num_tokens,
             side="BUY",
+            order_type="FOK",
         )
 
-        if result.success:
+        # Only track position if order was accepted AND filled
+        order_status = (result.status or "").upper()
+        if result.success and order_status not in ("LIVE", "OPEN"):
             actual_cost = buy_price * num_tokens
 
             # Immediately deduct from balance so next Kelly calculation
@@ -673,6 +677,15 @@ class MomentumSniperStrategy:
                 "success"
             )
             return True
+        elif result.success and order_status in ("LIVE", "OPEN"):
+            # Order was accepted but NOT filled (sat on book) — do NOT track position
+            self.log(
+                f"Order NOT FILLED ({state.coin} {side} @ {buy_price:.2f}) "
+                f"status={result.status} — skipping phantom position",
+                "warning"
+            )
+            state.last_fail_time[side] = time.time()
+            return False
         else:
             self.log(f"Order failed ({state.coin} {side}): {result.message}", "error")
             # Cooldown: don't retry this coin/side for 60 seconds
