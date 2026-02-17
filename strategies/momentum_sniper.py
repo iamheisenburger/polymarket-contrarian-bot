@@ -211,6 +211,56 @@ class MomentumSniperStrategy:
     def log(self, msg: str, level: str = "info"):
         self._log_buffer.add(msg, level)
 
+    def _resolve_orphaned_trades(self):
+        """Resolve pending trades from previous sessions via Gamma API."""
+        pending = self.trade_logger.get_pending_trades()
+        if not pending:
+            return
+
+        self.log(f"Found {len(pending)} orphaned pending trades — resolving...", "warning")
+
+        from src.gamma_client import GammaClient
+        gamma = GammaClient()
+        real_balance = self.bot.get_usdc_balance() or self._balance
+
+        resolved = 0
+        for trade_key, record in list(pending.items()):
+            try:
+                market_data = gamma.get_market_by_slug(record.market_slug)
+                if not market_data:
+                    continue
+
+                prices = gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
+
+                # Resolved markets have one side at ~1.0 and other at ~0.0
+                if up_price > 0.9:
+                    winning_side = "up"
+                elif down_price > 0.9:
+                    winning_side = "down"
+                else:
+                    continue  # Market not yet resolved
+
+                side_won = (record.side == winning_side)
+                payout = record.num_tokens * 1.0 if side_won else 0.0
+
+                self.trade_logger.log_outcome(
+                    market_slug=record.market_slug,
+                    side=record.side,
+                    won=side_won,
+                    payout=payout,
+                    usdc_balance=real_balance,
+                )
+
+                outcome = "WON" if side_won else "LOST"
+                self.log(f"  Resolved orphan: {record.coin} {record.side.upper()} {record.market_slug} → {outcome}", "info")
+                resolved += 1
+            except Exception as e:
+                self.log(f"  Failed to resolve {trade_key}: {e}", "warning")
+
+        self.log(f"Resolved {resolved}/{len(pending)} orphaned trades", "success")
+
     def _refresh_balance(self):
         """Query USDC balance (rate-limited to every 10s)."""
         now = time.time()
@@ -247,6 +297,9 @@ class MomentumSniperStrategy:
         # Check USDC balance
         self._refresh_balance()
         self.log(f"USDC balance: ${self._balance:.2f}", "success")
+
+        # Resolve orphaned pending trades from previous sessions
+        self._resolve_orphaned_trades()
 
         # Create market managers for each coin
         for coin in self.config.coins:
@@ -592,6 +645,9 @@ class MomentumSniperStrategy:
             vol = self.binance.get_volatility(state.coin)
             other_price = state.manager.get_mid_price("down" if side == "up" else "up")
 
+            # Get real USDC balance for accurate logging
+            real_balance = self.bot.get_usdc_balance() or self._balance
+
             self.trade_logger.log_trade(
                 market_slug=state.current_slug,
                 coin=state.coin,
@@ -601,6 +657,7 @@ class MomentumSniperStrategy:
                 bet_size_usdc=actual_cost,
                 num_tokens=num_tokens,
                 bankroll=self._balance,
+                usdc_balance=real_balance,
                 btc_price=spot,
                 other_side_price=other_price,
                 volatility_std=vol,
@@ -687,14 +744,18 @@ class MomentumSniperStrategy:
                 else:
                     self.stats.losses += 1
 
-                # Log outcome
-                for pending_slug in self.trade_logger.get_pending_slugs():
-                    if pending_slug == old_slug:
-                        self.trade_logger.log_outcome(
-                            market_slug=old_slug,
-                            won=pnl >= 0,
-                            payout=max(0, pnl + state.total_cost),
-                        )
+                # Log outcome per side (each side resolves independently)
+                real_balance = self.bot.get_usdc_balance() or self._balance
+                for side_name, record in self.trade_logger.get_pending_for_market(old_slug):
+                    side_won = (side_name == winning_side)
+                    side_payout = record.num_tokens * 1.0 if side_won else 0.0
+                    self.trade_logger.log_outcome(
+                        market_slug=old_slug,
+                        side=side_name,
+                        won=side_won,
+                        payout=side_payout,
+                        usdc_balance=real_balance,
+                    )
 
                 outcome = "WIN" if pnl >= 0 else "LOSS"
                 self.log(
