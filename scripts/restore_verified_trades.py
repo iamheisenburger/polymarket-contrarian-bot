@@ -83,26 +83,26 @@ def main():
         print(f"  Win rate: {wins / (wins + losses) * 100:.1f}%")
     print(f"  Total PnL: ${total_pnl:+.2f}")
 
-    # Balance check
+    # Verification: bankroll vs USDC gap at end of period
+    # NOTE: Simple (start_balance + PnL = end_balance) doesn't work for mid-stream
+    # subsets because some positions were opened before the subset started but
+    # settled within it. Instead we verify the bankroll-USDC gap is near zero
+    # at the end, which confirms no phantom positions exist.
     if merged:
-        first_usdc = float(merged[0].get("usdc_balance", 0))
-        first_cost = float(merged[0]["bet_size_usdc"])
-        start_bal = first_usdc + first_cost if first_usdc > 0 else 0
+        last_bankroll = float(merged[-1].get("bankroll", 0))
         last_usdc = float(merged[-1].get("usdc_balance", 0))
+        end_gap = abs(last_bankroll - last_usdc)
 
-        if start_bal > 0 and last_usdc > 0:
-            expected = start_bal + total_pnl
-            diff = abs(expected - last_usdc)
-            print(f"\n  Starting USDC: ${start_bal:.2f}")
-            print(f"  Expected ending: ${expected:.2f}")
-            print(f"  Actual ending: ${last_usdc:.2f}")
-            print(f"  Diff: ${diff:.2f}")
-            if diff < 3.0:
-                print(f"  Balance check: PASS")
-            else:
-                print(f"  Balance check: FAIL — investigate before proceeding")
-                print(f"  NOT writing output. Fix the issue first.")
-                sys.exit(1)
+        print(f"\n  Last bankroll: ${last_bankroll:.2f}")
+        print(f"  Last USDC:     ${last_usdc:.2f}")
+        print(f"  Gap:           ${end_gap:.2f}")
+
+        if end_gap < 3.0:
+            print(f"  Integrity check: PASS (bankroll matches USDC)")
+        else:
+            print(f"  Integrity check: FAIL (gap ${end_gap:.2f}) — investigate")
+            print(f"  NOT writing output. Fix the issue first.")
+            sys.exit(1)
 
     # Backup current file
     if CURRENT.exists():
