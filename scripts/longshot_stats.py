@@ -121,30 +121,25 @@ def print_report(trades, coins, total):
     print(f"  Longshot PnL:         ${total['pnl']:+.2f}")
     print()
 
-    # Balance tracking — use first trade's USDC balance as starting point
-    if n >= 2:
-        # Starting balance = first trade's logged USDC + first trade's cost
-        # (USDC was logged after the order deducted, so add cost back)
-        first_usdc = float(trades[0].get("usdc_balance", 0))
-        first_cost = float(trades[0]["bet_size_usdc"])
-        start_bal = first_usdc + first_cost if first_usdc > 0 else 0
-
+    # Balance integrity — verify bankroll matches on-chain USDC
+    # This checks that the bot's internal state matches reality.
+    # A gap means phantom positions or untracked balance changes.
+    if n >= 1:
+        last_bankroll = float(trades[-1].get("bankroll", 0))
         last_usdc = float(trades[-1].get("usdc_balance", 0))
 
-        print("  --- Balance Check (FOK verified fills only) ---")
-        if start_bal > 0:
-            print(f"  Starting USDC:         ${start_bal:.2f}")
-            print(f"  Logged PnL:            ${total['pnl']:+.2f}")
-            print(f"  Expected balance:      ${start_bal + total['pnl']:.2f}")
-            print(f"  Last logged USDC:      ${last_usdc:.2f}")
-            diff = abs((start_bal + total["pnl"]) - last_usdc)
-            if diff < 3.0:
-                print(f"  Match: YES (diff ${diff:.2f})")
+        print("  --- Balance Integrity Check ---")
+        print(f"  Last bankroll:         ${last_bankroll:.2f}")
+        print(f"  Last USDC (on-chain):  ${last_usdc:.2f}")
+
+        if last_usdc > 0 and last_bankroll > 0:
+            gap = abs(last_bankroll - last_usdc)
+            if gap < 3.0:
+                print(f"  Match: YES (gap ${gap:.2f})")
             else:
-                print(f"  Match: NO (diff ${diff:.2f}) — investigate!")
+                print(f"  Match: NO (gap ${gap:.2f}) — investigate!")
         else:
-            print(f"  Last logged USDC:      ${last_usdc:.2f}")
-            print(f"  (Starting balance unknown — USDC was 0 at first trade)")
+            print(f"  (Insufficient data for balance check)")
         print()
 
     # Time info
