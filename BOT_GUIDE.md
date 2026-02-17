@@ -59,18 +59,25 @@ no edge is available, not a bug.
 - Every outcome is settled on-chain via Chainlink oracle — wins and losses are factual
 - To judge longshot profitability: **use win rate vs 21% breakeven**, not account balance
 
-### Baseline (established 2026-02-17)
-- **Trade #80, balance $43.17** — all pre-min-size positions fully settled
-- Before trade #80: account balance was polluted by old pre-min-size losses settling
-  in the background (~$53 absorbed). The per-trade PnL was correct but didn't match
-  the balance delta.
-- **After trade #80: balance delta = longshot PnL**. No more outside interference.
-- The stats script (`scripts/longshot_stats.py`) has a post-baseline balance check
-  that verifies this.
+### Phantom Trades Bug (fixed 2026-02-17)
+- **Bug:** GTC orders accepted by CLOB (`success=True`) were logged as filled trades
+  even when they sat on the orderbook unfilled. This inflated PnL by ~$15-20.
+- **Fix:** Switched to FOK (Fill Or Kill) orders — fills instantly or is cancelled.
+  Bot now verifies order status before tracking position (rejects LIVE/OPEN status).
+- **Code:** `strategies/momentum_sniper.py` — order_type="FOK" + fill verification
+
+### Baseline (restored 2026-02-17)
+- **40 verified trades restored** from the archive (trades that had USDC balance
+  confirmation, bankroll-USDC gap = $0.00 at end of period).
+- First 62 trades from original log were discarded — no USDC balance data to verify,
+  plus contaminated by pre-min-size settlements and phantom trades.
+- All new trades use FOK orders — verified fills only.
+- Integrity check: bankroll vs on-chain USDC gap (not PnL sum, which fails mid-stream).
 
 ### Archived files (in `data/`)
 - `archive_pre_minsize_trades.csv` — old pre-min-size era trades (do not use)
 - `archive_sniper_trades_old_logger.csv` — old logger duplicate (do not use)
+- `archive_longshot_phantom_trades.csv` — contaminated log with phantom fills (do not use)
 - `trades.csv` — old contrarian log (retired)
 
 ## Quick Commands
