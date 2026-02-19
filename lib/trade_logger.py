@@ -29,12 +29,15 @@ Usage:
 
 import csv
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -210,8 +213,8 @@ class TradeLogger:
                 record = TradeRecord(**record_dict)
                 self._pending_trades[key] = record
                 self.stats.pending += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to load pending trades from {self.pending_filepath}: {e}")
 
     def _save_pending(self) -> None:
         """Save pending trades to JSON sidecar file."""
@@ -222,8 +225,8 @@ class TradeLogger:
 
             with open(self.pending_filepath, "w") as f:
                 json.dump(data, f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to save pending trades to {self.pending_filepath}: {e}")
 
     def log_trade(
         self,
@@ -352,8 +355,8 @@ class TradeLogger:
                     f"{record.momentum_at_entry:.8f}",
                     f"{record.volatility_at_entry:.6f}",
                 ])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to write trade to CSV {self.filepath}: {e}")
 
     def get_pending_slugs(self) -> List[str]:
         """Get list of market slugs with pending outcomes."""
