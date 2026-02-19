@@ -2,25 +2,44 @@
 """
 Precision Sniper v2 Stats — Professional trade analytics.
 
-Tracks: overall WR, WR by volatility/TTE/price/hour/momentum, balance trajectory.
-Run: python3 scripts/v2_stats.py [--csv data/v2_trades.csv]
+Tracks: overall WR, WR by volatility/TTE/price/hour/momentum/coin/timeframe.
+Reads from both 5m and 15m trade logs automatically.
+Run: python3 scripts/v2_stats.py
 """
 import csv
+import glob
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime
 
-DEFAULT_CSV = "data/v2_trades.csv"
+DEFAULT_CSVS = ["data/v2_trades.csv", "data/v2_trades_15m.csv"]
 BREAKEVEN_WR = 21.0  # % win rate needed to break even at ~$0.21 entry
 
 
-def load_trades(filepath):
+def load_trades_from_file(filepath):
     trades = []
-    with open(filepath) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("outcome") in ("won", "lost"):
-                trades.append(row)
+    try:
+        with open(filepath) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("outcome") in ("won", "lost"):
+                    trades.append(row)
+    except FileNotFoundError:
+        pass
+    return trades
+
+
+def load_trades(filepaths=None):
+    if filepaths is None:
+        filepaths = DEFAULT_CSVS
+    if isinstance(filepaths, str):
+        filepaths = [filepaths]
+    trades = []
+    for fp in filepaths:
+        trades.extend(load_trades_from_file(fp))
+    # Sort by timestamp
+    trades.sort(key=lambda t: t.get("timestamp", ""))
     return trades
 
 
@@ -61,17 +80,16 @@ def bucket_analysis(trades, key_fn, bucket_label, sort_key=None):
 
 
 def main():
-    filepath = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV
+    if len(sys.argv) > 1:
+        filepaths = [sys.argv[1]]
+    else:
+        filepaths = DEFAULT_CSVS
 
-    try:
-        trades = load_trades(filepath)
-    except FileNotFoundError:
-        print(f"  No trade file found: {filepath}")
-        print("  Bot hasn't placed any trades yet.")
-        return
+    trades = load_trades(filepaths)
 
     if not trades:
         print("  No resolved trades yet.")
+        print(f"  Checked: {', '.join(filepaths)}")
         return
 
     wins = sum(1 for t in trades if t["outcome"] == "won")
@@ -83,8 +101,15 @@ def main():
     first_bal = float(trades[0].get("usdc_balance", 0))
     last_bal = float(trades[-1].get("usdc_balance", 0))
 
+    # Count sources
+    sources = set()
+    for fp in filepaths:
+        if os.path.exists(fp):
+            sources.add(fp)
+    src_str = " + ".join(sources) if sources else "no files"
+
     print("=" * 60)
-    print(f"  PRECISION SNIPER v2 — {filepath}")
+    print(f"  PRECISION SNIPER v2 — {src_str}")
     print("=" * 60)
     print(f"  Trades: {len(trades)} ({wins}W / {losses}L)")
     print(f"  Win Rate: {wr(wins, len(trades)):.1f}% (breakeven: {BREAKEVEN_WR:.0f}%)")
@@ -193,6 +218,14 @@ def main():
     # --- Side analysis ---
     print_section("WR by Side")
     bucket_analysis(trades, lambda t: t["side"].upper(), "Side")
+
+    # --- Per-coin analysis ---
+    print_section("WR by Coin")
+    bucket_analysis(trades, lambda t: t.get("coin", "BTC").upper(), "Coin")
+
+    # --- Per-timeframe analysis ---
+    print_section("WR by Timeframe")
+    bucket_analysis(trades, lambda t: t.get("timeframe", "5m"), "Timeframe")
 
     # --- Consecutive analysis ---
     print_section("Streak Analysis")
