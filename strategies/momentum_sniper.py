@@ -66,7 +66,8 @@ class SniperConfig:
     kelly_strong: float = 0.75      # Strong edge: 3/4 Kelly
     bankroll: float = 20.0          # Starting capital in USDC
     min_bet_usdc: float = 1.0       # Polymarket minimum ($1 floor)
-    max_bet_usdc: float = 100.0     # Cap per trade
+    max_bet_usdc: float = 100.0     # Cap per trade (absolute)
+    max_bet_fraction: float = 0.15  # Max fraction of bankroll per trade (15%)
 
     # Conservative mode: always bet minimum (5 tokens) to gather data.
     # Use this when bankroll is small and you need statistical significance
@@ -487,6 +488,12 @@ class MomentumSniperStrategy:
         # Use stronger Kelly fraction for strong signals
         fraction = self.config.kelly_strong if strong else self.config.kelly_fraction
         bet_fraction = kelly_f * fraction
+
+        # Hard cap: never risk more than max_bet_fraction of bankroll on one trade.
+        # Kelly can compute huge fractions near expiry (fair_prob ~0.99 → 65%+ of
+        # bankroll). This cap prevents any single trade from blowing up the account.
+        if self.config.max_bet_fraction > 0:
+            bet_fraction = min(bet_fraction, self.config.max_bet_fraction)
 
         available = self._available_balance()
         if available < self.config.min_bet_usdc:

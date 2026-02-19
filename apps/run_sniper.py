@@ -95,6 +95,10 @@ def main():
         help="Max USDC per single trade — Kelly handles sizing (default: 100)"
     )
     parser.add_argument(
+        "--max-bet-fraction", type=float, default=0.15,
+        help="Max fraction of bankroll per trade (default: 0.15 = 15%%). Prevents Kelly from over-betting near expiry."
+    )
+    parser.add_argument(
         "--min-size", action="store_true",
         help="Conservative mode — always bet minimum 5 tokens per trade for data gathering"
     )
@@ -195,6 +199,7 @@ def main():
         kelly_strong=args.kelly_strong,
         bankroll=args.bankroll,
         max_bet_usdc=args.max_bet,
+        max_bet_fraction=args.max_bet_fraction,
         max_entry_price=args.max_entry_price,
         min_size_mode=args.min_size,
         kelly_coins=kelly_coins,
@@ -239,6 +244,7 @@ def main():
         print(f"  Position Sizing (Kelly Criterion):")
         print(f"    Normal Kelly: {args.kelly:.0%}")
         print(f"    Strong Kelly: {args.kelly_strong:.0%}")
+        print(f"    Max per trade: {args.max_bet_fraction:.0%} of bankroll (${args.max_bet_fraction * args.bankroll:.2f})")
         print(f"    Min per trade: $1.00 (Polymarket floor)")
         print()
         ex_price = 0.40
