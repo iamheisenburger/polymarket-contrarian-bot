@@ -534,7 +534,7 @@ class MomentumSniperStrategy:
             # Volatility filter: only trade in low-vol regimes.
             # Data: vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
             if self.config.max_volatility > 0:
-                current_vol = self.price_feed.get_volatility(state.coin)
+                current_vol = self.binance.get_volatility(state.coin)
                 if current_vol > self.config.max_volatility:
                     continue
 
@@ -590,7 +590,7 @@ class MomentumSniperStrategy:
                 if edge >= self.config.min_edge:
                     # Momentum filter: Binance must be moving in our direction
                     if self.config.min_momentum > 0:
-                        momentum = self.price_feed.get_momentum(
+                        momentum = self.binance.get_momentum(
                             state.coin, self.config.momentum_lookback
                         )
                         if side == "up" and momentum < self.config.min_momentum:
@@ -715,7 +715,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
                 fair_value_at_entry=fair_prob,
                 time_to_expiry_at_entry=state.seconds_to_expiry(),
-                momentum_at_entry=self.price_feed.get_momentum(
+                momentum_at_entry=self.binance.get_momentum(
                     state.coin, self.config.momentum_lookback
                 ),
                 volatility_at_entry=vol,
