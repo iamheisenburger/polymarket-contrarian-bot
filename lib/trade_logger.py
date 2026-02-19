@@ -57,6 +57,10 @@ class TradeRecord:
     btc_price: float = 0.0
     other_side_price: float = 0.0
     volatility_std: float = 0.0
+    fair_value_at_entry: float = 0.0       # Black-Scholes fair prob when we entered
+    time_to_expiry_at_entry: float = 0.0   # Seconds left when we entered
+    momentum_at_entry: float = 0.0         # Binance price change % (30s lookback)
+    volatility_at_entry: float = 0.0       # Realized vol when we entered
 
     @property
     def trade_key(self) -> str:
@@ -134,6 +138,8 @@ class TradeLogger:
         "entry_price", "bet_size_usdc", "num_tokens",
         "outcome", "payout", "pnl", "bankroll", "usdc_balance",
         "btc_price", "other_side_price", "volatility_std",
+        "fair_value_at_entry", "time_to_expiry_at_entry",
+        "momentum_at_entry", "volatility_at_entry",
     ]
 
     def __init__(self, filepath: str = "data/trades.csv"):
@@ -233,6 +239,10 @@ class TradeLogger:
         btc_price: float = 0.0,
         other_side_price: float = 0.0,
         volatility_std: float = 0.0,
+        fair_value_at_entry: float = 0.0,
+        time_to_expiry_at_entry: float = 0.0,
+        momentum_at_entry: float = 0.0,
+        volatility_at_entry: float = 0.0,
     ) -> TradeRecord:
         """
         Log a new trade entry. Stored in pending JSON only (not CSV yet).
@@ -252,6 +262,10 @@ class TradeLogger:
             btc_price=btc_price,
             other_side_price=other_side_price,
             volatility_std=volatility_std,
+            fair_value_at_entry=fair_value_at_entry,
+            time_to_expiry_at_entry=time_to_expiry_at_entry,
+            momentum_at_entry=momentum_at_entry,
+            volatility_at_entry=volatility_at_entry,
         )
 
         trade_key = record.trade_key
@@ -333,6 +347,10 @@ class TradeLogger:
                     f"{record.btc_price:.2f}",
                     f"{record.other_side_price:.4f}",
                     f"{record.volatility_std:.6f}",
+                    f"{record.fair_value_at_entry:.6f}",
+                    f"{record.time_to_expiry_at_entry:.0f}",
+                    f"{record.momentum_at_entry:.8f}",
+                    f"{record.volatility_at_entry:.6f}",
                 ])
         except Exception:
             pass

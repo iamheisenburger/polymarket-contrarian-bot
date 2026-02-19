@@ -82,6 +82,18 @@ class SniperConfig:
     # Empty list = trade all hours. E.g. [0, 2, 9, 16, 17] to block bad hours.
     blocked_hours: List[int] = field(default_factory=list)
 
+    # Volatility filter: skip trading when realized vol exceeds this.
+    # Data shows vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
+    # Set to 0.0 to disable.
+    max_volatility: float = 0.50
+
+    # Momentum filter: minimum Binance price change (fraction) in trade direction
+    # over the lookback period. 0.0005 = 0.05%. Set to 0.0 to disable.
+    min_momentum: float = 0.0005
+
+    # Momentum lookback period in seconds
+    momentum_lookback: float = 30.0
+
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
@@ -519,6 +531,13 @@ class MomentumSniperStrategy:
             if state.seconds_to_expiry() <= 0:
                 continue
 
+            # Volatility filter: only trade in low-vol regimes.
+            # Data: vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
+            if self.config.max_volatility > 0:
+                current_vol = self.price_feed.get_volatility(state.coin)
+                if current_vol > self.config.max_volatility:
+                    continue
+
             # Calculate fair value
             fv = self._calculate_fair_value(state)
             if not fv:
@@ -569,6 +588,16 @@ class MomentumSniperStrategy:
                 edge = fair_prob - buy_price
 
                 if edge >= self.config.min_edge:
+                    # Momentum filter: Binance must be moving in our direction
+                    if self.config.min_momentum > 0:
+                        momentum = self.price_feed.get_momentum(
+                            state.coin, self.config.momentum_lookback
+                        )
+                        if side == "up" and momentum < self.config.min_momentum:
+                            continue  # Price not trending up
+                        if side == "down" and momentum > -self.config.min_momentum:
+                            continue  # Price not trending down
+
                     opportunities.append((state, side, best_ask, edge, fv))
 
         # Sort by edge, best first
@@ -684,6 +713,12 @@ class MomentumSniperStrategy:
                 btc_price=spot,
                 other_side_price=other_price,
                 volatility_std=vol,
+                fair_value_at_entry=fair_prob,
+                time_to_expiry_at_entry=state.seconds_to_expiry(),
+                momentum_at_entry=self.price_feed.get_momentum(
+                    state.coin, self.config.momentum_lookback
+                ),
+                volatility_at_entry=vol,
             )
 
             kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
@@ -976,8 +1011,14 @@ class MomentumSniperStrategy:
             sizing = "MIN-SIZE (5 tok)"
         else:
             sizing = f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
+        # Build filters string
+        filters = f"edge>={self.config.min_edge:.0%}"
+        if self.config.max_volatility > 0:
+            filters += f" | vol<{self.config.max_volatility:.2f}"
+        if self.config.min_momentum > 0:
+            filters += f" | mom>{self.config.min_momentum:.2%}"
         lines.append(
-            f"  Settings: edge>={self.config.min_edge:.2f} | "
+            f"  Settings: {filters} | "
             f"{sizing} | "
             f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}]"
         )

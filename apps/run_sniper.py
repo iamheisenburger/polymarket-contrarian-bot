@@ -122,6 +122,18 @@ def main():
         "--block-hours", type=str, default="",
         help="Comma-separated UTC hours to skip trading. E.g. --block-hours 0,2,9,16,17"
     )
+    parser.add_argument(
+        "--max-vol", type=float, default=0.0,
+        help="Max volatility to trade (e.g. 0.50). 0 = disabled (default)"
+    )
+    parser.add_argument(
+        "--min-momentum", type=float, default=0.0,
+        help="Min Binance price move in trade direction (e.g. 0.0005 = 0.05%%). 0 = disabled (default)"
+    )
+    parser.add_argument(
+        "--momentum-lookback", type=float, default=30.0,
+        help="Seconds to look back for momentum calculation (default: 30)"
+    )
 
     args = parser.parse_args()
 
@@ -187,6 +199,9 @@ def main():
         min_size_mode=args.min_size,
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
+        max_volatility=args.max_vol,
+        min_momentum=args.min_momentum,
+        momentum_lookback=args.momentum_lookback,
         observe_only=args.observe,
         log_file=args.log_file,
     )

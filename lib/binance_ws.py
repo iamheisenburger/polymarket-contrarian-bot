@@ -139,6 +139,36 @@ class BinancePriceFeed:
 
         return state._cached_vol
 
+    def get_momentum(self, coin: str, lookback_seconds: float = 30.0) -> float:
+        """
+        Return price change % over last N seconds. Positive = price going up.
+
+        Used as a momentum filter: only enter trades when Binance price
+        is moving in the direction of our bet.
+        """
+        coin = coin.upper()
+        state = self._state.get(coin)
+        if not state or not state.history:
+            return 0.0
+
+        current_price = state.price
+        if current_price <= 0:
+            return 0.0
+
+        # Find the most recent price at or before the cutoff time
+        cutoff = time.time() - lookback_seconds
+        past_price = None
+        for point in state.history:
+            if point.timestamp <= cutoff:
+                past_price = point.price
+        # If no point old enough, use the oldest available
+        if past_price is None and state.history:
+            past_price = state.history[0].price
+        if not past_price or past_price <= 0:
+            return 0.0
+
+        return (current_price - past_price) / past_price
+
     def _calculate_volatility(self, coin: str) -> float:
         """Calculate annualized realized volatility from price history."""
         state = self._state[coin]

@@ -2,47 +2,52 @@
 
 ## Strategy Overview
 
-We trade Polymarket crypto binary markets (BTC/ETH/SOL/XRP Up/Down, 15-minute) by
-exploiting the latency between Binance spot price movements and Polymarket orderbook
-repricing. Black-Scholes calculates the true probability; when the market price lags
-behind, we buy the mispriced side and hold to settlement ($1.00 on win, $0.00 on loss).
+We trade Polymarket crypto binary markets by exploiting the latency between Binance
+spot price movements and Polymarket orderbook repricing. Black-Scholes calculates
+the true probability; when the market price lags behind, we buy the mispriced side
+and hold to settlement ($1.00 on win, $0.00 on loss).
 
-Both strategies use the same engine (`strategies/momentum_sniper.py`) but target
-different price regimes:
+### Active: Precision Sniper v2 (BTC 5m)
+- **BTC only, 5-minute markets** — 288 market windows per day
+- **Any price range** — entry up to $0.85 (trades cheap AND midrange sides)
+- **Three entry filters** working together:
+  1. **Edge ≥ 15%** — fair_value minus buy_price must be at least $0.15
+  2. **Volatility < 0.50** — realized vol from Binance below 0.50
+  3. **Momentum confirmation** — Binance price moved ≥ 0.05% in trade direction (30s)
+- Breakeven WR: ~21% (varies by entry price)
+- Trade log: `data/v2_trades.csv`
 
-### Strategy 1: LONGSHOT (live)
-- **Buys the CHEAP side** — entry price < $0.20 (execution ~$0.21)
-- Payout: **4.76x** | Breakeven WR: **21%**
-- Per trade: risk $1.05, win $3.95 (5 tokens at $0.21)
-- Fires when crypto trends strongly (one side gets pushed cheap)
-- Trade log: `data/longshot_trades.csv`
-
-### Strategy 2: MIDSHOT (not yet live)
-- **Buys the MIDRANGE side** — entry price ~$0.40-$0.60
-- Payout: **~2x** | Breakeven WR: **50%**
-- Per trade: risk ~$2.50, win ~$2.50 (5 tokens at ~$0.50)
-- Fires when markets are uncertain (near 50/50), higher frequency
-- Trade log: `data/midshot_trades.csv` (to be created)
+### Why These Filters (from 249-trade Longshot analysis)
+| Filter | Evidence |
+|--------|----------|
+| Vol < 0.50 | 35.8% WR on 106 trades vs 22.4% when vol > 0.50 |
+| Vol < 0.40 | 44.4% WR on 54 trades |
+| Vol > 0.70 | 22.5% WR — barely breakeven, should NEVER trade |
+| Short TTE (<3 min) | 40.4% WR on 57 trades |
+| Win clustering | 38.4% WR after a win vs 25.7% after a loss |
 
 ### Binary Payoff Math
 - Breakeven win rate = entry price (e.g., $0.21 entry → 21% breakeven)
 - Edge comes from Binance moving in ms while Polymarket reprices in seconds
 - Kelly Criterion sizes bets; currently locked to min-size (5 tokens) for data collection
-- Both strategies hold to settlement — no early exits
+- Hold to settlement — no early exits
 
-## Master Plan (7 Steps)
+## V2 Growth Plan
 
-1. **[CURRENT]** Collect 50 trades/coin on Longshot (BTC/ETH/SOL/XRP = 200 total)
-2. If profitable (WR > 21%), remove `--min-size` and let Kelly scale
-3. Grow account to fund Midshot campaign
-4. Start Midshot at `--min-size` (50 trades/coin data collection)
-5. Determine if Midshot is profitable (WR > 50%)
-6. If profitable, remove `--min-size` on Midshot too
-7. Explore 5m markets for both strategies
+1. **[CURRENT]** Collect 50 trades at min-size (data collection)
+2. If WR > 30% at 50 trades → half-Kelly sizing
+3. If WR > 30% at 100 trades → 3/4 Kelly sizing
+4. If WR < 21% at 50 trades → STOP, review filters
 
 **Rules during data collection:** No strategy changes. No parameter tweaking. Let
 the data come in. Losing streaks are mathematically expected. Quiet periods mean
 no edge is available, not a bug.
+
+### Retired: Longshot v1 (Feb 17-19, 249 trades)
+- BTC/ETH/SOL/XRP on 15m markets, entry < $0.20
+- Overall 29.7% WR but decayed from 36.8% pre-peak to 22.7% post-peak
+- No volatility filter, no momentum filter — traded too often with weak signals
+- Trade log archived: `data/longshot_trades.csv`
 
 ## Server Details
 - **Provider:** DigitalOcean
@@ -82,7 +87,12 @@ no edge is available, not a bug.
 
 ## Quick Commands
 
-### Run longshot stats (THE command for checking performance)
+### Run v2 stats (THE command for checking performance)
+```bash
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "python3 /opt/polymarket-bot/scripts/v2_stats.py"
+```
+
+### Run old longshot stats (archived, for reference)
 ```bash
 ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "python3 /opt/polymarket-bot/scripts/longshot_stats.py"
 ```
@@ -119,18 +129,14 @@ ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "free -h && echo '---' && df -h 
 
 ## Active Processes on VPS
 
-1. **Longshot sniper** (main bot):
-   `apps/run_sniper.py --coins BTC ETH SOL XRP --timeframe 15m --bankroll 25 --min-edge 0.05 --min-size --max-entry-price 0.20`
+1. **Precision Sniper v2** (main bot):
+   ```bash
+   python apps/run_sniper.py --coins BTC --timeframe 5m --bankroll 35 --min-edge 0.15 --min-size --max-entry-price 0.85 --max-vol 0.50 --min-momentum 0.0005 --momentum-lookback 30 --log-file data/v2_trades.csv
+   ```
    Log: `/var/log/polymarket-sniper.log`
 
-2. **Market maker** (observe only, separate from Longshot/Midshot):
-   `apps/run_market_maker.py --coin BTC --timeframe 15m --bankroll 19 --observe`
-   Log: `/var/log/polymarket-mm.log`
-
-3. **Lag collector** (research data):
+2. **Lag collector** (research data):
    `scripts/lag_collector.py` (screen session)
-
-4. **Old contrarian service**: STOPPED (systemd configured but inactive)
 
 ## Architecture
 
@@ -159,13 +165,14 @@ Project Root/
 │   ├── market_manager.py      # Market lifecycle management
 │   └── console.py             # Terminal UI
 ├── data/
-│   ├── longshot_trades.csv    # Longshot trade log (ONLY source of truth)
+│   ├── v2_trades.csv          # V2 trade log (ONLY source of truth)
+│   ├── longshot_trades.csv    # Longshot v1 log (archived)
 │   ├── longshot_trades.pending.json  # Pending trade tracker
-│   ├── mm_trades.csv          # Market maker log (empty, observe only)
 │   ├── archive_*.csv          # Old files, do not use
 │   └── trades.csv             # Old contrarian log (retired)
 └── scripts/
-    ├── longshot_stats.py       # Stats script — run this to check performance
+    ├── v2_stats.py             # V2 stats — run this to check performance
+    ├── longshot_stats.py       # Old longshot stats (for reference)
     ├── lag_collector.py        # Binance vs Polymarket lag research
     ├── analyze_top_traders.py  # Leaderboard wallet analysis
     └── scan_daily_crypto.py    # Daily crypto market scanner
@@ -179,45 +186,41 @@ Project Root/
 
 ## Statistical Validation
 
-Each strategy needs 50 trades per coin (200 total) before conclusions:
-- **50/coin:** Minimum for directional confidence
-- Compare observed WR to breakeven WR
-- If WR > breakeven with margin, remove `--min-size` and let Kelly scale
-- If WR < breakeven, strategy is unprofitable — stop or retune
+V2 needs 50 trades before conclusions:
+- Compare observed WR to ~21% breakeven WR
+- If WR > 30% at 50 trades → half-Kelly sizing
+- If WR > 30% at 100 trades → 3/4 Kelly sizing
+- If WR < 21% at 50 trades → STOP
 
-**Ground truth is always the CSV trade log.** Not the terminal display, not gut feel.
+**Ground truth is always `data/v2_trades.csv`.** Not the terminal display, not gut feel.
 
-## Step 2 Decision Framework & Results
+### V2 Decision Checkpoints
+| Checkpoint | WR > 35% | WR 25-35% | WR 21-25% | WR < 21% |
+|------------|----------|-----------|-----------|----------|
+| 50 trades | Half-Kelly | Stay min-size | Stay min-size, review | **Stop** |
+| 100 trades | 3/4 Kelly | Half-Kelly | Review filters | **Stop** |
 
-### Framework (agreed 2026-02-19)
-| Per-Coin WR | Action |
-|-------------|--------|
-| **Above 30%** | Remove `--min-size`, let Kelly scale |
-| **25-30%** | Keep at `--min-size` for another 50 trades |
-| **Below 25%** | Drop that coin |
-
-### Results (evaluated at 246 trades, 2026-02-19)
-| Coin | Trades | WR | Decision |
-|------|--------|-----|----------|
-| BTC | 56 | 35.7% | **Kelly (half-Kelly)** — clear winner |
-| ETH | 75 | 29.3% | **Stay min-size** — thin edge, needs data |
-| SOL | 65 | 29.2% | **Stay min-size** — thin edge, needs data |
-| XRP | 50 | 24.0% | **Dropped** — below threshold |
-
-### Active Run Command (Step 2)
+### Active Run Command (v2)
 ```bash
-python apps/run_sniper.py --coins BTC ETH SOL --timeframe 15m --bankroll 39 --min-edge 0.05 --min-size --kelly-coins BTC --max-entry-price 0.20
+python apps/run_sniper.py --coins BTC --timeframe 5m --bankroll 35 --min-edge 0.15 --min-size --max-entry-price 0.85 --max-vol 0.50 --min-momentum 0.0005 --momentum-lookback 30 --log-file data/v2_trades.csv
 ```
 
-### Hour Blocking (available but disabled)
-Analysis of 246 trades showed 5 worst UTC hours (00,02,09,16,17) at 7% WR (3W-40L).
-Feature implemented via `--block-hours` but not enabled pending more per-hour data.
-The stats script now shows per-hour WR for ongoing monitoring.
+## Longshot v1 Results (archived)
+
+### Step 2 Results (evaluated at 246 trades, 2026-02-19)
+| Coin | Trades | WR | Decision |
+|------|--------|-----|----------|
+| BTC | 56 | 35.7% | Strong edge |
+| ETH | 75 | 29.3% | Thin edge |
+| SOL | 65 | 29.2% | Thin edge |
+| XRP | 50 | 24.0% | Below breakeven |
+
+**Post-mortem:** Overall 29.7% WR masked a pre-peak 36.8% → post-peak 22.7% decay.
+No volatility or momentum filters meant the bot traded every signal regardless of
+conditions, including high-vol noise periods that destroyed gains.
 
 ## Important Notes
 - Server MUST be in a non-US, non-blocked region (Amsterdam works)
 - The sniper process is NOT managed by systemd — it runs directly
-- Market maker (observe mode) is a SEPARATE concept from Longshot/Midshot
-- Both Longshot and Midshot use the same `momentum_sniper.py` engine
 - Polymarket uses Chainlink BTC/USD for settlement (not Binance/spot directly)
 - USDC has 6 decimal places; Polymarket minimum order is $1.00 / 5 tokens
