@@ -187,6 +187,33 @@ Each strategy needs 50 trades per coin (200 total) before conclusions:
 
 **Ground truth is always the CSV trade log.** Not the terminal display, not gut feel.
 
+## Step 2 Decision Framework & Results
+
+### Framework (agreed 2026-02-19)
+| Per-Coin WR | Action |
+|-------------|--------|
+| **Above 30%** | Remove `--min-size`, let Kelly scale |
+| **25-30%** | Keep at `--min-size` for another 50 trades |
+| **Below 25%** | Drop that coin |
+
+### Results (evaluated at 246 trades, 2026-02-19)
+| Coin | Trades | WR | Decision |
+|------|--------|-----|----------|
+| BTC | 56 | 35.7% | **Kelly (half-Kelly)** — clear winner |
+| ETH | 75 | 29.3% | **Stay min-size** — thin edge, needs data |
+| SOL | 65 | 29.2% | **Stay min-size** — thin edge, needs data |
+| XRP | 50 | 24.0% | **Dropped** — below threshold |
+
+### Active Run Command (Step 2)
+```bash
+python apps/run_sniper.py --coins BTC ETH SOL --timeframe 15m --bankroll 39 --min-edge 0.05 --min-size --kelly-coins BTC --max-entry-price 0.20
+```
+
+### Hour Blocking (available but disabled)
+Analysis of 246 trades showed 5 worst UTC hours (00,02,09,16,17) at 7% WR (3W-40L).
+Feature implemented via `--block-hours` but not enabled pending more per-hour data.
+The stats script now shows per-hour WR for ongoing monitoring.
+
 ## Important Notes
 - Server MUST be in a non-US, non-blocked region (Amsterdam works)
 - The sniper process is NOT managed by systemd — it runs directly

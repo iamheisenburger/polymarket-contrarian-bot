@@ -114,6 +114,14 @@ def main():
         "--debug", action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--kelly-coins", nargs="+", type=str, default=[],
+        help="Coins to use Kelly sizing for (others stay min-size). E.g. --kelly-coins BTC"
+    )
+    parser.add_argument(
+        "--block-hours", type=str, default="",
+        help="Comma-separated UTC hours to skip trading. E.g. --block-hours 0,2,9,16,17"
+    )
 
     args = parser.parse_args()
 
@@ -126,6 +134,26 @@ def main():
     for c in coins:
         if c not in valid_coins:
             print(f"{Colors.RED}Invalid coin: {c}. Options: {valid_coins}{Colors.RESET}")
+            sys.exit(1)
+
+    # Validate kelly-coins (must be subset of --coins)
+    kelly_coins = [c.upper() for c in args.kelly_coins]
+    for c in kelly_coins:
+        if c not in coins:
+            print(f"{Colors.RED}Error: --kelly-coins {c} not in --coins list ({coins}){Colors.RESET}")
+            sys.exit(1)
+
+    # Parse blocked hours
+    blocked_hours = []
+    if args.block_hours:
+        try:
+            blocked_hours = [int(h.strip()) for h in args.block_hours.split(",")]
+            for h in blocked_hours:
+                if h < 0 or h > 23:
+                    print(f"{Colors.RED}Error: --block-hours must be 0-23, got {h}{Colors.RESET}")
+                    sys.exit(1)
+        except ValueError:
+            print(f"{Colors.RED}Error: --block-hours must be comma-separated integers{Colors.RESET}")
             sys.exit(1)
 
     # Check environment
@@ -157,6 +185,8 @@ def main():
         max_bet_usdc=args.max_bet,
         max_entry_price=args.max_entry_price,
         min_size_mode=args.min_size,
+        kelly_coins=kelly_coins,
+        blocked_hours=blocked_hours,
         observe_only=args.observe,
         log_file=args.log_file,
     )

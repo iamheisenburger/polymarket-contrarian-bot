@@ -73,6 +73,15 @@ class SniperConfig:
     # before committing to full Kelly sizing.
     min_size_mode: bool = False
 
+    # Per-coin Kelly override: when min_size_mode is True, coins listed here
+    # use Kelly sizing instead of min-size. Coins NOT listed stay at min-size.
+    # Empty list = all coins follow min_size_mode setting.
+    kelly_coins: List[str] = field(default_factory=list)
+
+    # Hour blocking: UTC hours to skip trading entirely.
+    # Empty list = trade all hours. E.g. [0, 2, 9, 16, 17] to block bad hours.
+    blocked_hours: List[int] = field(default_factory=list)
+
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
@@ -489,6 +498,13 @@ class MomentumSniperStrategy:
         """
         opportunities = []
 
+        # Hour blocking: skip trading entirely during blocked UTC hours
+        if self.config.blocked_hours:
+            import datetime
+            current_hour = datetime.datetime.utcnow().hour
+            if current_hour in self.config.blocked_hours:
+                return []
+
         for coin, state in self.coin_states.items():
             if not state.current_slug:
                 continue
@@ -582,7 +598,15 @@ class MomentumSniperStrategy:
         fair_prob = fv.fair_up if side == "up" else fv.fair_down
         is_strong = edge >= self.config.strong_edge
 
-        if self.config.min_size_mode:
+        # Per-coin sizing: kelly_coins use Kelly even when min_size_mode is on
+        use_kelly = (not self.config.min_size_mode) or (state.coin in self.config.kelly_coins)
+
+        if use_kelly:
+            bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
+            if bet_usdc < self.config.min_bet_usdc:
+                return False
+            num_tokens = round(bet_usdc / entry_price, 2)
+        else:
             # Conservative: always bet exactly 5 tokens (Polymarket minimum).
             # Cheapest way to get data on whether the edge is real.
             num_tokens = 5.0
@@ -592,11 +616,6 @@ class MomentumSniperStrategy:
                 return False
             if bet_usdc > self._available_balance():
                 return False
-        else:
-            bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
-            if bet_usdc < self.config.min_bet_usdc:
-                return False
-            num_tokens = round(bet_usdc / entry_price, 2)
 
         if num_tokens < 5.0:
             # Not enough for Polymarket minimum order size
@@ -950,7 +969,13 @@ class MomentumSniperStrategy:
         )
 
         # Edge settings
-        sizing = "MIN-SIZE (5 tok)" if self.config.min_size_mode else f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
+        if self.config.kelly_coins:
+            kelly_str = "/".join(self.config.kelly_coins)
+            sizing = f"Kelly: {kelly_str} | MIN-SIZE: others"
+        elif self.config.min_size_mode:
+            sizing = "MIN-SIZE (5 tok)"
+        else:
+            sizing = f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
         lines.append(
             f"  Settings: edge>={self.config.min_edge:.2f} | "
             f"{sizing} | "

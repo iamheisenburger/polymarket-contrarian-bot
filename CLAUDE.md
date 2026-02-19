@@ -2,9 +2,44 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Active Strategy: Momentum Sniper (Longshot + Midshot)
 
-A beginner-friendly Python trading bot for Polymarket with gasless transactions via Builder Program. Uses EIP-712 signing for orders, encrypted private key storage, and supports both the CLOB API and Relayer API.
+**READ `BOT_GUIDE.md` FIRST** — it has the full strategy breakdown, math, master plan, SSH commands, and architecture.
+
+This bot trades Polymarket crypto binary markets (BTC/ETH/SOL/XRP Up/Down, 15m) by
+exploiting Binance-to-Polymarket latency. Black-Scholes calculates fair value; when
+market price lags, we buy the mispriced side and hold to settlement ($1 win / $0 loss).
+
+Two campaigns using the same engine (`strategies/momentum_sniper.py`):
+
+| | Longshot | Midshot |
+|---|---------|---------|
+| Status | **LIVE** (data collection) | NOT YET LIVE |
+| Entry price | < $0.20 | ~$0.40-$0.60 |
+| Payout | 4.76x | ~2x |
+| Breakeven WR | 21% | 50% |
+| Trade log | `data/longshot_trades.csv` | `data/midshot_trades.csv` (TBD) |
+
+**Master Plan (7 steps):**
+1. [CURRENT] Collect 50 trades/coin on Longshot (200 total)
+2. If profitable, remove `--min-size` and let Kelly scale
+3. Grow account
+4. Start Midshot at `--min-size` (50 trades/coin)
+5. Evaluate Midshot profitability
+6. If profitable, remove `--min-size` on Midshot
+7. Explore 5m markets
+
+**IMPORTANT:** No strategy changes during data collection. The CSV trade log is ground truth.
+
+## VPS & Deployment
+
+- **IP:** 209.38.36.107 | **SSH:** `ssh -i ~/.ssh/polymarket_bot root@209.38.36.107`
+- **Code:** `/opt/polymarket-bot/` | **GitHub:** https://github.com/iamheisenburger/polymarket-contrarian-bot
+- **Sniper log:** `/var/log/polymarket-sniper.log`
+- **Wallet EOA:** 0x788AdB6eaDa73377F7b63F59b2fF0573C86A65E5
+- **Safe address:** 0x13D0684C532be5323662e851a1Bd10DF46d79806
+
+The sniper runs as a background process (NOT systemd). Check with `ps aux | grep python`.
 
 ## Common Commands
 
@@ -14,98 +49,63 @@ pip install -r requirements.txt
 cp .env.example .env  # Edit with your credentials
 source .env
 
-# Run quickstart example
-python examples/quickstart.py
+# Run the sniper bot locally
+python apps/run_sniper.py --coins BTC ETH SOL XRP --timeframe 15m --bankroll 25 --min-edge 0.05 --min-size --max-entry-price 0.20
 
-# Run full integration test
-python scripts/full_test.py
-
-# Run the bot
-python scripts/run_bot.py              # Quick demo
-python scripts/run_bot.py --interactive # Interactive mode
-
-# Testing
-pytest tests/ -v                        # Run all tests (89 tests)
+# Run tests
+pytest tests/ -v                        # Run all tests
 pytest tests/test_utils.py -v           # Test utility functions
 pytest tests/test_bot.py -v             # Test bot module
 pytest tests/test_crypto.py -v          # Test encryption
 pytest tests/test_signer.py -v          # Test EIP-712 signing
+
+# SSH quick checks
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "tail -50 /var/log/polymarket-sniper.log"
+ssh -i ~/.ssh/polymarket_bot root@209.38.36.107 "cat /opt/polymarket-bot/data/longshot_trades.csv"
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         TradingBot                          │
-│                        (bot.py)                             │
-│  - High-level trading interface                             │
-│  - Async order operations                                   │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-         ┌────────────┼────────────┐
-         ▼            ▼            ▼
-┌─────────────┐ ┌───────────┐ ┌───────────────┐
-│ OrderSigner │ │ ClobClient│ │ RelayerClient │
-│ (signer.py) │ │(client.py)│ │ (client.py)   │
-│             │ │           │ │               │
-│ EIP-712     │ │ Order     │ │ Gasless       │
-│ signatures  │ │ submission│ │ transactions  │
-└──────┬──────┘ └─────┬─────┘ └───────────────┘
-       │              │
-       ▼              ▼
-┌─────────────┐ ┌───────────┐
-│ KeyManager  │ │  Config   │
-│ (crypto.py) │ │(config.py)│
-│             │ │           │
-│ PBKDF2 +    │ │ YAML/ENV  │
-│ Fernet      │ │ loading   │
-└─────────────┘ └───────────┘
+apps/run_sniper.py              # CLI entry point for Longshot/Midshot
+strategies/momentum_sniper.py   # Core strategy (SniperConfig, MomentumSniperStrategy)
+lib/fair_value.py               # Black-Scholes binary pricing
+lib/binance_ws.py               # Binance real-time price feed
+lib/trade_logger.py             # CSV trade logging
+lib/market_manager.py           # Market lifecycle management
+src/bot.py                      # Order execution, balance, auto-redemption
+src/client.py                   # Polymarket CLOB/Relayer API client
+src/signer.py                   # EIP-712 order signing
+src/websocket_client.py         # Polymarket orderbook WebSocket
+src/gamma_client.py             # Market discovery
 ```
 
-### Module Responsibilities
+### Key Modules
 
 | Module | Purpose | Key Classes |
 |--------|---------|-------------|
-| `bot.py` | Main trading interface | `TradingBot`, `OrderResult` |
+| `momentum_sniper.py` | Core trading strategy | `MomentumSniperStrategy`, `SniperConfig` |
+| `bot.py` | Order execution | `TradingBot`, `OrderResult` |
+| `fair_value.py` | Fair value calculation | `BinaryFairValue`, `FairValue` |
 | `client.py` | API communication | `ClobClient`, `RelayerClient` |
 | `signer.py` | EIP-712 signing | `OrderSigner`, `Order` |
-| `crypto.py` | Key encryption | `KeyManager` |
-| `config.py` | Configuration | `Config`, `BuilderConfig` |
-| `utils.py` | Helper functions | `create_bot_from_env`, `validate_address` |
+| `trade_logger.py` | Trade CSV logging | `TradeLogger` |
 
 ### Data Flow
-
-1. `TradingBot.place_order()` creates an `Order` dataclass
-2. `OrderSigner.sign_order()` produces EIP-712 signature
-3. `ClobClient.post_order()` submits to CLOB with Builder HMAC auth headers
-4. If gasless enabled, `RelayerClient` handles Safe deployment/approvals
+1. Binance WebSocket provides sub-second crypto price updates
+2. `BinaryFairValue.calculate()` computes P(Up) from Black-Scholes
+3. Compare fair value to Polymarket best ask prices
+4. When ask is significantly below fair value (edge > min_edge) → BUY
+5. Hold to settlement: binary pays $1 on win, $0 on loss
+6. Auto-redeem winnings and compound into next market
 
 ## Key Patterns
 
-- **Async methods**: All trading operations (`place_order`, `cancel_order`, `get_trades`) are async
+- **Async methods**: All trading operations are async
 - **Config precedence**: Environment vars > YAML file > defaults
 - **Builder HMAC auth**: Timestamp + method + path + body signed with api_secret
 - **Signature type 2**: Gnosis Safe signatures for Polymarket
-
-## Configuration
-
-Config loads from `config.yaml` or environment variables:
-
-```python
-# From environment
-config = Config.from_env()
-
-# From YAML
-config = Config.load("config.yaml")
-
-# With env overrides
-config = Config.load_with_env("config.yaml")
-```
-
-Key fields:
-- `safe_address`: Your Polymarket proxy wallet address
-- `builder.api_key/api_secret/api_passphrase`: For gasless trading
-- `clob.chain_id`: 137 (Polygon mainnet)
+- **min_size_mode**: When True, always buys exactly 5 tokens (data collection mode)
 
 ## Testing Notes
 
@@ -113,33 +113,23 @@ Key fields:
 - Mock external API calls; never hit real Polymarket APIs in tests
 - Test private key: `"0x" + "a" * 64`
 - Test safe address: `"0x" + "b" * 40`
-- YAML config values starting with `0x` must be quoted to avoid integer parsing
-
-## Dependencies
-
-- `eth-account>=0.13.0`: Uses new `encode_typed_data` API
-- `web3>=6.0.0`: Polygon RPC interactions
-- `cryptography`: Fernet encryption for private keys
-- `pyyaml`: YAML config file support
-- `python-dotenv`: .env file loading
 
 ## Polymarket API Context
 
 - CLOB API: `https://clob.polymarket.com` - order submission/cancellation
 - Relayer API: `https://relayer-v2.polymarket.com` - gasless transactions
+- Gamma API: `https://gamma-api.polymarket.com` - market discovery
 - Token IDs are ERC-1155 identifiers for market outcomes
 - Prices are 0-1 (probability percentages)
-- USDC has 6 decimal places
+- USDC has 6 decimal places, minimum order $1.00 / 5 tokens
+- Polymarket uses Chainlink BTC/USD for settlement
 
 **Important**: The `docs/` directory contains official Polymarket documentation. When implementing or debugging API features, always reference:
 - `docs/developers/CLOB/` - CLOB API endpoints, authentication, orders
 - `docs/developers/builders/` - Builder Program, Relayer, gasless transactions
 - `docs/api-reference/` - REST API endpoint specifications
 
-## For Beginners
-
-Start with these files in order:
-1. `examples/quickstart.py` - Simplest possible example
-2. `examples/basic_trading.py` - Common operations
-3. `src/bot.py` - Read the TradingBot class
-4. `examples/strategy_example.py` - Custom strategy framework
+## Retired Strategies
+- **Contrarian** (`strategies/contrarian.py`): Bought cheap side ($0.03-$0.07) of BTC 5m markets. RETIRED.
+- **Flash Crash** (`strategies/flash_crash.py`): Volatility-based probability drop trading. UNUSED.
+- **Market Maker** (`strategies/market_maker.py`): Two-sided quoting. Running in observe-only mode, separate from Longshot/Midshot.

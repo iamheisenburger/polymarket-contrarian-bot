@@ -89,11 +89,11 @@ def print_report(trades, coins, total):
     print(header)
     print("-" * 65)
 
-    for coin in ["BTC", "ETH", "SOL", "XRP"]:
+    all_coins = sorted(set(t["coin"] for t in trades))
+    for coin in all_coins:
         c = coins[coin]
         ct = c["w"] + c["l"] + c["p"]
         cwr = (c["w"] / (c["w"] + c["l"]) * 100) if (c["w"] + c["l"]) > 0 else 0
-        status = "OK" if cwr > BREAKEVEN_WR else "BELOW"
         print(f"{coin:<6} {ct:>6} {c['w']:>4} {c['l']:>4} {cwr:>6.1f}% ${c['pnl']:>+8.2f}   {ct}/50")
 
     print("-" * 65)
@@ -147,6 +147,26 @@ def print_report(trades, coins, total):
     last_ts = trades[-1]["timestamp"][:19]
     print(f"  First trade: {first_ts}")
     print(f"  Last trade:  {last_ts}")
+    print()
+
+    # Per-hour WR breakdown
+    hour_stats = defaultdict(lambda: {"w": 0, "l": 0})
+    for t in trades:
+        h = int(t["timestamp"][11:13])
+        if t["outcome"] == "won":
+            hour_stats[h]["w"] += 1
+        elif t["outcome"] == "lost":
+            hour_stats[h]["l"] += 1
+
+    print("  --- Per-Hour WR (UTC) ---")
+    print(f"  {'HR':>4} {'W':>3} {'L':>3} {'TOT':>4} {'WR':>6}")
+    for h in sorted(hour_stats):
+        w = hour_stats[h]["w"]
+        l = hour_stats[h]["l"]
+        tot = w + l
+        wr_h = w / tot * 100 if tot else 0
+        flag = " <<" if wr_h < 15 and tot >= 5 else ""
+        print(f"  {h:>4} {w:>3} {l:>3} {tot:>4} {wr_h:>5.0f}%{flag}")
     print()
 
 
