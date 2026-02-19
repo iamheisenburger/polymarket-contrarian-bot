@@ -577,18 +577,14 @@ class MomentumSniperStrategy:
                 if best_ask < self.config.min_entry_price:
                     continue
 
-                # CRITICAL: never buy the other side if it creates a guaranteed loss.
-                # If we already hold one side, buying the opposite means we pay
-                # (existing_cost + new_cost) for a guaranteed $1 payout.
-                # Only buy if the combined entry prices are below $1 (true arb).
+                # Never buy the opposite side of an existing position.
+                # Kelly sizes each side independently, so token counts differ
+                # and buying both sides is NOT a guaranteed arb — it's a coin
+                # flip on which side has more tokens. Just pick a direction.
                 if side == "up" and state.has_down_position:
-                    avg_down_price = state.down_cost / state.down_tokens if state.down_tokens > 0 else 0
-                    if avg_down_price + best_ask >= 1.0:
-                        continue  # Would guarantee a loss
+                    continue
                 if side == "down" and state.has_up_position:
-                    avg_up_price = state.up_cost / state.up_tokens if state.up_tokens > 0 else 0
-                    if avg_up_price + best_ask >= 1.0:
-                        continue  # Would guarantee a loss
+                    continue
 
                 # Calculate edge using actual buy price (we pay ask + 1 cent for fill)
                 buy_price = min(round(best_ask + 0.01, 2), 0.99)
