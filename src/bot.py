@@ -440,18 +440,28 @@ class TradingBot:
             clob_side = CLOB_BUY if side.upper() == "BUY" else CLOB_SELL
 
             # Map string order_type to py_clob_client OrderType enum
-            ot_map = {"GTC": OrderType.GTC, "FOK": OrderType.FOK, "GTD": OrderType.GTD}
-            ot = ot_map.get(order_type.upper(), OrderType.GTC)
+            # NOTE: order_type goes to post_order(), NOT PartialCreateOrderOptions
+            from py_clob_client.clob_types import OrderType as ClobOrderType
+            ot_map = {"GTC": ClobOrderType.GTC, "FOK": ClobOrderType.FOK, "GTD": ClobOrderType.GTD}
+            ot = ot_map.get(order_type.upper(), ClobOrderType.GTC)
 
-            response = await self._run_in_thread(
-                self._official_client.create_and_post_order,
+            # Step 1: Create and sign the order
+            order = await self._run_in_thread(
+                self._official_client.create_order,
                 OrderArgs(
                     token_id=token_id,
                     price=price,
                     size=size,
                     side=clob_side,
                 ),
-                PartialCreateOrderOptions(tick_size="0.01", neg_risk=False, order_type=ot),
+                PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+            )
+
+            # Step 2: Post the order with the correct order type (FOK/GTC/GTD)
+            response = await self._run_in_thread(
+                self._official_client.post_order,
+                order,
+                ot,
             )
 
             success = response.get("success", False)
