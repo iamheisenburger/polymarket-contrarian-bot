@@ -44,7 +44,7 @@ from .crypto import KeyManager, CryptoError, InvalidPasswordError
 # Official Polymarket client for order placement
 try:
     from py_clob_client.client import ClobClient as OfficialClobClient
-    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY as CLOB_BUY, SELL as CLOB_SELL
     HAS_OFFICIAL_CLIENT = True
 except ImportError:
@@ -439,6 +439,10 @@ class TradingBot:
         try:
             clob_side = CLOB_BUY if side.upper() == "BUY" else CLOB_SELL
 
+            # Map string order_type to py_clob_client OrderType enum
+            ot_map = {"GTC": OrderType.GTC, "FOK": OrderType.FOK, "GTD": OrderType.GTD}
+            ot = ot_map.get(order_type.upper(), OrderType.GTC)
+
             response = await self._run_in_thread(
                 self._official_client.create_and_post_order,
                 OrderArgs(
@@ -447,7 +451,7 @@ class TradingBot:
                     size=size,
                     side=clob_side,
                 ),
-                PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
+                PartialCreateOrderOptions(tick_size="0.01", neg_risk=False, order_type=ot),
             )
 
             success = response.get("success", False)
