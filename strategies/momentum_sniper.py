@@ -207,6 +207,14 @@ class MomentumSniperStrategy:
         # Binance real-time price feed (all coins)
         self.binance = BinancePriceFeed(coins=config.coins)
 
+        # Deribit implied volatility feed (forward-looking, market consensus)
+        self._deribit_feed = None
+        try:
+            from lib.deribit_vol import DeribitVolFeed
+            self._deribit_feed = DeribitVolFeed(coins=config.coins)
+        except Exception:
+            pass
+
         # Per-coin market managers
         self.coin_states: Dict[str, CoinMarketState] = {}
 
@@ -410,7 +418,7 @@ class MomentumSniperStrategy:
             # Joined mid-window — back-solve from Polymarket mid price.
             up_price = state.manager.get_mid_price("up")
             if 0.1 < up_price < 0.9:
-                vol = self.binance.get_volatility(state.coin)
+                vol, _ = self._get_volatility(state.coin)
                 secs_left = state.seconds_to_expiry()
                 if secs_left > 30 and vol > 0:
                     from lib.fair_value import SECONDS_PER_YEAR
@@ -448,6 +456,28 @@ class MomentumSniperStrategy:
         d1, d2, d3 = 1.432788, 0.189269, 0.001308
         return t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t)
 
+    def _get_volatility(self, coin: str) -> tuple:
+        """
+        Get best available volatility estimate for a coin.
+
+        Priority:
+        1. Deribit implied vol (forward-looking, market consensus)
+        2. Binance realized vol (backward-looking, from tick data)
+
+        Uses max(deribit_iv, realized_vol) for conservative estimate.
+        Returns (vol, source) where source is "IV" or "RV".
+        """
+        deribit_vol = None
+        if self._deribit_feed:
+            deribit_vol = self._deribit_feed.get_implied_vol(coin)
+
+        realized_vol = self.binance.get_volatility(coin)
+
+        if deribit_vol is not None:
+            return (max(deribit_vol, realized_vol), "IV")
+
+        return (realized_vol, "RV")
+
     def _calculate_fair_value(self, state: CoinMarketState) -> Optional[FairValue]:
         """Calculate fair value for a coin's current market."""
         spot = self.binance.get_price(state.coin)
@@ -455,7 +485,7 @@ class MomentumSniperStrategy:
             return None
 
         secs = state.seconds_to_expiry()
-        vol = self.binance.get_volatility(state.coin)
+        vol, _ = self._get_volatility(state.coin)
 
         return self.fv_calc.calculate(
             spot=spot,
@@ -485,8 +515,12 @@ class MomentumSniperStrategy:
         if kelly_f <= 0:
             return 0.0
 
-        # Use stronger Kelly fraction for strong signals
-        fraction = self.config.kelly_strong if strong else self.config.kelly_fraction
+        # Two-factor Kelly: entry price confidence + edge strength
+        # Entry >= $0.60 has 93% WR (14W/1L) — use stronger Kelly
+        # Entry $0.40-$0.59 has 61.5% WR (8W/5L) — use base Kelly
+        price_kelly = self.config.kelly_strong if entry_price >= 0.60 else self.config.kelly_fraction
+        edge_kelly = self.config.kelly_strong if strong else self.config.kelly_fraction
+        fraction = max(price_kelly, edge_kelly)
         bet_fraction = kelly_f * fraction
 
         # Hard cap: never risk more than max_bet_fraction of bankroll on one trade.
@@ -541,7 +575,7 @@ class MomentumSniperStrategy:
             # Volatility filter: only trade in low-vol regimes.
             # Data: vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
             if self.config.max_volatility > 0:
-                current_vol = self.binance.get_volatility(state.coin)
+                current_vol, _ = self._get_volatility(state.coin)
                 if current_vol > self.config.max_volatility:
                     continue
 
@@ -614,6 +648,7 @@ class MomentumSniperStrategy:
         entry_price: float,
         edge: float,
         fv: FairValue,
+        signal_time: float = 0.0,
     ) -> bool:
         """Execute a snipe trade."""
         if self.config.observe_only:
@@ -662,6 +697,9 @@ class MomentumSniperStrategy:
         # This prevents phantom positions from unfilled GTC orders sitting on the book.
         buy_price = min(round(entry_price + 0.01, 2), 0.99)
 
+        order_start = time.time()
+        signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
+
         result = await self.bot.place_order(
             token_id=token_id,
             price=buy_price,
@@ -669,6 +707,10 @@ class MomentumSniperStrategy:
             side="BUY",
             order_type="FOK",
         )
+
+        order_end = time.time()
+        order_latency_ms = (order_end - order_start) * 1000
+        total_latency_ms = (order_end - signal_time) * 1000 if signal_time else 0
 
         # Only track position if order was accepted AND filled
         order_status = (result.status or "").upper()
@@ -697,7 +739,7 @@ class MomentumSniperStrategy:
 
             # Log trade
             spot = self.binance.get_price(state.coin)
-            vol = self.binance.get_volatility(state.coin)
+            vol, vol_src = self._get_volatility(state.coin)
             other_price = state.manager.get_mid_price("down" if side == "up" else "up")
 
             # Get real USDC balance for accurate logging
@@ -722,6 +764,10 @@ class MomentumSniperStrategy:
                     state.coin, self.config.momentum_lookback
                 ),
                 volatility_at_entry=vol,
+                signal_to_order_ms=signal_to_order_ms,
+                order_latency_ms=order_latency_ms,
+                total_latency_ms=total_latency_ms,
+                vol_source=vol_src,
             )
 
             kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
@@ -730,7 +776,8 @@ class MomentumSniperStrategy:
             self.log(
                 f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
                 f"x{num_tokens:.0f} (${actual_cost:.2f}) "
-                f"edge={edge:.2f} [{strength}] kelly={kelly_pct:.0f}%",
+                f"edge={edge:.2f} [{strength}] kelly={kelly_pct:.0f}% "
+                f"vol={vol_src} lat={total_latency_ms:.0f}ms",
                 "success"
             )
             return True
@@ -910,6 +957,7 @@ class MomentumSniperStrategy:
 
         # Find opportunities across all coins
         opportunities = self._find_opportunities()
+        signal_time = time.time()
 
         # Execute ALL opportunities — no artificial limit on trades per tick.
         # Kelly sizes each bet against available balance, so later bets
@@ -917,7 +965,7 @@ class MomentumSniperStrategy:
         for state, side, price, edge, fv in opportunities:
             if self._available_balance() < self.config.min_bet_usdc:
                 break  # Out of capital — Kelly's job is done
-            await self._execute_snipe(state, side, price, edge, fv)
+            await self._execute_snipe(state, side, price, edge, fv, signal_time=signal_time)
 
     def _render_status(self):
         """Render the live status display."""
@@ -937,7 +985,7 @@ class MomentumSniperStrategy:
                 continue
 
             spot = self.binance.get_price(coin)
-            vol = self.binance.get_volatility(coin)
+            vol, vol_src = self._get_volatility(coin)
             secs = state.seconds_to_expiry()
             mins, s = divmod(int(secs), 60)
 
@@ -955,7 +1003,7 @@ class MomentumSniperStrategy:
                 strike_fmt = f"${state.strike_price:>,.2f}"
             else:
                 strike_fmt = f"${state.strike_price:>,.0f}"
-            lines.append(f"  {coin}  ${spot:>10,.2f}  vol={vol*100:.0f}%  "
+            lines.append(f"  {coin}  ${spot:>10,.2f}  vol={vol*100:.0f}%({vol_src})  "
                          f"strike={strike_fmt}  "
                          f"expiry={mins}m{s:02d}s{waiting}")
 

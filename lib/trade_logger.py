@@ -64,6 +64,10 @@ class TradeRecord:
     time_to_expiry_at_entry: float = 0.0   # Seconds left when we entered
     momentum_at_entry: float = 0.0         # Binance price change % (30s lookback)
     volatility_at_entry: float = 0.0       # Realized vol when we entered
+    signal_to_order_ms: float = 0.0        # ms from signal detection to order submission
+    order_latency_ms: float = 0.0          # ms for order round-trip to Polymarket
+    total_latency_ms: float = 0.0          # ms from signal to fill
+    vol_source: str = ""                   # "IV" (Deribit) or "RV" (Binance realized)
 
     @property
     def trade_key(self) -> str:
@@ -143,6 +147,8 @@ class TradeLogger:
         "btc_price", "other_side_price", "volatility_std",
         "fair_value_at_entry", "time_to_expiry_at_entry",
         "momentum_at_entry", "volatility_at_entry",
+        "signal_to_order_ms", "order_latency_ms", "total_latency_ms",
+        "vol_source",
     ]
 
     def __init__(self, filepath: str = "data/trades.csv"):
@@ -246,6 +252,10 @@ class TradeLogger:
         time_to_expiry_at_entry: float = 0.0,
         momentum_at_entry: float = 0.0,
         volatility_at_entry: float = 0.0,
+        signal_to_order_ms: float = 0.0,
+        order_latency_ms: float = 0.0,
+        total_latency_ms: float = 0.0,
+        vol_source: str = "",
     ) -> TradeRecord:
         """
         Log a new trade entry. Stored in pending JSON only (not CSV yet).
@@ -269,6 +279,10 @@ class TradeLogger:
             time_to_expiry_at_entry=time_to_expiry_at_entry,
             momentum_at_entry=momentum_at_entry,
             volatility_at_entry=volatility_at_entry,
+            signal_to_order_ms=signal_to_order_ms,
+            order_latency_ms=order_latency_ms,
+            total_latency_ms=total_latency_ms,
+            vol_source=vol_source,
         )
 
         trade_key = record.trade_key
@@ -354,6 +368,10 @@ class TradeLogger:
                     f"{record.time_to_expiry_at_entry:.0f}",
                     f"{record.momentum_at_entry:.8f}",
                     f"{record.volatility_at_entry:.6f}",
+                    f"{record.signal_to_order_ms:.0f}",
+                    f"{record.order_latency_ms:.0f}",
+                    f"{record.total_latency_ms:.0f}",
+                    record.vol_source,
                 ])
         except Exception as e:
             logger.error(f"CRITICAL: Failed to write trade to CSV {self.filepath}: {e}")
