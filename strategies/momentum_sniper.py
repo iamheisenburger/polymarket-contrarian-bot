@@ -672,7 +672,7 @@ class MomentumSniperStrategy:
             bet_usdc = self._kelly_bet_usdc(fair_prob, entry_price, strong=is_strong)
             if bet_usdc < self.config.min_bet_usdc:
                 return False
-            num_tokens = round(bet_usdc / entry_price, 2)
+            num_tokens = int(bet_usdc / entry_price)  # Whole tokens: price(2dp) × int = max 2dp USDC
         else:
             # Conservative: always bet exactly 5 tokens (Polymarket minimum).
             # Cheapest way to get data on whether the edge is real.
