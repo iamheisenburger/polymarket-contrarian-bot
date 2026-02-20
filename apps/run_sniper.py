@@ -107,6 +107,10 @@ def main():
         help="Max entry price to trade at (default: 0.85). Lower = cheaper trades, more survival."
     )
     parser.add_argument(
+        "--min-entry-price", type=float, default=0.02,
+        help="Min entry price to trade at (default: 0.02). Higher = higher model confidence required."
+    )
+    parser.add_argument(
         "--observe", action="store_true",
         help="Observe-only mode — show signals but don't trade"
     )
@@ -201,6 +205,7 @@ def main():
         max_bet_usdc=args.max_bet,
         max_bet_fraction=args.max_bet_fraction,
         max_entry_price=args.max_entry_price,
+        min_entry_price=args.min_entry_price,
         min_size_mode=args.min_size,
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
