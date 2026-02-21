@@ -23,7 +23,7 @@ echo "  Single process, paper trading only"
 echo "  Settlement: Gamma API only"
 echo ""
 
-nohup $PYTHON apps/run_arena.py \
+nohup env PYTHONUNBUFFERED=1 $PYTHON apps/run_arena.py \
     --coins BTC ETH SOL XRP \
     --timeframe 5m \
     --bankroll 12.95 \
