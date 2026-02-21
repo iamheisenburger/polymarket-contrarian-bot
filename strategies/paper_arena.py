@@ -579,16 +579,22 @@ class PaperArena:
             return
         self._last_settle_time = now
 
+        total_pending = 0
+        total_resolved = 0
+
         for sname, sstate in self.strategy_states.items():
             pending_slugs = sstate.logger.get_pending_slugs()
             if not pending_slugs:
                 continue
 
-            for slug in pending_slugs:
+            total_pending += len(pending_slugs)
+
+            for slug in list(pending_slugs):
                 winner = self._determine_winner(slug)
                 if not winner:
                     continue
 
+                total_resolved += 1
                 pending = sstate.logger.get_pending_for_market(slug)
                 for side, record in pending:
                     won = (side == winner)
@@ -609,11 +615,18 @@ class PaperArena:
                         f"pnl=${pnl:+.2f} bal=${sstate.balance:.2f}"
                     )
 
+        if total_pending > 0:
+            print(
+                f"[Arena] Settle check: {total_pending} pending slugs, "
+                f"{total_resolved} resolved"
+            )
+
     def _determine_winner(self, slug: str) -> Optional[str]:
         """Query Gamma API for market outcome."""
         try:
             market = self.gamma.get_market_by_slug(slug)
             if not market:
+                logger.warning(f"Settle: Gamma returned None for {slug}")
                 return None
             prices = self.gamma.parse_prices(market)
             up_p = prices.get("up", 0.5)
@@ -623,7 +636,8 @@ class PaperArena:
             elif down_p > 0.9:
                 return "down"
             return None
-        except Exception:
+        except Exception as e:
+            logger.error(f"Settle error for {slug}: {e}")
             return None
 
     # ------------------------------------------------------------------
