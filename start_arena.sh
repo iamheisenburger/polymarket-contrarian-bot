@@ -26,7 +26,7 @@ echo ""
 nohup env PYTHONUNBUFFERED=1 $PYTHON apps/run_arena.py \
     --coins BTC ETH SOL XRP \
     --timeframe 5m \
-    --bankroll 12.95 \
+    --bankroll 50.00 \
     >> /var/log/arena.log 2>&1 &
 
 echo "  Arena started (PID: $!)"
