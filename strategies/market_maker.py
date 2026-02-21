@@ -235,6 +235,9 @@ class MarketMakerStrategy(BaseStrategy):
         self._session_start = time.time()
         self._current_slug: str = ""
 
+        # Periodic settlement timer
+        self._last_settle_time: float = 0.0
+
     async def start(self) -> bool:
         """Start strategy with Binance price feed."""
         # Start Binance WebSocket first
@@ -679,42 +682,37 @@ class MarketMakerStrategy(BaseStrategy):
 
     def _resolve_trades(self, slug: str):
         """
-        Determine trade outcomes when market settles.
+        Try to resolve trades for a settled market (single attempt, non-blocking).
 
-        Uses ONLY the Gamma API (authoritative source). Polymarket settles on
-        Chainlink, not Binance — never guess from orderbook prices.
+        Uses ONLY the Gamma API. If not resolved yet, _periodic_settle will retry.
         """
         if self.quotes.up_inventory <= 0 and self.quotes.down_inventory <= 0:
             return
 
-        # Determine winner via Gamma API (retry up to 5 times)
         winning_side = None
-        for attempt in range(5):
-            try:
-                market_data = self._gamma.get_market_by_slug(slug)
-                if market_data:
-                    prices = self._gamma.parse_prices(market_data)
-                    up_price = prices.get("up", 0)
-                    down_price = prices.get("down", 0)
-                    if up_price > 0.9:
-                        winning_side = "up"
-                        break
-                    elif down_price > 0.9:
-                        winning_side = "down"
-                        break
-            except Exception as e:
-                self.log(f"Gamma API check failed (attempt {attempt + 1}): {e}", "warning")
-            if attempt < 4:
-                self.log(f"Market {slug} not resolved, waiting 15s ({attempt + 1}/5)")
-                time.sleep(15)
+        try:
+            market_data = self._gamma.get_market_by_slug(slug)
+            if market_data:
+                prices = self._gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
+                if up_price > 0.9:
+                    winning_side = "up"
+                elif down_price > 0.9:
+                    winning_side = "down"
+        except Exception as e:
+            self.log(f"Gamma API check failed: {e}", "warning")
 
         if winning_side is None:
-            self.log(f"UNRESOLVED after 5 attempts: {slug} — refusing to guess", "error")
+            self.log(f"{slug} not yet resolved — will retry periodically")
             return
 
+        self._settle_with_winner(slug, winning_side)
+
+    def _settle_with_winner(self, slug: str, winning_side: str):
+        """Settle inventory and log outcomes for a resolved market."""
         pnl = self.quotes.settle_market(winning_side)
 
-        # Log outcomes for each pending trade in this market
         pending_trades = self.trade_logger.get_pending_for_market(slug)
         for trade_side, record in pending_trades:
             won = (trade_side == winning_side)
@@ -726,13 +724,66 @@ class MarketMakerStrategy(BaseStrategy):
                 payout=payout,
             )
 
-        outcome_str = f"{'WIN' if pnl >= 0 else 'LOSS'}"
+        outcome_str = "WIN" if pnl >= 0 else "LOSS"
         self.log(
             f"SETTLED {slug}: {outcome_str} ${pnl:+.2f} "
             f"({winning_side.upper()} won, Gamma API verified) | "
             f"Session PnL: ${self.quotes.realized_pnl:+.2f}",
             "success" if pnl >= 0 else "warning"
         )
+
+    def _periodic_settle(self):
+        """
+        Periodically resolve pending trades via Gamma API.
+
+        Gamma API takes 2-5 minutes to update after a 5m market closes.
+        This runs every 30 seconds to catch resolutions.
+        """
+        now = time.time()
+        if now - self._last_settle_time < 30:
+            return
+        self._last_settle_time = now
+
+        pending = self.trade_logger.get_pending_trades()
+        if not pending:
+            return
+
+        for trade_key, record in list(pending.items()):
+            try:
+                market_data = self._gamma.get_market_by_slug(record.market_slug)
+                if not market_data:
+                    continue
+
+                prices = self._gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
+
+                if up_price > 0.9:
+                    winning_side = "up"
+                elif down_price > 0.9:
+                    winning_side = "down"
+                else:
+                    continue  # Not resolved yet
+
+                side_won = (record.side == winning_side)
+                payout = record.num_tokens * 1.0 if side_won else 0.0
+
+                self.trade_logger.log_outcome(
+                    market_slug=record.market_slug,
+                    side=record.side,
+                    won=side_won,
+                    payout=payout,
+                )
+
+                pnl = payout - record.bet_size_usdc
+                outcome = "WON" if side_won else "LOST"
+                self.log(
+                    f"SETTLED {record.coin} {record.side.upper()} {record.market_slug}: "
+                    f"{outcome} ${pnl:+.2f} (Gamma API verified)",
+                    "success" if side_won else "warning"
+                )
+            except Exception as e:
+                self.log(f"Settle check failed for {trade_key}: {e}", "warning")
 
     # === BaseStrategy hooks ===
 
@@ -784,6 +835,9 @@ class MarketMakerStrategy(BaseStrategy):
 
         # No artificial loss limit — Kelly Criterion manages risk.
         # If bankroll goes to $0, balance check in _post_quotes stops us.
+
+        # Periodically settle pending trades via Gamma API
+        self._periodic_settle()
 
         # Post or update quotes if needed
         if self._should_requote(fv):

@@ -271,6 +271,9 @@ class MomentumSniperStrategy:
         self._last_redeem_time: float = 0.0
         self._redeem_interval: float = 60.0  # Check every 60 seconds
 
+        # Background settlement tracking
+        self._last_settle_time: float = 0.0
+
         # Running state
         self.running = False
 
@@ -910,48 +913,99 @@ class MomentumSniperStrategy:
 
     def _determine_winner(self, state: CoinMarketState, old_slug: str) -> Optional[str]:
         """
-        Determine the winning side of a settled market.
+        Try to determine the winning side of a settled market (non-blocking).
 
-        Uses ONLY the Gamma API (authoritative source). Polymarket settles on
-        Chainlink, not Binance — never use Binance spot as a fallback because
-        they disagree on close markets (caused 35% misclassification rate).
+        Uses ONLY the Gamma API (authoritative source). Makes a SINGLE attempt.
+        If not yet resolved, returns None — the periodic settler will retry later.
         """
         if not old_slug:
             return None
 
-        # Retry with delays — Gamma API may take time to reflect resolution
-        for attempt in range(5):
-            try:
-                market_data = state.manager.gamma.get_market_by_slug(old_slug)
-                if market_data:
-                    prices = state.manager.gamma.parse_prices(market_data)
-                    up_price = prices.get("up", 0)
-                    down_price = prices.get("down", 0)
+        try:
+            market_data = state.manager.gamma.get_market_by_slug(old_slug)
+            if market_data:
+                prices = state.manager.gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
 
-                    # After resolution, winning side price → 1.0, losing → 0.0
-                    if up_price > 0.9:
-                        self.log(f"{state.coin} Gamma API: UP won (up={up_price:.2f})")
-                        return "up"
-                    elif down_price > 0.9:
-                        self.log(f"{state.coin} Gamma API: DOWN won (down={down_price:.2f})")
-                        return "down"
-            except Exception as e:
-                self.log(
-                    f"{state.coin} Gamma API check failed (attempt {attempt + 1}): {e}",
-                    "warning"
-                )
+                if up_price > 0.9:
+                    self.log(f"{state.coin} Gamma API: UP won (up={up_price:.2f})")
+                    return "up"
+                elif down_price > 0.9:
+                    self.log(f"{state.coin} Gamma API: DOWN won (down={down_price:.2f})")
+                    return "down"
+        except Exception as e:
+            self.log(f"{state.coin} Gamma API check failed: {e}", "warning")
 
-            if attempt < 4:
-                self.log(
-                    f"{state.coin} not yet resolved, waiting 15s ({attempt + 1}/5)"
-                )
-                time.sleep(15)
-
-        self.log(
-            f"{state.coin} UNRESOLVED after 5 attempts — refusing to guess",
-            "error"
-        )
+        self.log(f"{state.coin} {old_slug} not yet resolved — will retry periodically")
         return None
+
+    def _periodic_settle(self):
+        """
+        Periodically resolve pending trades via Gamma API.
+
+        The Gamma API takes 2-5 minutes to update outcomePrices after a 5m market
+        closes. Instead of blocking at market change, we check all pending trades
+        every 30 seconds until they resolve.
+        """
+        now = time.time()
+        if now - self._last_settle_time < 30:
+            return
+        self._last_settle_time = now
+
+        pending = self.trade_logger.get_pending_trades()
+        if not pending:
+            return
+
+        from src.gamma_client import GammaClient
+        gamma = GammaClient()
+        real_balance = self.bot.get_usdc_balance() or self._balance
+
+        for trade_key, record in list(pending.items()):
+            try:
+                market_data = gamma.get_market_by_slug(record.market_slug)
+                if not market_data:
+                    continue
+
+                prices = gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
+
+                if up_price > 0.9:
+                    winning_side = "up"
+                elif down_price > 0.9:
+                    winning_side = "down"
+                else:
+                    continue  # Not resolved yet
+
+                side_won = (record.side == winning_side)
+                payout = record.num_tokens * 1.0 if side_won else 0.0
+
+                self.trade_logger.log_outcome(
+                    market_slug=record.market_slug,
+                    side=record.side,
+                    won=side_won,
+                    payout=payout,
+                    usdc_balance=real_balance,
+                )
+
+                # Update session stats
+                if side_won:
+                    self.stats.wins += 1
+                    self.stats.total_payout += payout
+                else:
+                    self.stats.losses += 1
+                self.stats.pending -= 1
+                self.stats.realized_pnl += (payout - record.bet_size_usdc)
+
+                outcome = "WON" if side_won else "LOST"
+                self.log(
+                    f"SETTLED {record.coin} {record.side.upper()} {record.market_slug}: "
+                    f"{outcome} ${payout - record.bet_size_usdc:+.2f} (Gamma API verified)",
+                    "success" if side_won else "warning"
+                )
+            except Exception as e:
+                self.log(f"Settle check failed for {trade_key}: {e}", "warning")
 
     def _handle_market_change(self, coin: str, old_slug: str, new_slug: str):
         """Handle market settlement and transition."""
@@ -959,27 +1013,11 @@ class MomentumSniperStrategy:
         if not state:
             return
 
-        # Settle positions
+        # Try immediate settlement (non-blocking, single attempt)
         if state.up_tokens > 0 or state.down_tokens > 0:
             winning_side = self._determine_winner(state, old_slug)
-
             if winning_side:
-                # Calculate PnL
-                if winning_side == "up":
-                    pnl = state.up_tokens * 1.0 - state.up_cost - state.down_cost
-                else:
-                    pnl = state.down_tokens * 1.0 - state.down_cost - state.up_cost
-
-                self.stats.realized_pnl += pnl
-                self.stats.pending -= (1 if state.has_up_position else 0) + (1 if state.has_down_position else 0)
-
-                if pnl >= 0:
-                    self.stats.wins += 1
-                    self.stats.total_payout += pnl + state.total_cost
-                else:
-                    self.stats.losses += 1
-
-                # Log outcome per side (each side resolves independently)
+                # Immediate resolution succeeded
                 real_balance = self.bot.get_usdc_balance() or self._balance
                 for side_name, record in self.trade_logger.get_pending_for_market(old_slug):
                     side_won = (side_name == winning_side)
@@ -991,16 +1029,21 @@ class MomentumSniperStrategy:
                         payout=side_payout,
                         usdc_balance=real_balance,
                     )
-
-                outcome = "WIN" if pnl >= 0 else "LOSS"
-                self.log(
-                    f"SETTLED {coin} {old_slug}: {outcome} ${pnl:+.2f} "
-                    f"({winning_side.upper()} won) | "
-                    f"Session: ${self.stats.realized_pnl:+.2f}",
-                    "success" if pnl >= 0 else "warning"
-                )
-            else:
-                self.log(f"WARNING: Could not determine winner for {coin} {old_slug}", "error")
+                    pnl = side_payout - record.bet_size_usdc
+                    self.stats.realized_pnl += pnl
+                    self.stats.pending -= 1
+                    if side_won:
+                        self.stats.wins += 1
+                        self.stats.total_payout += side_payout
+                    else:
+                        self.stats.losses += 1
+                    outcome = "WON" if side_won else "LOST"
+                    self.log(
+                        f"SETTLED {coin} {side_name.upper()} {old_slug}: {outcome} "
+                        f"${pnl:+.2f} | Session: ${self.stats.realized_pnl:+.2f}",
+                        "success" if side_won else "warning"
+                    )
+            # If not resolved, _periodic_settle will handle it later
 
         # Refresh balance
         self._last_balance_check = 0
@@ -1056,6 +1099,9 @@ class MomentumSniperStrategy:
 
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
+        # Periodic settlement of pending trades via Gamma API
+        self._periodic_settle()
+
         # Periodic redemption of settled winning positions
         self._periodic_redeem()
 
