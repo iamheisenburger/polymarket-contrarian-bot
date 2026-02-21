@@ -21,7 +21,9 @@ echo ""
 
 # Instance 1: 5m markets (primary — lowest fees, highest frequency)
 # 12 windows/hr/coin × 4 coins = 48 windows/hr = 1,152/day
-nohup python3 apps/run_sniper.py \
+PYTHON=/opt/polymarket-bot/venv/bin/python
+
+nohup $PYTHON apps/run_sniper.py \
     --coins BTC ETH SOL XRP \
     --timeframe 5m \
     --bankroll 20 \
@@ -40,7 +42,7 @@ echo "  5m instance started (PID: $!)"
 # Instance 2: 1h markets (supplementary — fee-free)
 # 1 window/hr/coin × 4 coins = 4 windows/hr = 96/day
 # Lower thresholds because no fees eat the edge
-nohup python3 apps/run_sniper.py \
+nohup $PYTHON apps/run_sniper.py \
     --coins BTC ETH SOL XRP \
     --timeframe 1h \
     --bankroll 20 \
