@@ -8,7 +8,7 @@
 # OBSERVE MODE — simulates fills when market best ask <= our quote price.
 # Decision: 50+ simulated fills → positive PnL = go live, else abandon.
 #
-# Runs 4 separate instances (one per coin) since market maker is single-coin.
+# Single process, all 4 coins via --coins flag.
 
 set -e
 cd /opt/polymarket-bot
@@ -20,31 +20,28 @@ PYTHON=/opt/polymarket-bot/venv/bin/python
 pkill -9 -f run_market_maker || true
 sleep 2
 
-echo "=== Track B — Market Maker PAPER TEST (4 coins) ==="
+echo "=== Track B — Market Maker PAPER TEST ==="
 echo "  BTC/ETH/SOL/XRP 5m — spread=0.04, min-edge=0.02"
+echo "  Single process, all 4 coins"
 echo "  Observe mode with simulated fills"
 echo "  Settlement: Gamma API only (no Binance fallback)"
 echo ""
 
-for COIN in BTC ETH SOL XRP; do
-    LOGFILE="data/track_b_${COIN,,}.csv"
-    nohup $PYTHON apps/run_market_maker.py \
-        --coin $COIN \
-        --timeframe 5m \
-        --spread 0.04 \
-        --min-edge 0.02 \
-        --kelly 0.50 \
-        --bankroll 12.95 \
-        --max-quote 5.0 \
-        --max-inv 5 \
-        --stop-before-expiry 120 \
-        --observe \
-        --log-file $LOGFILE \
-        >> /var/log/track-b.log 2>&1 &
-    echo "  $COIN started (PID: $!) → $LOGFILE"
-    sleep 1
-done
+nohup $PYTHON apps/run_market_maker.py \
+    --coins BTC ETH SOL XRP \
+    --timeframe 5m \
+    --spread 0.04 \
+    --min-edge 0.02 \
+    --kelly 0.50 \
+    --bankroll 12.95 \
+    --max-quote 5.0 \
+    --max-inv 5 \
+    --stop-before-expiry 120 \
+    --observe \
+    --log-file data/track_b.csv \
+    >> /var/log/track-b.log 2>&1 &
 
+echo "  Track B started (PID: $!)"
 sleep 3
 
 PROCS=$(ps aux | grep run_market_maker | grep -v grep | wc -l)
