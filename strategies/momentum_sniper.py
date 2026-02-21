@@ -793,6 +793,22 @@ class MomentumSniperStrategy:
             order_type="FOK",
         )
 
+        # FOK fallback: if Kelly-sized order fails on thin orderbook,
+        # retry with minimum 5 tokens (paper-validated fill size).
+        if not result.success and num_tokens > 5:
+            self.log(
+                f"FOK failed at {num_tokens:.0f} tokens, retrying min-size (5)",
+                "warning"
+            )
+            num_tokens = 5.0
+            result = await self.bot.place_order(
+                token_id=token_id,
+                price=buy_price,
+                size=num_tokens,
+                side="BUY",
+                order_type="FOK",
+            )
+
         order_end = time.time()
         order_latency_ms = (order_end - order_start) * 1000
         total_latency_ms = (order_end - signal_time) * 1000 if signal_time else 0
