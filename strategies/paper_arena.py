@@ -579,22 +579,33 @@ class PaperArena:
             return
         self._last_settle_time = now
 
-        total_pending = 0
-        total_resolved = 0
+        # Collect all unique pending slugs across strategies
+        all_slugs: set = set()
+        for sstate in self.strategy_states.values():
+            all_slugs.update(sstate.logger.get_pending_slugs())
 
+        if not all_slugs:
+            return
+
+        # Determine winner once per slug (not once per strategy)
+        winners: Dict[str, Optional[str]] = {}
+        for slug in all_slugs:
+            winners[slug] = self._determine_winner(slug)
+
+        resolved_count = sum(1 for w in winners.values() if w)
+        print(
+            f"[Arena] Settle: {len(all_slugs)} unique slugs, "
+            f"{resolved_count} resolved"
+        )
+
+        # Apply results to all strategies
         for sname, sstate in self.strategy_states.items():
             pending_slugs = sstate.logger.get_pending_slugs()
-            if not pending_slugs:
-                continue
-
-            total_pending += len(pending_slugs)
-
             for slug in list(pending_slugs):
-                winner = self._determine_winner(slug)
+                winner = winners.get(slug)
                 if not winner:
                     continue
 
-                total_resolved += 1
                 pending = sstate.logger.get_pending_for_market(slug)
                 for side, record in pending:
                     won = (side == winner)
@@ -615,26 +626,27 @@ class PaperArena:
                         f"pnl=${pnl:+.2f} bal=${sstate.balance:.2f}"
                     )
 
-        if total_pending > 0:
-            print(
-                f"[Arena] Settle check: {total_pending} pending slugs, "
-                f"{total_resolved} resolved"
-            )
-
     def _determine_winner(self, slug: str) -> Optional[str]:
-        """Query Gamma API for market outcome."""
+        """Query Gamma API for market outcome using fresh request."""
         try:
-            market = self.gamma.get_market_by_slug(slug)
+            import requests as _req
+            url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
+            resp = _req.get(url, timeout=10)
+            if resp.status_code != 200:
+                return None
+            market = resp.json()
             if not market:
-                logger.warning(f"Settle: Gamma returned None for {slug}")
                 return None
             prices = self.gamma.parse_prices(market)
             up_p = prices.get("up", 0.5)
             down_p = prices.get("down", 0.5)
+            closed = market.get("closed", False)
             if up_p > 0.9:
                 return "up"
             elif down_p > 0.9:
                 return "down"
+            if closed:
+                print(f"[Arena] WARN: {slug} closed but prices={up_p:.2f}/{down_p:.2f}")
             return None
         except Exception as e:
             logger.error(f"Settle error for {slug}: {e}")
