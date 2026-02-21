@@ -146,6 +146,12 @@ def main():
         "--min-fair-value", type=float, default=0.70,
         help="Min model confidence to trade (default: 0.70). Only trade when model is highly confident."
     )
+    parser.add_argument(
+        "--price-source", type=str, default="binance",
+        choices=["binance", "chainlink"],
+        help="Price feed for fair value (default: binance). "
+             "'chainlink' uses Polymarket's settlement source — eliminates Binance/Chainlink divergence."
+    )
 
     args = parser.parse_args()
 
@@ -217,6 +223,7 @@ def main():
         min_momentum=args.min_momentum,
         momentum_lookback=args.momentum_lookback,
         min_fair_value=args.min_fair_value,
+        price_source=args.price_source,
         observe_only=args.observe,
         log_file=args.log_file,
     )
@@ -227,9 +234,11 @@ def main():
     print(f"\n{'='*60}")
     print(f"  MOMENTUM SNIPER — {'/'.join(coins)} {args.timeframe}")
     print(f"{'='*60}\n")
+    price_src = f"{Colors.CYAN}CHAINLINK (settlement source){Colors.RESET}" if args.price_source == "chainlink" else "Binance"
     print(f"  Mode:           {mode}")
     print(f"  Coins:          {', '.join(coins)}")
     print(f"  Timeframe:      {args.timeframe}")
+    print(f"  Price source:   {price_src}")
     print(f"  Bankroll:       ${args.bankroll:.2f}")
     print()
 

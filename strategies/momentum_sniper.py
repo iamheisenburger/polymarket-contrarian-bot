@@ -127,6 +127,11 @@ class SniperConfig:
     # Market settings
     market_check_interval: float = 30.0
 
+    # Price source for fair value calculation.
+    # "binance" = Binance WebSocket (fast but NOT settlement source)
+    # "chainlink" = Polymarket RTDS Chainlink feed (settlement source)
+    price_source: str = "binance"
+
     # Logging
     log_file: str = "data/longshot_trades.csv"
     observe_only: bool = False
@@ -229,8 +234,14 @@ class MomentumSniperStrategy:
         # Fair value calculator
         self.fv_calc = BinaryFairValue()
 
-        # Binance real-time price feed (all coins)
-        self.binance = BinancePriceFeed(coins=config.coins)
+        # Real-time price feed (all coins)
+        # Chainlink = Polymarket's settlement source (most accurate for outcomes)
+        # Binance = faster updates, but diverges from settlement on close markets
+        if config.price_source == "chainlink":
+            from lib.chainlink_ws import ChainlinkPriceFeed
+            self.binance = ChainlinkPriceFeed(coins=config.coins)
+        else:
+            self.binance = BinancePriceFeed(coins=config.coins)
 
         # Deribit implied volatility feed (forward-looking, market consensus)
         self._deribit_feed = None
@@ -901,11 +912,15 @@ class MomentumSniperStrategy:
         """
         Determine the winning side of a settled market.
 
-        Primary: Query Gamma API for actual outcomePrices (authoritative).
-        Fallback: Compare Binance spot price to strike price.
+        Uses ONLY the Gamma API (authoritative source). Polymarket settles on
+        Chainlink, not Binance — never use Binance spot as a fallback because
+        they disagree on close markets (caused 35% misclassification rate).
         """
-        # Primary: Gamma API resolution
-        if old_slug:
+        if not old_slug:
+            return None
+
+        # Retry with delays — Gamma API may take time to reflect resolution
+        for attempt in range(5):
             try:
                 market_data = state.manager.gamma.get_market_by_slug(old_slug)
                 if market_data:
@@ -920,20 +935,22 @@ class MomentumSniperStrategy:
                     elif down_price > 0.9:
                         self.log(f"{state.coin} Gamma API: DOWN won (down={down_price:.2f})")
                         return "down"
-                    # Market not yet fully resolved in API — fall through to spot
             except Exception as e:
-                self.log(f"{state.coin} Gamma API check failed: {e}", "warning")
+                self.log(
+                    f"{state.coin} Gamma API check failed (attempt {attempt + 1}): {e}",
+                    "warning"
+                )
 
-        # Fallback: Binance spot vs strike
-        spot = self.binance.get_price(state.coin)
-        if spot > 0 and state.strike_price > 0:
-            winner = "up" if spot >= state.strike_price else "down"
-            self.log(
-                f"{state.coin} spot fallback: {winner.upper()} "
-                f"(spot=${spot:,.2f} vs strike=${state.strike_price:,.2f})"
-            )
-            return winner
+            if attempt < 4:
+                self.log(
+                    f"{state.coin} not yet resolved, waiting 15s ({attempt + 1}/5)"
+                )
+                time.sleep(15)
 
+        self.log(
+            f"{state.coin} UNRESOLVED after 5 attempts — refusing to guess",
+            "error"
+        )
         return None
 
     def _handle_market_change(self, coin: str, old_slug: str, new_slug: str):

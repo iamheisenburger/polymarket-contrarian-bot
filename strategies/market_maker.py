@@ -44,6 +44,7 @@ from lib.console import Colors, StatusDisplay, format_countdown
 from lib.trade_logger import TradeLogger
 from strategies.base import BaseStrategy, StrategyConfig
 from src.bot import TradingBot, OrderResult
+from src.gamma_client import GammaClient
 from src.websocket_client import OrderbookSnapshot
 
 
@@ -108,6 +109,14 @@ class QuoteState:
         self.down_inventory: float = 0.0   # Down tokens held
         self.up_cost_basis: float = 0.0    # Total USDC spent on Up
         self.down_cost_basis: float = 0.0
+
+        # Simulated quote tracking (observe mode)
+        self.sim_up_active: bool = False
+        self.sim_down_active: bool = False
+        self.sim_up_price: float = 0.0
+        self.sim_down_price: float = 0.0
+        self.sim_up_tokens: float = 0.0
+        self.sim_down_tokens: float = 0.0
 
         # Session stats
         self.quotes_posted: int = 0
@@ -174,6 +183,13 @@ class QuoteState:
         self.down_quote_size = 0.0
         self.last_fair_up = 0.5
         self.last_quote_time = 0.0
+        # Reset simulated quotes
+        self.sim_up_active = False
+        self.sim_down_active = False
+        self.sim_up_price = 0.0
+        self.sim_down_price = 0.0
+        self.sim_up_tokens = 0.0
+        self.sim_down_tokens = 0.0
 
 
 class MarketMakerStrategy(BaseStrategy):
@@ -211,6 +227,9 @@ class MarketMakerStrategy(BaseStrategy):
         # USDC balance
         self._balance: float = 0.0
         self._last_balance_check: float = 0.0
+
+        # Gamma API for settlement verification
+        self._gamma = GammaClient()
 
         # Session tracking
         self._session_start = time.time()
@@ -431,15 +450,6 @@ class MarketMakerStrategy(BaseStrategy):
 
     async def _post_quotes(self, fv: FairValue):
         """Post or update two-sided quotes with Kelly-sized positions."""
-        if self.mc.observe_only:
-            return
-
-        # Balance check (rate-limited)
-        self._refresh_balance()
-        if self._balance > 0 and self._balance < self.mc.min_balance:
-            self.log(f"Balance ${self._balance:.2f} below minimum — done", "warning")
-            return
-
         up_quote, down_quote = self._calculate_quotes(fv)
 
         # Check minimum edge
@@ -450,16 +460,37 @@ class MarketMakerStrategy(BaseStrategy):
         post_up = self.quotes.fills_up < self.mc.max_inventory_per_side
         post_down = self.quotes.fills_down < self.mc.max_inventory_per_side
 
-        # Cancel existing quotes first
-        await self._cancel_all_quotes()
-
         # Kelly-sized USDC per quote
         up_usdc = self._kelly_quote_usdc(fv.fair_up, up_quote) if up_edge >= self.mc.min_edge else 0
         down_usdc = self._kelly_quote_usdc(fv.fair_down, down_quote) if down_edge >= self.mc.min_edge else 0
 
-        # Convert USDC to token count
-        up_tokens = round(up_usdc / up_quote, 2) if up_quote > 0.01 and up_usdc > 0 else 0
-        down_tokens = round(down_usdc / down_quote, 2) if down_quote > 0.01 and down_usdc > 0 else 0
+        # Convert USDC to token count (min 5 tokens for paper testing)
+        up_tokens = max(5.0, round(up_usdc / up_quote, 2)) if up_quote > 0.01 and up_usdc > 0 else 0
+        down_tokens = max(5.0, round(down_usdc / down_quote, 2)) if down_quote > 0.01 and down_usdc > 0 else 0
+
+        if self.mc.observe_only:
+            # Simulated quoting — track what we WOULD post
+            self.quotes.sim_up_active = post_up and up_tokens >= 1.0
+            self.quotes.sim_up_price = up_quote if self.quotes.sim_up_active else 0.0
+            self.quotes.sim_up_tokens = up_tokens if self.quotes.sim_up_active else 0.0
+            self.quotes.sim_down_active = post_down and down_tokens >= 1.0
+            self.quotes.sim_down_price = down_quote if self.quotes.sim_down_active else 0.0
+            self.quotes.sim_down_tokens = down_tokens if self.quotes.sim_down_active else 0.0
+            self.quotes.last_fair_up = fv.fair_up
+            self.quotes.last_quote_time = time.time()
+            self.quotes.quotes_posted += int(self.quotes.sim_up_active) + int(self.quotes.sim_down_active)
+            return
+
+        # --- Live mode below ---
+
+        # Balance check (rate-limited)
+        self._refresh_balance()
+        if self._balance > 0 and self._balance < self.mc.min_balance:
+            self.log(f"Balance ${self._balance:.2f} below minimum — done", "warning")
+            return
+
+        # Cancel existing quotes first
+        await self._cancel_all_quotes()
 
         # Post new quotes
         tasks = []
@@ -572,28 +603,76 @@ class MarketMakerStrategy(BaseStrategy):
             self.quotes.record_fill(side, price, size, usdc)
             setattr(self.quotes, order_id_attr, None)
 
-            # Log fill to CSV
-            spot = self.binance.get_price(self.mc.coin)
-            vol = self.binance.get_volatility(self.mc.coin)
-            fv = self._current_fv
-            other_price = self._last_prices.get("down" if side == "up" else "up", 0)
-
-            self.trade_logger.log_trade(
-                market_slug=self._current_slug,
-                coin=self.mc.coin,
-                timeframe=self.mc.timeframe,
-                side=side,
-                entry_price=price,
-                bet_size_usdc=usdc,
-                num_tokens=size,
-                bankroll=self._balance,
-                btc_price=spot,
-                other_side_price=other_price,
-                volatility_std=vol,
-            )
+            # Log fill to CSV with full context
+            self._log_fill_to_csv(side, price, size, usdc)
 
             self.log(
                 f"FILL {side.upper()} @ {price:.2f} x{size:.0f} (${usdc:.2f}) | "
+                f"Inv: Up={self.quotes.up_inventory:.0f} Down={self.quotes.down_inventory:.0f}",
+                "success"
+            )
+
+    def _log_fill_to_csv(self, side: str, price: float, size: float, usdc: float):
+        """Log a fill (real or simulated) to CSV with full context."""
+        spot = self.binance.get_price(self.mc.coin)
+        vol = self.binance.get_volatility(self.mc.coin)
+        fv = self._current_fv
+        other_price = self._last_prices.get("down" if side == "up" else "up", 0)
+        fair_val = fv.fair_up if side == "up" else fv.fair_down if fv else 0.0
+        secs_left = self._seconds_to_expiry()
+
+        self.trade_logger.log_trade(
+            market_slug=self._current_slug,
+            coin=self.mc.coin,
+            timeframe=self.mc.timeframe,
+            side=side,
+            entry_price=price,
+            bet_size_usdc=usdc,
+            num_tokens=size,
+            bankroll=self._balance if self._balance > 0 else self.mc.starting_bankroll,
+            btc_price=spot,
+            other_side_price=other_price,
+            volatility_std=vol,
+            fair_value_at_entry=fair_val,
+            time_to_expiry_at_entry=secs_left,
+            volatility_at_entry=vol,
+        )
+
+    def _check_simulated_fills(self):
+        """
+        Simulate fill detection in observe mode.
+
+        Checks if the market's best ask is at or below our simulated quote price.
+        If so, a taker would have filled our bid — record as a simulated fill.
+        """
+        for side, active_attr, price_attr, tokens_attr in [
+            ("up", "sim_up_active", "sim_up_price", "sim_up_tokens"),
+            ("down", "sim_down_active", "sim_down_price", "sim_down_tokens"),
+        ]:
+            if not getattr(self.quotes, active_attr):
+                continue
+
+            quote_price = getattr(self.quotes, price_attr)
+            quote_tokens = getattr(self.quotes, tokens_attr)
+
+            # Check if market best ask <= our bid (would fill us)
+            best_ask = self.market.get_best_ask(side)
+            if best_ask <= 0 or best_ask > quote_price:
+                continue
+
+            # Simulated fill at our quote price
+            usdc = quote_price * quote_tokens
+            self.quotes.record_fill(side, quote_price, quote_tokens, usdc)
+
+            # Mark this sim quote as consumed
+            setattr(self.quotes, active_attr, False)
+
+            # Log to CSV
+            self._log_fill_to_csv(side, quote_price, quote_tokens, usdc)
+
+            self.log(
+                f"SIM FILL {side.upper()} @ {quote_price:.2f} x{quote_tokens:.0f} "
+                f"(${usdc:.2f}) ask={best_ask:.2f} | "
                 f"Inv: Up={self.quotes.up_inventory:.0f} Down={self.quotes.down_inventory:.0f}",
                 "success"
             )
@@ -602,41 +681,55 @@ class MarketMakerStrategy(BaseStrategy):
         """
         Determine trade outcomes when market settles.
 
-        Uses last known prices: winning side trends to $1.00, losing to $0.00.
-        Logs outcomes to CSV and settles inventory.
+        Uses ONLY the Gamma API (authoritative source). Polymarket settles on
+        Chainlink, not Binance — never guess from orderbook prices.
         """
         if self.quotes.up_inventory <= 0 and self.quotes.down_inventory <= 0:
             return
 
-        # Determine winner from last known prices
-        up_price = self._last_prices.get("up", 0)
-        down_price = self._last_prices.get("down", 0)
+        # Determine winner via Gamma API (retry up to 5 times)
+        winning_side = None
+        for attempt in range(5):
+            try:
+                market_data = self._gamma.get_market_by_slug(slug)
+                if market_data:
+                    prices = self._gamma.parse_prices(market_data)
+                    up_price = prices.get("up", 0)
+                    down_price = prices.get("down", 0)
+                    if up_price > 0.9:
+                        winning_side = "up"
+                        break
+                    elif down_price > 0.9:
+                        winning_side = "down"
+                        break
+            except Exception as e:
+                self.log(f"Gamma API check failed (attempt {attempt + 1}): {e}", "warning")
+            if attempt < 4:
+                self.log(f"Market {slug} not resolved, waiting 15s ({attempt + 1}/5)")
+                time.sleep(15)
 
-        if up_price <= 0 and down_price <= 0:
-            self.log(f"Settlement: {slug} (no price data)", "warning")
+        if winning_side is None:
+            self.log(f"UNRESOLVED after 5 attempts: {slug} — refusing to guess", "error")
             return
 
-        winning_side = "up" if up_price > 0.50 else "down"
         pnl = self.quotes.settle_market(winning_side)
 
-        # Log outcomes for all pending trades in this market
-        pending = self.trade_logger.get_pending_slugs()
-        for pending_slug in pending:
-            if pending_slug == slug:
-                # Determine if each logged trade won
-                # We logged individual fills, the outcome depends on which side
-                # For simplicity, log the aggregate outcome
-                won = pnl >= 0
-                self.trade_logger.log_outcome(
-                    market_slug=slug,
-                    won=won,
-                    payout=max(0, pnl + self.quotes.total_cost),
-                )
+        # Log outcomes for each pending trade in this market
+        pending_trades = self.trade_logger.get_pending_for_market(slug)
+        for trade_side, record in pending_trades:
+            won = (trade_side == winning_side)
+            payout = record.num_tokens * 1.0 if won else 0.0
+            self.trade_logger.log_outcome(
+                market_slug=slug,
+                side=trade_side,
+                won=won,
+                payout=payout,
+            )
 
         outcome_str = f"{'WIN' if pnl >= 0 else 'LOSS'}"
         self.log(
             f"SETTLED {slug}: {outcome_str} ${pnl:+.2f} "
-            f"({winning_side.upper()} won) | "
+            f"({winning_side.upper()} won, Gamma API verified) | "
             f"Session PnL: ${self.quotes.realized_pnl:+.2f}",
             "success" if pnl >= 0 else "warning"
         )
@@ -661,23 +754,32 @@ class MarketMakerStrategy(BaseStrategy):
         self._current_fv = fv
         secs_left = self._seconds_to_expiry()
 
-        # Check for fills
-        await self._check_fills()
+        # Check for fills (real or simulated)
+        if self.mc.observe_only:
+            self._check_simulated_fills()
+        else:
+            await self._check_fills()
 
         # Stop quoting near expiry (gamma risk too high)
         if secs_left < self.mc.stop_quoting_seconds:
-            if self.quotes.has_active_quotes:
+            if self.quotes.has_active_quotes or self.quotes.sim_up_active or self.quotes.sim_down_active:
                 self.log(
                     f"Expiry in {secs_left:.0f}s — pulling quotes",
                     "warning"
                 )
-                await self._cancel_all_quotes()
+                if not self.mc.observe_only:
+                    await self._cancel_all_quotes()
+                self.quotes.sim_up_active = False
+                self.quotes.sim_down_active = False
             return
 
         # Check if market is too close to certainty
         if fv.dominant_prob > 0.92:
             if self.quotes.has_active_quotes:
-                await self._cancel_all_quotes()
+                if not self.mc.observe_only:
+                    await self._cancel_all_quotes()
+            self.quotes.sim_up_active = False
+            self.quotes.sim_down_active = False
             return
 
         # No artificial loss limit — Kelly Criterion manages risk.
@@ -791,8 +893,20 @@ class MarketMakerStrategy(BaseStrategy):
 
         lines.append("")
 
-        # Quotes
-        if self.quotes.has_active_quotes:
+        # Quotes (real or simulated)
+        if self.mc.observe_only:
+            parts = []
+            if self.quotes.sim_up_active:
+                parts.append(f"UP @ {self.quotes.sim_up_price:.2f}")
+            if self.quotes.sim_down_active:
+                parts.append(f"DOWN @ {self.quotes.sim_down_price:.2f}")
+            if parts:
+                lines.append(f"  Sim Quotes: {' | '.join(parts)}")
+            elif secs < self.mc.stop_quoting_seconds:
+                lines.append("  Sim Quotes: PAUSED (near expiry)")
+            else:
+                lines.append("  Sim Quotes: (none active)")
+        elif self.quotes.has_active_quotes:
             parts = []
             if self.quotes.up_order_id:
                 parts.append(f"UP @ {self.quotes.up_quote_price:.2f}")
