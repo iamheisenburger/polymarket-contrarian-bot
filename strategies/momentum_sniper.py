@@ -1019,7 +1019,7 @@ class MomentumSniperStrategy:
         # Kelly sizes each bet against available balance, so later bets
         # naturally get smaller as capital is allocated. Let volume work.
         for state, side, price, edge, fv in opportunities:
-            if self._available_balance() < self.config.min_bet_usdc:
+            if not self.config.observe_only and self._available_balance() < self.config.min_bet_usdc:
                 break  # Out of capital — Kelly's job is done
             await self._execute_snipe(state, side, price, edge, fv, signal_time=signal_time)
 
