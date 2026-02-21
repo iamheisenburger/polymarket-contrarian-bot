@@ -661,14 +661,61 @@ class MomentumSniperStrategy:
     ) -> bool:
         """Execute a snipe trade."""
         if self.config.observe_only:
+            # Paper trading: track virtual positions so settlement logs to CSV
+            fair_prob = fv.fair_up if side == "up" else fv.fair_down
+            num_tokens = 5.0
+            buy_price = min(round(entry_price + 0.01, 2), 0.99)
+            actual_cost = buy_price * num_tokens
+
+            if side == "up":
+                state.up_tokens += num_tokens
+                state.up_cost += actual_cost
+            else:
+                state.down_tokens += num_tokens
+                state.down_cost += actual_cost
+
+            state.last_trade_time = time.time()
+            self.stats.trades += 1
+            self.stats.pending += 1
+            self.stats.total_wagered += actual_cost
+            self.stats.opportunities_found += 1
+
+            spot = self.binance.get_price(state.coin)
+            vol, vol_src = self._get_volatility(state.coin)
+            other_price = state.manager.get_mid_price("down" if side == "up" else "up")
+
+            self.trade_logger.log_trade(
+                market_slug=state.current_slug,
+                coin=state.coin,
+                timeframe=self.config.timeframe,
+                side=side,
+                entry_price=buy_price,
+                bet_size_usdc=actual_cost,
+                num_tokens=num_tokens,
+                bankroll=self._balance,
+                usdc_balance=self._balance,
+                btc_price=spot,
+                other_side_price=other_price,
+                volatility_std=vol,
+                fair_value_at_entry=fair_prob,
+                time_to_expiry_at_entry=state.seconds_to_expiry(),
+                momentum_at_entry=self.binance.get_momentum(
+                    state.coin, self.config.momentum_lookback
+                ),
+                volatility_at_entry=vol,
+                signal_to_order_ms=0,
+                order_latency_ms=0,
+                total_latency_ms=0,
+                vol_source=vol_src,
+            )
+
             self.log(
-                f"[OBSERVE] Would BUY {state.coin} {side.upper()} "
-                f"@ {entry_price:.2f} (fair={fv.fair_up if side == 'up' else fv.fair_down:.2f}, "
-                f"edge={edge:.2f})",
+                f"[PAPER] {state.coin} {side.upper()} @ {buy_price:.2f} "
+                f"x{num_tokens:.0f} (${actual_cost:.2f}) edge={edge:.2f} "
+                f"FV={fair_prob:.2f} vol={vol_src}",
                 "trade"
             )
-            self.stats.opportunities_found += 1
-            return False
+            return True
 
         # Calculate bet size
         fair_prob = fv.fair_up if side == "up" else fv.fair_down
