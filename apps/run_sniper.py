@@ -142,6 +142,10 @@ def main():
         "--momentum-lookback", type=float, default=30.0,
         help="Seconds to look back for momentum calculation (default: 30)"
     )
+    parser.add_argument(
+        "--min-fair-value", type=float, default=0.50,
+        help="Min model confidence to trade (default: 0.50 = disabled). 0.58+ recommended — filters coin-flip trades."
+    )
 
     args = parser.parse_args()
 
@@ -212,6 +216,7 @@ def main():
         max_volatility=args.max_vol,
         min_momentum=args.min_momentum,
         momentum_lookback=args.momentum_lookback,
+        min_fair_value=args.min_fair_value,
         observe_only=args.observe,
         log_file=args.log_file,
     )

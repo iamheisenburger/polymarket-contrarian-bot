@@ -95,6 +95,11 @@ class SniperConfig:
     # Momentum lookback period in seconds
     momentum_lookback: float = 30.0
 
+    # Fair value confidence: minimum model confidence to trade.
+    # FV 0.50 = coin flip (no edge). FV 0.60+ = model is confident.
+    # Data: FV >= 0.60 → 80% WR. FV 0.50-0.52 → 26% WR.
+    min_fair_value: float = 0.50     # 0.50 = disabled (default). 0.58+ recommended.
+
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
@@ -625,6 +630,10 @@ class MomentumSniperStrategy:
                 edge = fair_prob - buy_price
 
                 if edge >= self.config.min_edge:
+                    # Fair value confidence filter: skip coin-flip trades
+                    if fair_prob < self.config.min_fair_value:
+                        continue  # Model not confident enough
+
                     # Momentum filter: Binance must be moving in our direction
                     if self.config.min_momentum > 0:
                         momentum = self.binance.get_momentum(
@@ -1068,6 +1077,8 @@ class MomentumSniperStrategy:
             filters += f" | vol<{self.config.max_volatility:.2f}"
         if self.config.min_momentum > 0:
             filters += f" | mom>{self.config.min_momentum:.2%}"
+        if self.config.min_fair_value > 0.50:
+            filters += f" | FV>={self.config.min_fair_value:.2f}"
         lines.append(
             f"  Settings: {filters} | "
             f"{sizing} | "
