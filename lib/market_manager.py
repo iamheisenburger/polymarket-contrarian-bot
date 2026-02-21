@@ -160,7 +160,7 @@ class MarketManager:
             coin: Coin symbol (BTC, ETH, SOL, XRP)
             market_check_interval: Seconds between market checks
             auto_switch_market: Auto switch when market changes
-            timeframe: Market timeframe ("5m" or "15m")
+            timeframe: Market timeframe ("5m", "15m", "4h", "1h", "daily")
         """
         self.coin = coin.upper()
         self.market_check_interval = market_check_interval

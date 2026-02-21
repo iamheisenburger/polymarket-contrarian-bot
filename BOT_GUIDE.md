@@ -7,19 +7,23 @@ spot price movements and Polymarket orderbook repricing. Black-Scholes calculate
 the true probability; when the market price lags behind, we buy the mispriced side
 and hold to settlement ($1.00 on win, $0.00 on loss).
 
-### Active: Viper v2 (BTC/ETH 15m — single instance)
-- **Single instance**: BTC/ETH on 15m markets only
-- **Half-Kelly sizing** with 15% max-bet-fraction cap
-- **Entry filters:**
-  1. **Edge >= 5 cents** — fair_value minus buy_price must be at least $0.05
-  2. **Min entry price $0.40** — the single most important filter (model is only accurate above this)
-  3. **Max entry price $0.85**
-  4. **Volatility cap** — vol < 0.50
-  5. **Momentum confirmation** — Binance price moved >= 0.05% in trade direction (30s lookback)
-  6. **Max bet fraction 15%** of bankroll per trade
-- **No blocked hours** — entry price filter handles everything
-- Starting bankroll: $21 (goal: $1000)
-- Trade log: `data/viper_15m.csv`
+### Active: Viper v4 Paper Trading (starting 2026-02-21)
+
+**What changed:** Fee-aware edge calculation, multi-timeframe (5m + 1h), higher confidence thresholds.
+Polymarket introduced taker fees Jan 19 (15m: 1.56% max) and Feb 12 (5m: 0.44% max). Old 2c edge
+was negative after fees. v4 uses net edge (after fee deduction) and higher FV thresholds.
+
+**5m Instance (PRIMARY):**
+- BTC/ETH/SOL/XRP, 12 windows/hr/coin = 1,152/day total
+- Fee: 0.44% max | Net edge >= 10c | FV >= 0.70 | Price $0.40-$0.85
+- Log: `data/viper_v4_5m.csv`
+
+**1h Instance (SUPPLEMENTARY):**
+- BTC/ETH/SOL/XRP, 1 window/hr/coin = 96/day total
+- Fee: NONE | Net edge >= 5c | FV >= 0.65 | Price $0.40-$0.85
+- Log: `data/viper_v4_1h.csv`
+
+**Decision point:** 40-50 trades → WR >= 60% = go live, WR < 50% = reassess
 
 ### Why $0.40 Min Entry (from 50-trade Viper v1 + 249-trade Longshot)
 - Entry >= $0.40: 22W/6L = **78.6% WR**, +$56.02
@@ -114,7 +118,7 @@ ssh -i ~/.ssh/polymarket_bot -o ConnectTimeout=5 root@209.38.36.107 "free -h && 
 ```bash
 python apps/run_sniper.py --coins BTC ETH --timeframe 15m --bankroll 20 \
   --min-edge 0.05 --min-entry-price 0.40 --max-entry-price 0.85 \
-  --max-vol 0.50 --min-momentum 0.0005 --momentum-lookback 30 \
+  --max-vol 0.75 --min-momentum 0.0005 --momentum-lookback 30 \
   --kelly 0.50 --kelly-strong 0.75 --max-bet-fraction 0.15 \
   --log-file data/viper_15m.csv
 ```
@@ -189,7 +193,8 @@ Project Root/
 ├── lib/
 │   ├── fair_value.py          # Black-Scholes binary pricing
 │   ├── binance_ws.py          # Binance real-time price feed + volatility + momentum
-│   ├── trade_logger.py        # CSV trade logging
+│   ├── deribit_vol.py         # Deribit DVOL implied volatility feed
+│   ├── trade_logger.py        # CSV trade logging (+ latency fields)
 │   ├── market_manager.py      # Market lifecycle management
 │   └── console.py             # Terminal UI
 ├── data/

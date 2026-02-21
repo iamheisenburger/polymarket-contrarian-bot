@@ -47,6 +47,26 @@ from lib.trade_logger import TradeLogger
 from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
+from src.gamma_client import GammaClient
+
+# Taker fee rates per timeframe.
+# Fee per token = price * (1 - price) * rate.
+# Max fee at p=0.50: 5m=0.44%, 15m=1.56%, others=0%.
+TAKER_FEE_RATES = {
+    "5m": 0.0176,
+    "15m": 0.0624,
+    "4h": 0.0,
+    "1h": 0.0,
+    "daily": 0.0,
+}
+
+
+def taker_fee_per_token(price: float, timeframe: str) -> float:
+    """Calculate taker fee per token at a given price and timeframe."""
+    rate = TAKER_FEE_RATES.get(timeframe, 0.0)
+    if rate <= 0:
+        return 0.0
+    return price * (1.0 - price) * rate
 
 
 @dataclass
@@ -398,15 +418,21 @@ class MomentumSniperStrategy:
         state.current_slug = slug
         state.market_start_time = time.time()
 
-        # Parse market start/end time from slug
+        # Parse market start/end time from slug or end_date
         market_start_ts = 0
+        duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 900)
         try:
             ts_str = slug.rsplit("-", 1)[-1]
             market_start_ts = int(ts_str)
-            duration = 900 if self.config.timeframe == "15m" else 300
             state.market_end_ts = market_start_ts + duration
         except (ValueError, IndexError):
-            state.market_end_ts = 0
+            # Non-timestamp slug (1h, daily) — use end_date from market info
+            end_ts = market.end_timestamp()
+            if end_ts:
+                state.market_end_ts = end_ts
+                market_start_ts = end_ts - duration
+            else:
+                state.market_end_ts = 0
 
         spot = self.binance.get_price(state.coin)
         if spot <= 0:
@@ -627,7 +653,10 @@ class MomentumSniperStrategy:
 
                 # Calculate edge using actual buy price (we pay ask + 1 cent for fill)
                 buy_price = min(round(best_ask + 0.01, 2), 0.99)
-                edge = fair_prob - buy_price
+
+                # Net edge = fair value - buy price - taker fee
+                fee = taker_fee_per_token(buy_price, self.config.timeframe)
+                edge = fair_prob - buy_price - fee
 
                 if edge >= self.config.min_edge:
                     # Fair value confidence filter: skip coin-flip trades
@@ -1064,8 +1093,10 @@ class MomentumSniperStrategy:
                          f"expiry={mins}m{s:02d}s{waiting}")
 
             if fv:
-                up_edge = fv.fair_up - up_ask if up_ask > 0 else 0
-                down_edge = fv.fair_down - down_ask if down_ask > 0 else 0
+                up_fee = taker_fee_per_token(up_ask, self.config.timeframe) if up_ask > 0 else 0
+                down_fee = taker_fee_per_token(down_ask, self.config.timeframe) if down_ask > 0 else 0
+                up_edge = fv.fair_up - up_ask - up_fee if up_ask > 0 else 0
+                down_edge = fv.fair_down - down_ask - down_fee if down_ask > 0 else 0
 
                 # Show edges with color indicators
                 up_signal = "*" if up_edge >= self.config.min_edge else " "
@@ -1126,10 +1157,13 @@ class MomentumSniperStrategy:
             filters += f" | mom>{self.config.min_momentum:.2%}"
         if self.config.min_fair_value > 0.50:
             filters += f" | FV>={self.config.min_fair_value:.2f}"
+        fee_rate = TAKER_FEE_RATES.get(self.config.timeframe, 0.0)
+        fee_str = "none" if fee_rate == 0 else f"{fee_rate*25:.2f}%@50c"
         lines.append(
             f"  Settings: {filters} | "
             f"{sizing} | "
-            f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}]"
+            f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}] | "
+            f"fee={fee_str}"
         )
 
         lines.append(f"{'─' * 70}")

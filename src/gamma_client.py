@@ -43,13 +43,31 @@ class GammaClient(ThreadLocalSessionMixin):
         "XRP": "xrp-updown-5m",
     }
 
+    COIN_SLUGS_4H = {
+        "BTC": "btc-updown-4h",
+        "ETH": "eth-updown-4h",
+        "SOL": "sol-updown-4h",
+        "XRP": "xrp-updown-4h",
+    }
+
     # Keep backward compat
     COIN_SLUGS = COIN_SLUGS_15M
+
+    # Coin tag names used in Gamma API event titles
+    COIN_TAGS = {
+        "BTC": "Bitcoin",
+        "ETH": "Ethereum",
+        "SOL": "Solana",
+        "XRP": "XRP",
+    }
 
     # Timeframe durations in seconds
     TIMEFRAME_SECONDS = {
         "5m": 300,
         "15m": 900,
+        "4h": 14400,
+        "1h": 3600,
+        "daily": 86400,
     }
 
     def __init__(self, host: str = DEFAULT_HOST, timeout: int = 10):
@@ -90,13 +108,26 @@ class GammaClient(ThreadLocalSessionMixin):
 
         Args:
             coin: Coin symbol (BTC, ETH, SOL, XRP)
-            timeframe: Market timeframe ("5m" or "15m")
+            timeframe: Market timeframe ("5m", "15m", "4h", "1h", "daily")
 
         Returns:
             Market data for the current window, or None
         """
         coin = coin.upper()
-        slug_map = self.COIN_SLUGS_5M if timeframe == "5m" else self.COIN_SLUGS_15M
+
+        # Route to tag-based discovery for timeframes with non-timestamp slugs
+        if timeframe == "1h":
+            return self._search_active_market(coin, "1H")
+        if timeframe == "daily":
+            return self._search_active_market(coin, "Daily-Close")
+
+        # Timestamp-based slug construction for 5m, 15m, 4h
+        slug_maps = {
+            "5m": self.COIN_SLUGS_5M,
+            "15m": self.COIN_SLUGS_15M,
+            "4h": self.COIN_SLUGS_4H,
+        }
+        slug_map = slug_maps.get(timeframe, self.COIN_SLUGS_15M)
         duration = self.TIMEFRAME_SECONDS.get(timeframe, 900)
 
         if coin not in slug_map:
@@ -105,10 +136,17 @@ class GammaClient(ThreadLocalSessionMixin):
         prefix = slug_map[coin]
         now = datetime.now(timezone.utc)
 
-        # Calculate window size in minutes
-        window_minutes = duration // 60
-        minute = (now.minute // window_minutes) * window_minutes
-        current_window = now.replace(minute=minute, second=0, microsecond=0)
+        # Calculate window alignment
+        if timeframe == "4h":
+            # 4h windows align to 0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC
+            hour = (now.hour // 4) * 4
+            current_window = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        else:
+            # 5m/15m windows align to minute boundaries
+            window_minutes = duration // 60
+            minute = (now.minute // window_minutes) * window_minutes
+            current_window = now.replace(minute=minute, second=0, microsecond=0)
+
         current_ts = int(current_window.timestamp())
 
         # Try current, next, and previous windows
@@ -120,6 +158,83 @@ class GammaClient(ThreadLocalSessionMixin):
                 return market
 
         return None
+
+    def _search_active_market(self, coin: str, tag: str) -> Optional[Dict[str, Any]]:
+        """
+        Find active market using Gamma events API tag search.
+
+        Used for timeframes with human-readable slugs (1H, daily)
+        where timestamp-based slug construction doesn't work.
+
+        Args:
+            coin: Coin symbol (BTC, ETH, SOL, XRP)
+            tag: Gamma API tag to search for ("1H", "Daily-Close")
+
+        Returns:
+            Market data dictionary or None
+        """
+        coin = coin.upper()
+        coin_tag = self.COIN_TAGS.get(coin, coin)
+
+        try:
+            url = f"{self.host}/events"
+            response = self.session.get(
+                url,
+                params={"active": "true", "limit": 50, "tag": tag},
+                timeout=self.timeout,
+            )
+            if response.status_code != 200:
+                return None
+
+            events = response.json()
+            now = datetime.now(timezone.utc)
+            best_market = None
+            best_end = None
+
+            for event in events:
+                title = event.get("title", "")
+                # Check if this event is for our coin
+                if coin_tag.lower() not in title.lower():
+                    continue
+
+                # Get markets from the event
+                markets = event.get("markets", [])
+                for market in markets:
+                    if not market.get("acceptingOrders"):
+                        continue
+
+                    # Parse end date — pick the soonest-expiring active market
+                    end_str = market.get("endDate", "")
+                    if not end_str:
+                        continue
+
+                    try:
+                        end_time = datetime.fromisoformat(
+                            end_str.replace("Z", "+00:00")
+                        )
+                    except (ValueError, TypeError):
+                        continue
+
+                    if end_time <= now:
+                        continue
+
+                    if best_end is None or end_time < best_end:
+                        best_end = end_time
+                        best_market = market
+
+            # If found via events search, fetch full market data by slug
+            # to ensure we have all fields (token IDs, prices, etc.)
+            if best_market:
+                slug = best_market.get("slug")
+                if slug:
+                    full_market = self.get_market_by_slug(slug)
+                    if full_market and full_market.get("acceptingOrders"):
+                        return full_market
+                return best_market
+
+            return None
+        except Exception:
+            return None
 
     def get_current_15m_market(self, coin: str) -> Optional[Dict[str, Any]]:
         """Get the current active 15-minute market for a coin."""
@@ -220,7 +335,7 @@ class GammaClient(ThreadLocalSessionMixin):
 
         Args:
             coin: Coin symbol
-            timeframe: Market timeframe ("5m" or "15m")
+            timeframe: Market timeframe ("5m", "15m", "4h", "1h", "daily")
 
         Returns:
             Dictionary with market info including token IDs and prices

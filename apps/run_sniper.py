@@ -66,17 +66,17 @@ def main():
         help="Coins to scan (default: BTC). Options: BTC ETH SOL XRP"
     )
     parser.add_argument(
-        "--timeframe", type=str, default="15m",
-        choices=["5m", "15m"],
-        help="Market timeframe (default: 15m)"
+        "--timeframe", type=str, default="5m",
+        choices=["5m", "15m", "4h", "1h", "daily"],
+        help="Market timeframe (default: 5m). 1h/daily are fee-free."
     )
     parser.add_argument(
         "--bankroll", type=float, default=20.0,
         help="Starting bankroll in USDC (default: 20.0)"
     )
     parser.add_argument(
-        "--min-edge", type=float, default=0.05,
-        help="Minimum edge to enter a trade (default: 0.05 = 5 cents)"
+        "--min-edge", type=float, default=0.10,
+        help="Minimum net edge (after fees) to enter a trade (default: 0.10 = 10 cents)"
     )
     parser.add_argument(
         "--strong-edge", type=float, default=0.10,
@@ -143,8 +143,8 @@ def main():
         help="Seconds to look back for momentum calculation (default: 30)"
     )
     parser.add_argument(
-        "--min-fair-value", type=float, default=0.50,
-        help="Min model confidence to trade (default: 0.50 = disabled). 0.58+ recommended — filters coin-flip trades."
+        "--min-fair-value", type=float, default=0.70,
+        help="Min model confidence to trade (default: 0.70). Only trade when model is highly confident."
     )
 
     args = parser.parse_args()
@@ -233,8 +233,18 @@ def main():
     print(f"  Bankroll:       ${args.bankroll:.2f}")
     print()
 
+    # Fee info
+    from strategies.momentum_sniper import TAKER_FEE_RATES
+    fee_rate = TAKER_FEE_RATES.get(args.timeframe, 0.0)
+    if fee_rate > 0:
+        max_fee_pct = fee_rate * 0.25 * 100  # max at p=0.50
+        print(f"  Taker Fee:      {max_fee_pct:.2f}% max (at 50c entry)")
+    else:
+        print(f"  Taker Fee:      NONE (fee-free market)")
+    print()
+
     # Edge info
-    print(f"  Edge Thresholds:")
+    print(f"  Edge Thresholds (net, after fees):")
     print(f"    Min edge:     {args.min_edge:.2f} ({args.min_edge*100:.0f} cents)")
     print(f"    Strong edge:  {args.strong_edge:.2f} ({args.strong_edge*100:.0f} cents)")
     print()
