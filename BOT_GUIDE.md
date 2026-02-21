@@ -9,19 +9,15 @@ and hold to settlement ($1.00 on win, $0.00 on loss).
 
 ### Active: Viper v4 Paper Trading (starting 2026-02-21)
 
-**What changed:** Fee-aware edge calculation, multi-timeframe (5m + 1h), higher confidence thresholds.
+**What changed:** Fee-aware edge calculation, higher confidence thresholds.
 Polymarket introduced taker fees Jan 19 (15m: 1.56% max) and Feb 12 (5m: 0.44% max). Old 2c edge
 was negative after fees. v4 uses net edge (after fee deduction) and higher FV thresholds.
+5m chosen over 15m: 3.5x lower fees, 3x higher frequency.
 
-**5m Instance (PRIMARY):**
+**5m Instance:**
 - BTC/ETH/SOL/XRP, 12 windows/hr/coin = 1,152/day total
 - Fee: 0.44% max | Net edge >= 10c | FV >= 0.70 | Price $0.40-$0.85
 - Log: `data/viper_v4_5m.csv`
-
-**1h Instance (SUPPLEMENTARY):**
-- BTC/ETH/SOL/XRP, 1 window/hr/coin = 96/day total
-- Fee: NONE | Net edge >= 5c | FV >= 0.65 | Price $0.40-$0.85
-- Log: `data/viper_v4_1h.csv`
 
 **Decision point:** 40-50 trades → WR >= 60% = go live, WR < 50% = reassess
 
