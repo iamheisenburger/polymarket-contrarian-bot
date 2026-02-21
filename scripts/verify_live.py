@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Spot-check trade outcomes against Gamma API to prove data is real."""
-import sys, json, urllib.request
+import sys, json, requests
 
 CHECKS = [
     ("Oracle #1",  "sol-updown-5m-1771690500", "down", "won"),
@@ -17,9 +17,9 @@ total = 0
 for label, slug, side, csv_outcome in CHECKS:
     try:
         url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
 
         if not data:
             print(f"{label}: {slug} — NOT FOUND")
