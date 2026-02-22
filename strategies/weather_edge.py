@@ -12,6 +12,7 @@ import asyncio
 import csv
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
@@ -41,7 +42,7 @@ class WeatherConfig:
     max_entry_price: float = 0.50   # cap — don't buy expensive buckets
     scan_interval: int = 300        # rescan every 5 min
     settle_interval: int = 300      # check settlements every 5 min
-    cities: list = field(default_factory=lambda: list(CITIES.keys()))
+    cities: list = field(default_factory=lambda: list(CITIES.keys()))  # Seoul/Seattle excluded from CITIES
     forecast_days: int = 2          # today + tomorrow
 
 
@@ -222,9 +223,16 @@ class WeatherEdgeBot:
                 continue
             members = forecasts[mkt.date]
 
-            # Compute model probability for this bucket
+            # Get city-specific bias correction
+            city_cfg = CITIES.get(mkt.city)
+            bias = city_cfg.bias_correction if city_cfg else 0.0
+            extra = city_cfg.extra_std if city_cfg else 0.0
+
+            # Compute model probability for this bucket (with bias correction)
             bucket_probs = self.forecaster.compute_bucket_probabilities(
-                members, [(mkt.bucket_low, mkt.bucket_high)]
+                members, [(mkt.bucket_low, mkt.bucket_high)],
+                bias_correction=bias,
+                extra_std=extra,
             )
             if not bucket_probs:
                 continue
@@ -233,7 +241,11 @@ class WeatherEdgeBot:
             edge = model_prob - mkt.best_ask
 
             if edge >= self.config.min_edge:
-                mean = sum(members) / len(members)
+                # Report corrected mean/std for diagnostics
+                corrected = [m + bias for m in members]
+                mean = sum(corrected) / len(corrected)
+                variance = sum((m - mean)**2 for m in corrected) / len(corrected)
+                std = math.sqrt(variance + extra**2)
                 opportunities.append({
                     "market": mkt,
                     "model_prob": model_prob,
@@ -241,7 +253,7 @@ class WeatherEdgeBot:
                     "prob_normal": bucket_probs[0]["prob_normal"],
                     "edge": edge,
                     "members_mean": mean,
-                    "members_std": (sum((m - mean)**2 for m in members) / len(members)) ** 0.5,
+                    "members_std": std,
                 })
 
         # Sort by edge descending
