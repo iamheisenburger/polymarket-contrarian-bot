@@ -256,40 +256,12 @@ class CopySniper:
         if self.config.skip_crypto_binaries and self._is_crypto_binary(signal.market_slug):
             return None
 
-        # Filter: resolution time — skip markets that won't resolve soon
-        if self.config.max_hours_to_resolution > 0:
-            market_info = self._get_market_info(signal.market_slug)
-            if market_info:
-                end_date_str = market_info.get("endDate") or market_info.get("end_date_iso")
-                if end_date_str:
-                    try:
-                        # Parse ISO date (handles both Z and +00:00 formats)
-                        end_str = end_date_str.replace("Z", "+00:00")
-                        end_dt = datetime.fromisoformat(end_str)
-                        now_dt = datetime.now(timezone.utc)
-                        hours_left = (end_dt - now_dt).total_seconds() / 3600
-                        if hours_left > self.config.max_hours_to_resolution:
-                            logger.debug(
-                                f"Skip {signal.market_question[:40]}... — "
-                                f"resolves in {hours_left:.0f}h (max {self.config.max_hours_to_resolution:.0f}h)"
-                            )
-                            return None
-                        if hours_left < 0.05:  # < 3 minutes left, too late
-                            return None
-                    except (ValueError, TypeError):
-                        pass  # Can't parse date, let it through
-                else:
-                    # No end date available — skip to be safe (could be indefinite)
-                    logger.debug(f"Skip {signal.market_question[:40]}... — no end date found")
-                    return None
-            else:
-                # Can't fetch market info — skip
-                return None
+        # --- Fast checks first (no API calls) ---
 
         # Filter: trade age
         age = now - signal.alpha_timestamp
         if age > self.config.max_trade_age:
-            logger.debug(f"Skip {signal.market_question[:40]}... — too old ({age}s)")
+            logger.info(f"SKIP [age {age}s] {signal.market_question[:50]}")
             return None
 
         # Filter: already have position in this market
@@ -298,20 +270,53 @@ class CopySniper:
 
         # Filter: entry price range from alpha's trade
         if signal.alpha_price < self.config.min_entry_price:
+            logger.info(f"SKIP [price ${signal.alpha_price:.2f} < min] {signal.market_question[:50]}")
             return None
         if signal.alpha_price > self.config.max_entry_price:
+            logger.info(f"SKIP [price ${signal.alpha_price:.2f} > max] {signal.market_question[:50]}")
             return None
+
+        # --- Expensive checks (API calls) ---
+
+        # Filter: resolution time — skip markets that won't resolve soon
+        if self.config.max_hours_to_resolution > 0:
+            market_info = self._get_market_info(signal.market_slug)
+            if market_info:
+                end_date_str = market_info.get("endDate") or market_info.get("end_date_iso")
+                if end_date_str:
+                    try:
+                        end_str = end_date_str.replace("Z", "+00:00")
+                        end_dt = datetime.fromisoformat(end_str)
+                        now_dt = datetime.now(timezone.utc)
+                        hours_left = (end_dt - now_dt).total_seconds() / 3600
+                        if hours_left > self.config.max_hours_to_resolution:
+                            logger.info(
+                                f"SKIP [resolves {hours_left:.0f}h] {signal.market_question[:50]}"
+                            )
+                            return None
+                        if hours_left < 0.05:  # < 3 minutes left, too late
+                            logger.info(f"SKIP [too late {hours_left*60:.0f}m] {signal.market_question[:50]}")
+                            return None
+                        logger.info(f"PASS [resolves {hours_left:.1f}h] {signal.market_question[:50]}")
+                    except (ValueError, TypeError):
+                        pass  # Can't parse date, let it through
+                else:
+                    logger.info(f"SKIP [no end date] {signal.market_question[:50]}")
+                    return None
+            else:
+                logger.info(f"SKIP [no market info] {signal.market_question[:50]}")
+                return None
 
         # Get current price
         current_price = self._get_market_price(signal.token_id)
         if current_price is None:
-            logger.debug(f"Skip {signal.market_question[:40]}... — no orderbook")
+            logger.info(f"SKIP [no orderbook] {signal.market_question[:50]}")
             return None
 
         # Filter: slippage
         slippage = current_price - signal.alpha_price
         if slippage > self.config.max_slippage:
-            logger.debug(f"Skip {signal.market_question[:40]}... — slippage {slippage:.3f}")
+            logger.info(f"SKIP [slippage {slippage:.3f}] {signal.market_question[:50]}")
             return None
 
         # Filter: current price range
