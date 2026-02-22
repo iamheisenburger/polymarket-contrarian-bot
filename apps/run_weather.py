@@ -27,6 +27,12 @@ def main():
                         help="Max position as fraction of bankroll (default: 0.20)")
     parser.add_argument("--cities", nargs="+", default=list(CITIES.keys()),
                         help=f"Cities to trade (default: all). Options: {', '.join(CITIES.keys())}")
+    parser.add_argument("--min-models", type=int, default=2,
+                        help="Min models that must agree on >=5%% prob (default: 2)")
+    parser.add_argument("--max-bets-per-city", type=int, default=1,
+                        help="Max bets per city-date combination (default: 1)")
+    parser.add_argument("--no-hrrr", action="store_true",
+                        help="Disable HRRR for US same-day predictions")
     parser.add_argument("--scan-interval", type=int, default=300,
                         help="Seconds between scans (default: 300)")
     parser.add_argument("--live", action="store_true",
@@ -57,6 +63,9 @@ def main():
         min_edge=args.min_edge,
         kelly_fraction=args.kelly,
         max_position_pct=args.max_pos,
+        min_models_agree=args.min_models,
+        max_bets_per_city_date=args.max_bets_per_city,
+        use_hrrr=not args.no_hrrr,
         cities=args.cities,
         scan_interval=args.scan_interval,
     )
@@ -70,16 +79,19 @@ def main():
         if not opps:
             print("No opportunities found with edge >= {:.0%}".format(config.min_edge))
         else:
-            print(f"Found {len(opps)} opportunities:\n")
-            print(f"{'City':<8} {'Date':<12} {'Bucket':<10} {'Ask':>6} {'Model':>7} {'Edge':>7} {'Count':>7} {'Normal':>7} {'Mean':>6} {'Std':>5}")
-            print("-" * 90)
+            print(f"Found {len(opps)} consensus opportunities:\n")
+            print(f"{'City':<14} {'Date':<12} {'Bucket':<10} {'Ask':>6} {'Consens':>8} {'Edge':>7} {'Agree':>6} {'Per-Model Detail'}")
+            print("-" * 110)
             for opp in opps:
                 mkt = opp["market"]
+                pm = opp.get("per_model", {})
+                pm_str = " ".join(f"{k}={v:.0%}" for k, v in pm.items())
+                hrrr = "+H" if opp.get("hrrr_boost") else "  "
                 print(
-                    f"{mkt.city:<8} {mkt.date:<12} {mkt.bucket_label:<10} "
-                    f"${mkt.best_ask:.3f} {opp['model_prob']:>6.1%} {opp['edge']:>+6.1%} "
-                    f"{opp['prob_count']:>6.1%} {opp['prob_normal']:>6.1%} "
-                    f"{opp['members_mean']:>5.1f} {opp['members_std']:>4.1f}"
+                    f"{mkt.city:<14} {mkt.date:<12} {mkt.bucket_label:<10} "
+                    f"${mkt.best_ask:.3f} {opp['model_prob']:>7.1%} {opp['edge']:>+6.1%} "
+                    f"{opp.get('models_agreeing', '?'):>3}/4{hrrr} "
+                    f"[{pm_str}]"
                 )
             print()
 
