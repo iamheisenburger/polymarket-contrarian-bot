@@ -5,13 +5,15 @@ Pulls ensemble members from 4 independent models (ECMWF, GFS, ICON, GEM)
 via Open-Meteo and computes consensus bucket probabilities. Only trades when
 multiple models agree on a bucket, eliminating single-model overconfidence.
 
-Also uses HRRR (3km deterministic) for US same-day temperature predictions.
+Also uses HRRR (3km deterministic) for US same-day temperature predictions
+and WU intraday cross-reference to kill impossible bets.
 
 Key v3 changes vs v2:
 - 4 models (143 members) instead of 1 model (51 members)
 - Consensus: only trade when min_models_agree models see >=5% probability
 - Max 1 bet per city-date (best edge only, no bucket scatter)
 - HRRR boost for US same-day markets
+- WU cross-reference: for same-day markets, check actual station readings before betting
 """
 
 import asyncio
@@ -30,6 +32,8 @@ import requests
 
 from lib.weather_api import CITIES, US_CITIES, ENSEMBLE_MODELS, WeatherForecaster
 from lib.weather_markets import WeatherMarket, WeatherMarketScanner
+from lib.wu_monitor import validate_forecast
+from src.bot import TradingBot
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +93,20 @@ class WeatherEdgeBot:
         self.forecaster = WeatherForecaster()
         self.scanner = WeatherMarketScanner()
 
-        # Paper portfolio
+        # Live trading bot (initialized only when not observe-only)
+        self.trading_bot: Optional[TradingBot] = None
+        if not config.observe_only:
+            import os
+            pk = os.getenv("POLY_PRIVATE_KEY")
+            safe = os.getenv("POLY_SAFE_ADDRESS")
+            if pk and safe:
+                self.trading_bot = TradingBot(private_key=pk, safe_address=safe)
+                logger.info(f"Live trading enabled: safe={safe[:10]}...")
+            else:
+                logger.error("LIVE mode but missing POLY_PRIVATE_KEY or POLY_SAFE_ADDRESS!")
+                config.observe_only = True
+
+        # Portfolio tracking
         self.balance = config.bankroll
         self.starting_balance = config.bankroll
         self.positions: Dict[str, PaperPosition] = {}  # slug -> position
@@ -109,6 +126,17 @@ class WeatherEdgeBot:
         # Pending JSON sidecar (survives restarts)
         self.pending_path = self.csv_path.with_suffix(".pending.json")
         self._load_pending()
+
+        # In live mode, override balance with actual USDC from chain
+        # (must come AFTER _load_pending so paper deductions don't apply)
+        if self.trading_bot:
+            real_bal = self.trading_bot.get_usdc_balance()
+            if real_bal is not None:
+                self.balance = real_bal
+                self.starting_balance = real_bal
+                logger.info(f"Live USDC balance: ${real_bal:.2f}")
+            else:
+                logger.warning(f"Could not fetch USDC balance, using --bankroll ${config.bankroll:.2f}")
 
     # ------------------------------------------------------------------
     # CSV I/O
@@ -323,7 +351,7 @@ class WeatherEdgeBot:
 
     def evaluate_opportunity(self, opp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Apply filters and Kelly sizing to an opportunity.
+        Apply filters, WU cross-reference, and Kelly sizing to an opportunity.
         Returns trade dict or None.
         """
         mkt: WeatherMarket = opp["market"]
@@ -340,9 +368,60 @@ class WeatherEdgeBot:
             logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {self.config.max_model_prob:.0%}")
             return None
 
-        # Already have position
+        # Already have position for this slug OR this city-date
         if mkt.slug in self.positions:
             return None
+        city_date_key = f"{mkt.city}|{mkt.date}"
+        for pos in self.positions.values():
+            if not pos.resolved and f"{pos.city}|{pos.market_date}" == city_date_key:
+                return None
+
+        # WU cross-reference for same-day markets
+        wu_adj = 1.0
+        wu_info = None
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        city_cfg = CITIES.get(mkt.city)
+        if city_cfg and city_cfg.station_code and mkt.date == today_str:
+            wu_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+            try:
+                wu_info = validate_forecast(
+                    station_code=city_cfg.station_code,
+                    date_str=wu_date,
+                    unit=city_cfg.unit,
+                    model_mean=opp["members_mean"],
+                    bucket_low=mkt.bucket_low,
+                    bucket_high=mkt.bucket_high,
+                )
+            except Exception as e:
+                logger.debug(f"WU check failed for {mkt.city}: {e}")
+
+            if wu_info:
+                wu_adj = wu_info["confidence_adjustment"]
+                if not wu_info["bucket_possible"]:
+                    logger.info(
+                        f"WU KILL {mkt.city} {mkt.bucket_label}: current max "
+                        f"{wu_info['current_max']:.0f} already above bucket "
+                        f"({wu_info['num_observations']} obs)"
+                    )
+                    return None
+                if wu_adj < 1.0:
+                    logger.info(
+                        f"WU ADJ {mkt.city} {mkt.bucket_label}: adj={wu_adj:.1f} "
+                        f"(current max={wu_info['current_max']:.0f}, "
+                        f"{wu_info['num_observations']} obs)"
+                    )
+                elif wu_adj > 1.0:
+                    logger.info(
+                        f"WU BOOST {mkt.city} {mkt.bucket_label}: adj={wu_adj:.1f} "
+                        f"(current max IN bucket, {wu_info['num_observations']} obs)"
+                    )
+
+                # Apply WU adjustment to model probability
+                model_prob = min(0.95, model_prob * wu_adj)
+                # Recheck edge after WU adjustment
+                if model_prob - price < self.config.min_edge:
+                    logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: edge gone after WU adj")
+                    return None
 
         # Kelly sizing
         if price <= 0 or price >= 1:
@@ -359,20 +438,20 @@ class WeatherEdgeBot:
         if bet_amount > self.balance:
             return None
 
-        num_tokens = bet_amount / price
-        num_tokens = max(5.0, round(num_tokens, 2))
-        cost = num_tokens * price
+        num_tokens = int(bet_amount / price)  # integer tokens: Polymarket requires clean amounts
+        num_tokens = max(5, num_tokens)
+        cost = round(num_tokens * price, 2)
 
         if cost > self.balance:
             num_tokens = int(self.balance / price)
-            cost = num_tokens * price
+            cost = round(num_tokens * price, 2)
         if cost < 1.0 or num_tokens < 5:
             return None
 
         return {
             "market": mkt,
             "model_prob": model_prob,
-            "edge": opp["edge"],
+            "edge": model_prob - price,  # recalc with WU-adjusted prob
             "prob_count": opp["prob_count"],
             "prob_normal": opp["prob_normal"],
             "num_tokens": num_tokens,
@@ -383,6 +462,8 @@ class WeatherEdgeBot:
             "models_agreeing": opp.get("models_agreeing", 0),
             "per_model": opp.get("per_model", {}),
             "hrrr_boost": opp.get("hrrr_boost", False),
+            "wu_adjustment": wu_adj,
+            "wu_info": wu_info,
         }
 
     # ------------------------------------------------------------------
@@ -422,16 +503,63 @@ class WeatherEdgeBot:
         mode = "OBSERVE" if self.config.observe_only else "LIVE"
         models_info = trade.get("models_agreeing", "?")
         hrrr = " +HRRR" if trade.get("hrrr_boost") else ""
+        wu = ""
+        wu_adj = trade.get("wu_adjustment", 1.0)
+        wu_info = trade.get("wu_info")
+        if wu_info:
+            wu = f" WU={wu_info['current_max']:.0f}({wu_adj:.1f}x)"
         per_model = trade.get("per_model", {})
         model_str = " ".join(f"{k}={v:.0%}" for k, v in per_model.items()) if per_model else ""
         print(
             f"[{mode}] WEATHER {mkt.city} {mkt.date} {mkt.bucket_label} "
             f"@ ${price:.3f} (consensus: {trade['model_prob']:.1%}, edge: {trade['edge']:.1%}) "
-            f"| {models_info}/4 models agree{hrrr} "
+            f"| {models_info}/4 models agree{hrrr}{wu} "
             f"| {tokens:.0f} tokens, ${cost:.2f} "
             f"| [{model_str}] "
             f"| Bal: ${self.balance:.2f}"
         )
+
+    async def execute_live_trade(self, trade: Dict[str, Any]) -> bool:
+        """Execute a REAL trade on Polymarket via FOK order."""
+        if not self.trading_bot:
+            logger.error("Live trade called but no trading bot!")
+            return False
+
+        mkt: WeatherMarket = trade["market"]
+        price = mkt.best_ask
+        tokens = trade["num_tokens"]
+        cost = trade["cost"]
+
+        try:
+            result = await self.trading_bot.place_order(
+                token_id=mkt.token_id,
+                price=price,
+                size=tokens,
+                side="BUY",
+                order_type="FOK",
+            )
+        except Exception as e:
+            logger.error(f"Live order FAILED for {mkt.city} {mkt.bucket_label}: {e}")
+            return False
+
+        if not result.success:
+            logger.warning(
+                f"Live order REJECTED {mkt.city} {mkt.bucket_label}: {result.message}"
+            )
+            return False
+
+        # FOK filled — record position and sync balance from chain
+        self.execute_paper_trade(trade)
+        real_bal = self.trading_bot.get_usdc_balance()
+        if real_bal is not None:
+            self.balance = real_bal
+
+        logger.info(
+            f"LIVE FILLED {mkt.city} {mkt.date} {mkt.bucket_label} "
+            f"@ ${price:.3f} | {tokens} tokens, ${cost:.2f} "
+            f"| order_id={result.order_id}"
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Settlement
@@ -530,6 +658,17 @@ class WeatherEdgeBot:
             self.positions = {k: v for k, v in self.positions.items() if not v.resolved}
             self._save_pending()
 
+            # Live mode: redeem winnings and refresh balance from chain
+            if self.trading_bot:
+                try:
+                    self.trading_bot.redeem_all()
+                except Exception as e:
+                    logger.debug(f"Redeem attempt: {e}")
+                real_bal = self.trading_bot.get_usdc_balance()
+                if real_bal is not None:
+                    self.balance = real_bal
+                    logger.info(f"Refreshed live USDC balance: ${real_bal:.2f}")
+
     # ------------------------------------------------------------------
     # Status display
     # ------------------------------------------------------------------
@@ -601,16 +740,27 @@ class WeatherEdgeBot:
                 # Evaluate and trade
                 traded = 0
                 skipped = 0
+                failed = 0
                 for opp in opps:
                     trade = self.evaluate_opportunity(opp)
                     if trade is not None:
-                        self.execute_paper_trade(trade)
-                        traded += 1
+                        if self.config.observe_only:
+                            self.execute_paper_trade(trade)
+                            traded += 1
+                        else:
+                            # LIVE: place real order on Polymarket
+                            success = await self.execute_live_trade(trade)
+                            if success:
+                                traded += 1
+                            else:
+                                failed += 1
                     else:
                         skipped += 1
 
+                mode_str = "paper" if self.config.observe_only else "LIVE"
                 if traded:
-                    print(f"[Cycle {cycle}] Executed {traded} paper trades ({skipped} filtered)")
+                    fail_str = f" ({failed} failed)" if failed else ""
+                    print(f"[Cycle {cycle}] Executed {traded} {mode_str} trades ({skipped} filtered{fail_str})")
                 elif opps:
                     print(f"[Cycle {cycle}] All {skipped} opportunities filtered (price/model_prob/existing/size)")
 
