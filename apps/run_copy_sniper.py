@@ -82,6 +82,10 @@ def parse_args():
         help="Kelly fraction (0.5 = half-Kelly, 1.0 = full Kelly). Default: 0.5",
     )
     parser.add_argument(
+        "--max-hours", type=float, default=24.0,
+        help="Max hours to market resolution (default: 24). 0 = no filter.",
+    )
+    parser.add_argument(
         "--live", action="store_true",
         help="Enable live trading (default: paper/observe only)",
     )
@@ -116,6 +120,7 @@ def main():
         min_entry_price=args.min_entry,
         max_entry_price=args.max_entry,
         kelly_fraction=args.kelly,
+        max_hours_to_resolution=args.max_hours,
     )
 
     if args.live:

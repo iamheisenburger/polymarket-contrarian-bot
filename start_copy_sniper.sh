@@ -19,7 +19,7 @@ sleep 2
 
 echo "=== Copy Sniper — Alpha Wallet Copy-Trade ==="
 echo "  Categories: SPORTS, POLITICS, ECONOMICS, CULTURE, TECH, FINANCE"
-echo "  Poll: every 60s | Settle: every 60s"
+echo "  Poll: every 60s | Settle: every 60s | Max resolve: 24h"
 echo "  Paper trading only"
 echo ""
 
@@ -32,6 +32,7 @@ nohup env PYTHONUNBUFFERED=1 $PYTHON apps/run_copy_sniper.py \
     --max-slippage 0.05 \
     --max-trade-age 300 \
     --kelly 0.5 \
+    --max-hours 24 \
     >> /var/log/copy-sniper.log 2>&1 &
 
 echo "  Copy Sniper started (PID: $!)"

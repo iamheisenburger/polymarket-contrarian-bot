@@ -57,6 +57,9 @@ class CopySniperConfig:
     wallets_per_category: int = 10
     # Ignore crypto binary markets (we proved they're unbeatable)
     skip_crypto_binaries: bool = True
+    # Resolution speed: only copy trades on markets resolving within N hours
+    # With $12.95 balance, can't lock capital in week-long events
+    max_hours_to_resolution: float = 24.0  # 0 = no filter
 
 
 @dataclass
@@ -252,6 +255,36 @@ class CopySniper:
         # Filter: skip crypto binaries
         if self.config.skip_crypto_binaries and self._is_crypto_binary(signal.market_slug):
             return None
+
+        # Filter: resolution time — skip markets that won't resolve soon
+        if self.config.max_hours_to_resolution > 0:
+            market_info = self._get_market_info(signal.market_slug)
+            if market_info:
+                end_date_str = market_info.get("endDate") or market_info.get("end_date_iso")
+                if end_date_str:
+                    try:
+                        # Parse ISO date (handles both Z and +00:00 formats)
+                        end_str = end_date_str.replace("Z", "+00:00")
+                        end_dt = datetime.fromisoformat(end_str)
+                        now_dt = datetime.now(timezone.utc)
+                        hours_left = (end_dt - now_dt).total_seconds() / 3600
+                        if hours_left > self.config.max_hours_to_resolution:
+                            logger.debug(
+                                f"Skip {signal.market_question[:40]}... — "
+                                f"resolves in {hours_left:.0f}h (max {self.config.max_hours_to_resolution:.0f}h)"
+                            )
+                            return None
+                        if hours_left < 0.05:  # < 3 minutes left, too late
+                            return None
+                    except (ValueError, TypeError):
+                        pass  # Can't parse date, let it through
+                else:
+                    # No end date available — skip to be safe (could be indefinite)
+                    logger.debug(f"Skip {signal.market_question[:40]}... — no end date found")
+                    return None
+            else:
+                # Can't fetch market info — skip
+                return None
 
         # Filter: trade age
         age = now - signal.alpha_timestamp
@@ -512,6 +545,8 @@ class CopySniper:
         print(f"  Bankroll: ${self.config.bankroll:.2f}")
         print(f"  Categories: {', '.join(self.config.categories)}")
         print(f"  Poll interval: {self.config.poll_interval}s")
+        if self.config.max_hours_to_resolution > 0:
+            print(f"  Max resolve time: {self.config.max_hours_to_resolution:.0f}h (skip long-dated)")
         print("=" * 60 + "\n")
 
         # Initial alpha discovery
