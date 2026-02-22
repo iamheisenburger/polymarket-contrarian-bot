@@ -351,13 +351,19 @@ class WeatherEdgeBot:
     # ------------------------------------------------------------------
 
     def _determine_winner(self, slug: str) -> Optional[str]:
-        """Check if a weather market has resolved via Gamma API."""
+        """Check if a weather market has resolved via Gamma API.
+        ONLY settles when market is officially closed — never on price movement."""
         try:
             resp = requests.get(f"{GAMMA_API}/markets/slug/{slug}", timeout=10)
             if resp.status_code != 200:
                 return None
             market = resp.json()
             if not market:
+                return None
+
+            # MUST be closed before we settle — price drops are NOT settlements
+            closed = market.get("closed", False)
+            if not closed:
                 return None
 
             prices_raw = market.get("outcomePrices", "")
@@ -373,18 +379,7 @@ class WeatherEdgeBot:
                 return None
 
             yes_p = float(prices[0])
-            no_p = float(prices[1])
-
-            if yes_p > 0.95:
-                return "Yes"
-            elif no_p > 0.95:
-                return "No"
-
-            closed = market.get("closed", False)
-            if closed:
-                return "Yes" if yes_p > 0.5 else "No"
-
-            return None
+            return "Yes" if yes_p > 0.5 else "No"
         except Exception as e:
             logger.debug(f"Settle check error for {slug}: {e}")
             return None
