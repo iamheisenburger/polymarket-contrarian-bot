@@ -9,7 +9,7 @@ pkill -f "run_weather.py" 2>/dev/null || true
 sleep 2
 
 # Start weather edge bot in paper/observe mode
-PYTHONUNBUFFERED=1 PYTHONPATH=. nohup python apps/run_weather.py \
+PYTHONUNBUFFERED=1 PYTHONPATH=. nohup python3 apps/run_weather.py \
     --bankroll 50 \
     --min-edge 0.05 \
     --kelly 0.5 \
