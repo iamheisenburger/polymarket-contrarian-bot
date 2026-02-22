@@ -30,7 +30,7 @@ nohup env PYTHONUNBUFFERED=1 $PYTHON apps/run_copy_sniper.py \
     --wallets-per-category 10 \
     --min-weekly-pnl 1000 \
     --max-slippage 0.05 \
-    --max-trade-age 300 \
+    --max-trade-age 1800 \
     --kelly 0.5 \
     --max-hours 24 \
     >> /var/log/copy-sniper.log 2>&1 &

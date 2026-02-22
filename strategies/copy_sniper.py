@@ -44,7 +44,7 @@ class CopySniperConfig:
     # Filters
     max_slippage: float = 0.05      # max price move since alpha trade (5 cents)
     min_liquidity: float = 100      # minimum market liquidity ($)
-    max_trade_age: int = 300        # max seconds since alpha trade (5 min)
+    max_trade_age: int = 1800       # max seconds since alpha trade (30 min — events move slower than crypto)
     min_entry_price: float = 0.10   # don't buy below $0.10
     max_entry_price: float = 0.90   # don't buy above $0.90
     max_position_pct: float = 0.30  # max 30% of bankroll per trade
