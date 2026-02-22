@@ -1,11 +1,17 @@
 """
-Weather Edge Strategy — exploit ensemble forecast edge on Polymarket weather markets.
+Weather Edge Strategy v3 — Multi-model consensus forecasting.
 
-Pulls 51 ECMWF ensemble members from Open-Meteo, computes bucket probabilities
-via fitted normal distribution, compares to Polymarket prices, and trades
-where model_prob > market_price + min_edge. Half-Kelly sizing.
+Pulls ensemble members from 4 independent models (ECMWF, GFS, ICON, GEM)
+via Open-Meteo and computes consensus bucket probabilities. Only trades when
+multiple models agree on a bucket, eliminating single-model overconfidence.
 
-Settlement: daily via Gamma API (markets resolve same day).
+Also uses HRRR (3km deterministic) for US same-day temperature predictions.
+
+Key v3 changes vs v2:
+- 4 models (143 members) instead of 1 model (51 members)
+- Consensus: only trade when min_models_agree models see >=5% probability
+- Max 1 bet per city-date (best edge only, no bucket scatter)
+- HRRR boost for US same-day markets
 """
 
 import asyncio
@@ -22,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from lib.weather_api import CITIES, WeatherForecaster
+from lib.weather_api import CITIES, US_CITIES, ENSEMBLE_MODELS, WeatherForecaster
 from lib.weather_markets import WeatherMarket, WeatherMarketScanner
 
 logger = logging.getLogger(__name__)
@@ -32,18 +38,21 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 
 @dataclass
 class WeatherConfig:
-    """Configuration for the weather edge bot."""
-    bankroll: float = 12.95
+    """Configuration for the weather edge bot v3."""
+    bankroll: float = 50.0
     observe_only: bool = True
-    min_edge: float = 0.05          # only trade when model_prob - price > 5c
+    min_edge: float = 0.05          # only trade when consensus_prob - price > 5c
     kelly_fraction: float = 0.5     # half-Kelly
-    max_position_pct: float = 0.20  # max 20% bankroll per trade
-    min_entry_price: float = 0.01   # floor (weather buckets can be 1-2c)
+    max_position_pct: float = 0.15  # max 15% bankroll per trade
+    min_entry_price: float = 0.03   # floor — skip $0.01 extreme longshots
     max_entry_price: float = 0.35   # cap — avoid overpriced favorites
-    max_model_prob: float = 0.40    # model is overconfident above 40% (backtest: 30% actual WR)
+    max_model_prob: float = 0.40    # consensus overconfidence cap
+    min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
+    max_bets_per_city_date: int = 1 # only bet on best bucket per city-date (no scatter)
+    use_hrrr: bool = True           # use HRRR for US same-day predictions
     scan_interval: int = 300        # rescan every 5 min
-    settle_interval: int = 300      # check settlements every 5 min
-    cities: list = field(default_factory=lambda: list(CITIES.keys()))  # Seoul/Seattle excluded from CITIES
+    settle_interval: int = 60       # check settlements every 60s
+    cities: list = field(default_factory=lambda: list(CITIES.keys()))
     forecast_days: int = 2          # today + tomorrow
 
 
@@ -166,7 +175,10 @@ class WeatherEdgeBot:
                 data = json.load(f)
             for key, d in data.items():
                 self.positions[key] = PaperPosition(**d)
-            logger.info(f"Loaded {len(self.positions)} pending weather positions")
+            # Deduct existing position costs from balance
+            existing_cost = sum(pos.cost for pos in self.positions.values() if not pos.resolved)
+            self.balance -= existing_cost
+            logger.info(f"Loaded {len(self.positions)} pending weather positions (${existing_cost:.2f} deployed, balance ${self.balance:.2f})")
         except Exception as e:
             logger.warning(f"Failed to load pending: {e}")
 
@@ -188,77 +200,125 @@ class WeatherEdgeBot:
 
     def scan_opportunities(self) -> List[Dict[str, Any]]:
         """
-        Scan all cities: pull ensemble forecasts + market prices, compute edge.
-        Returns list of opportunities with positive edge.
+        Scan all cities: pull multi-model forecasts + market prices, compute
+        consensus edge. Only returns opportunities where multiple models agree.
+        Limits to max_bets_per_city_date per city-date combination.
         """
         opportunities = []
 
-        # 1. Get all priced markets from Polymarket (one API call for discovery)
+        # 1. Get all priced markets from Polymarket
         markets = self.scanner.scan_all(city_filter=self.config.cities)
         if not markets:
             logger.info("No priced weather markets found")
             return []
 
-        # 2. Get ensemble forecasts for each unique city in parallel
+        # 2. Get multi-model forecasts + HRRR for each city in parallel
         cities_needed = set()
         for mkt in markets:
             if CITIES.get(mkt.city):
                 cities_needed.add(mkt.city)
 
-        city_forecasts: Dict[str, Dict] = {}
-        def _fetch_forecast(city_key):
-            return city_key, self.forecaster.get_ensemble_forecast(
+        city_forecasts: Dict[str, Dict] = {}     # city -> {date: {model: [members]}}
+        city_hrrr: Dict[str, Dict[str, float]] = {}  # city -> {date: temp}
+
+        def _fetch_multi(city_key):
+            return city_key, self.forecaster.get_multi_model_forecast(
                 city_key, days=self.config.forecast_days
             )
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futs = [pool.submit(_fetch_forecast, c) for c in cities_needed]
+        def _fetch_hrrr(city_key):
+            return city_key, self.forecaster.get_hrrr_forecast(city_key, days=2)
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            # Fetch multi-model ensembles
+            futs = [pool.submit(_fetch_multi, c) for c in cities_needed]
+            # Fetch HRRR for US cities
+            if self.config.use_hrrr:
+                hrrr_futs = [pool.submit(_fetch_hrrr, c) for c in cities_needed if c in US_CITIES]
+            else:
+                hrrr_futs = []
+
             for fut in as_completed(futs):
                 city_key, data = fut.result()
                 city_forecasts[city_key] = data
 
-        # 3. Match markets to forecasts and compute edge
+            for fut in as_completed(hrrr_futs):
+                city_key, data = fut.result()
+                city_hrrr[city_key] = data
+
+        # 3. Match markets to forecasts and compute consensus edge
         for mkt in markets:
             forecasts = city_forecasts.get(mkt.city, {})
             if mkt.date not in forecasts:
                 continue
-            members = forecasts[mkt.date]
+            model_members = forecasts[mkt.date]  # {model_key: [members]}
 
-            # Get city-specific bias correction
+            if not model_members:
+                continue
+
             city_cfg = CITIES.get(mkt.city)
             bias = city_cfg.bias_correction if city_cfg else 0.0
             extra = city_cfg.extra_std if city_cfg else 0.0
 
-            # Compute model probability for this bucket (with bias correction)
-            bucket_probs = self.forecaster.compute_bucket_probabilities(
-                members, [(mkt.bucket_low, mkt.bucket_high)],
+            # Get HRRR temp if available for this city-date
+            hrrr_temp = city_hrrr.get(mkt.city, {}).get(mkt.date)
+
+            # Compute consensus probability
+            bucket_probs = self.forecaster.compute_consensus_probability(
+                model_members,
+                [(mkt.bucket_low, mkt.bucket_high)],
                 bias_correction=bias,
                 extra_std=extra,
+                hrrr_temp=hrrr_temp,
+                min_models_agree=self.config.min_models_agree,
             )
             if not bucket_probs:
                 continue
 
-            model_prob = bucket_probs[0]["prob"]
+            bp = bucket_probs[0]
+            model_prob = bp["prob"]
             edge = model_prob - mkt.best_ask
 
             if edge >= self.config.min_edge:
-                # Report corrected mean/std for diagnostics
-                corrected = [m + bias for m in members]
-                mean = sum(corrected) / len(corrected)
-                variance = sum((m - mean)**2 for m in corrected) / len(corrected)
-                std = math.sqrt(variance + extra**2)
+                # Compute consensus mean for diagnostics
+                all_members = []
+                for members in model_members.values():
+                    all_members.extend(m + bias for m in members)
+                mean = sum(all_members) / len(all_members) if all_members else 0
+                variance = sum((m - mean) ** 2 for m in all_members) / len(all_members) if all_members else 0
+                std = math.sqrt(variance + extra ** 2)
+
                 opportunities.append({
                     "market": mkt,
                     "model_prob": model_prob,
-                    "prob_count": bucket_probs[0]["prob_count"],
-                    "prob_normal": bucket_probs[0]["prob_normal"],
+                    "prob_count": bp["prob_count"],
+                    "prob_normal": bp["prob_normal"],
                     "edge": edge,
                     "members_mean": mean,
                     "members_std": std,
+                    "models_agreeing": bp.get("models_agreeing", 0),
+                    "per_model": bp.get("per_model", {}),
+                    "hrrr_boost": bp.get("hrrr_boost", False),
                 })
 
         # Sort by edge descending
         opportunities.sort(key=lambda x: x["edge"], reverse=True)
+
+        # Limit to max_bets_per_city_date per city-date
+        if self.config.max_bets_per_city_date > 0:
+            seen: Dict[str, int] = {}  # "city|date" -> count
+            filtered = []
+            for opp in opportunities:
+                mkt = opp["market"]
+                key = f"{mkt.city}|{mkt.date}"
+                count = seen.get(key, 0)
+                if count < self.config.max_bets_per_city_date:
+                    filtered.append(opp)
+                    seen[key] = count + 1
+            if len(filtered) < len(opportunities):
+                logger.info(f"City-date limit: {len(opportunities)} → {len(filtered)} opportunities")
+            opportunities = filtered
+
         return opportunities
 
     def evaluate_opportunity(self, opp: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -272,10 +332,12 @@ class WeatherEdgeBot:
 
         # Price range filter
         if price < self.config.min_entry_price or price > self.config.max_entry_price:
+            logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: price ${price:.3f} outside [{self.config.min_entry_price}, {self.config.max_entry_price}]")
             return None
 
         # Model overconfidence filter: above 40%, model says 50% but actual WR is ~30%
         if model_prob > self.config.max_model_prob:
+            logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {self.config.max_model_prob:.0%}")
             return None
 
         # Already have position
@@ -355,11 +417,16 @@ class WeatherEdgeBot:
         self._save_pending()
 
         mode = "OBSERVE" if self.config.observe_only else "LIVE"
+        models_info = trade.get("models_agreeing", "?")
+        hrrr = " +HRRR" if trade.get("hrrr_boost") else ""
+        per_model = trade.get("per_model", {})
+        model_str = " ".join(f"{k}={v:.0%}" for k, v in per_model.items()) if per_model else ""
         print(
             f"[{mode}] WEATHER {mkt.city} {mkt.date} {mkt.bucket_label} "
-            f"@ ${price:.3f} (model: {trade['model_prob']:.1%}, edge: {trade['edge']:.1%}) "
+            f"@ ${price:.3f} (consensus: {trade['model_prob']:.1%}, edge: {trade['edge']:.1%}) "
+            f"| {models_info}/4 models agree{hrrr} "
             f"| {tokens:.0f} tokens, ${cost:.2f} "
-            f"| mean={trade['members_mean']:.1f}±{trade['members_std']:.1f} "
+            f"| [{model_str}] "
             f"| Bal: ${self.balance:.2f}"
         )
 
@@ -410,10 +477,14 @@ class WeatherEdgeBot:
         if not pending:
             return
 
+        logger.info(f"Settlement check: {len(pending)} pending positions")
         resolved_any = False
+        closed_count = 0
         for pos in pending:
             winner = self._determine_winner(pos.slug)
             time.sleep(0.1)
+            if winner is not None:
+                closed_count += 1
 
             if winner is None:
                 continue
@@ -448,7 +519,11 @@ class WeatherEdgeBot:
                 f"| WR: {wr:.1f}% ({self.wins}W/{self.losses}L)"
             )
 
-        if resolved_any:
+        if not resolved_any:
+            logger.info(f"Settlement: 0/{len(pending)} resolved (none closed yet)")
+        else:
+            remaining = sum(1 for v in self.positions.values() if not v.resolved)
+            logger.info(f"Settlement: {closed_count} resolved, {remaining} still pending")
             self.positions = {k: v for k, v in self.positions.items() if not v.resolved}
             self._save_pending()
 
@@ -464,12 +539,15 @@ class WeatherEdgeBot:
         pending = sum(1 for p in self.positions.values() if not p.resolved)
 
         print(f"\n{'='*60}")
-        print(f"  WEATHER EDGE — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
+        print(f"  WEATHER EDGE v3 — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
+        print(f"  Models: ECMWF + GFS + ICON + GEM (4-model consensus)")
         print(f"  Balance: ${self.balance:.2f} (started: ${self.starting_balance:.2f})")
         print(f"  Trades: {self.total_trades} | W:{self.wins} L:{self.losses} P:{pending}")
         print(f"  Win Rate: {wr:.1f}% | PnL: ${pnl:+.2f}")
         print(f"  Cities: {', '.join(self.config.cities)}")
         print(f"  Min edge: {self.config.min_edge:.0%} | Kelly: {self.config.kelly_fraction:.0%}")
+        print(f"  Min models agree: {self.config.min_models_agree}/4 | Max bets/city-date: {self.config.max_bets_per_city_date}")
+        print(f"  HRRR: {'ON' if self.config.use_hrrr else 'OFF'} (US cities: {', '.join(c for c in self.config.cities if c in US_CITIES)})")
         print(f"{'='*60}\n")
 
     # ------------------------------------------------------------------
@@ -479,11 +557,14 @@ class WeatherEdgeBot:
     async def run(self):
         """Main event loop."""
         print("\n" + "=" * 60)
-        print("  WEATHER EDGE BOT — Ensemble Forecast vs. Polymarket")
+        print("  WEATHER EDGE v3 — 4-Model Consensus vs. Polymarket")
+        print(f"  Models: ECMWF (51) + GFS (31) + ICON (40) + GEM (21) = 143 members")
         print(f"  Mode: {'OBSERVE (paper)' if self.config.observe_only else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:.2f}")
         print(f"  Cities: {', '.join(self.config.cities)}")
         print(f"  Min edge: {self.config.min_edge:.0%} | Kelly: {self.config.kelly_fraction:.0%}")
+        print(f"  Min models agree: {self.config.min_models_agree}/4 | Max bets/city-date: {self.config.max_bets_per_city_date}")
+        print(f"  HRRR: {'ON' if self.config.use_hrrr else 'OFF'}")
         print(f"  Scan interval: {self.config.scan_interval}s")
         print("=" * 60 + "\n")
 
@@ -501,25 +582,34 @@ class WeatherEdgeBot:
                 opps = self.scan_opportunities()
 
                 if opps:
-                    print(f"[Cycle {cycle}] Found {len(opps)} opportunities with edge >= {self.config.min_edge:.0%}")
+                    print(f"[Cycle {cycle}] Found {len(opps)} consensus opportunities (edge >= {self.config.min_edge:.0%}, >={self.config.min_models_agree} models)")
                     for opp in opps:
                         mkt = opp["market"]
+                        pm = opp.get("per_model", {})
+                        pm_str = " ".join(f"{k}={v:.0%}" for k, v in pm.items())
+                        hrrr = " +HRRR" if opp.get("hrrr_boost") else ""
                         print(
                             f"  → {mkt.city} {mkt.date} {mkt.bucket_label}: "
-                            f"ask=${mkt.best_ask:.3f} model={opp['model_prob']:.1%} "
-                            f"edge={opp['edge']:+.1%}"
+                            f"ask=${mkt.best_ask:.3f} consensus={opp['model_prob']:.1%} "
+                            f"edge={opp['edge']:+.1%} ({opp.get('models_agreeing', '?')}/4 agree{hrrr}) "
+                            f"[{pm_str}]"
                         )
 
                 # Evaluate and trade
                 traded = 0
+                skipped = 0
                 for opp in opps:
                     trade = self.evaluate_opportunity(opp)
                     if trade is not None:
                         self.execute_paper_trade(trade)
                         traded += 1
+                    else:
+                        skipped += 1
 
                 if traded:
-                    print(f"[Cycle {cycle}] Executed {traded} paper trades")
+                    print(f"[Cycle {cycle}] Executed {traded} paper trades ({skipped} filtered)")
+                elif opps:
+                    print(f"[Cycle {cycle}] All {skipped} opportunities filtered (price/model_prob/existing/size)")
 
                 # Settlement check
                 if now - last_settle >= self.config.settle_interval:
