@@ -54,7 +54,7 @@ class WeatherConfig:
     min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
     max_bets_per_city_date: int = 1 # only bet on best bucket per city-date (no scatter)
     use_hrrr: bool = True           # use HRRR for US same-day predictions
-    scan_interval: int = 300        # rescan every 5 min
+    scan_interval: int = 600        # rescan every 10 min (avoid Open-Meteo 429 rate limits)
     settle_interval: int = 60       # check settlements every 60s
     cities: list = field(default_factory=lambda: list(CITIES.keys()))
     forecast_days: int = 2          # today + tomorrow
@@ -257,7 +257,7 @@ class WeatherEdgeBot:
         def _fetch_hrrr(city_key):
             return city_key, self.forecaster.get_hrrr_forecast(city_key, days=2)
 
-        with ThreadPoolExecutor(max_workers=12) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             # Fetch multi-model ensembles
             futs = [pool.submit(_fetch_multi, c) for c in cities_needed]
             # Fetch HRRR for US cities
@@ -548,11 +548,9 @@ class WeatherEdgeBot:
             )
             return False
 
-        # FOK filled — record position and sync balance from chain
+        # FOK filled — record position and deduct cost
+        # (don't trust chain balance query right after fill — it can be stale)
         self.execute_paper_trade(trade)
-        real_bal = self.trading_bot.get_usdc_balance()
-        if real_bal is not None:
-            self.balance = real_bal
 
         logger.info(
             f"LIVE FILLED {mkt.city} {mkt.date} {mkt.bucket_label} "
