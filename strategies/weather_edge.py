@@ -50,7 +50,7 @@ class WeatherConfig:
     max_position_pct: float = 0.15  # max 15% bankroll per trade
     min_entry_price: float = 0.03   # floor — skip $0.01 extreme longshots
     max_entry_price: float = 0.35   # cap — avoid overpriced favorites
-    max_model_prob: float = 0.40    # consensus overconfidence cap
+    max_model_prob: float = 0.50    # consensus overconfidence cap (v3 multi-model is better calibrated)
     min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
     max_bets_per_city_date: int = 1 # only bet on best bucket per city-date (no scatter)
     use_hrrr: bool = True           # use HRRR for US same-day predictions
@@ -363,7 +363,7 @@ class WeatherEdgeBot:
             logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: price ${price:.3f} outside [{self.config.min_entry_price}, {self.config.max_entry_price}]")
             return None
 
-        # Model overconfidence filter: above 40%, model says 50% but actual WR is ~30%
+        # Model overconfidence filter
         if model_prob > self.config.max_model_prob:
             logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {self.config.max_model_prob:.0%}")
             return None
@@ -433,8 +433,8 @@ class WeatherEdgeBot:
 
         bet_amount = self.balance * kelly_f
         if bet_amount < 1.0:
-            # Try minimum viable bet
-            bet_amount = min(1.0, self.balance * 0.15)
+            # Force $1.00 minimum (Polymarket floor) if balance allows
+            bet_amount = 1.0
         if bet_amount > self.balance:
             return None
 
