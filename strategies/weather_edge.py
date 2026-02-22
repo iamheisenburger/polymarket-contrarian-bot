@@ -380,6 +380,9 @@ class WeatherEdgeBot:
             "kelly_f": kelly_f,
             "members_mean": opp["members_mean"],
             "members_std": opp["members_std"],
+            "models_agreeing": opp.get("models_agreeing", 0),
+            "per_model": opp.get("per_model", {}),
+            "hrrr_boost": opp.get("hrrr_boost", False),
         }
 
     # ------------------------------------------------------------------
