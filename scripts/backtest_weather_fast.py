@@ -22,7 +22,8 @@ MIN_EDGE = 0.05
 KELLY_FRAC = 0.5
 MAX_POS_PCT = 0.20
 MIN_ENTRY = 0.01
-MAX_ENTRY = 0.50
+MAX_ENTRY = 0.35        # lowered from 0.50 — avoid overpriced favorites
+MAX_MODEL_PROB = 0.40   # model overconfident above 40% (30% actual WR)
 START_BALANCE = 50.0
 
 CORR = {
@@ -259,6 +260,11 @@ def run_simulation():
             traded_this_event = False
             for bkt in ranked:
                 mp = bkt["model_prob"]
+
+                # Skip overconfident predictions (model says 50%, actual WR ~30%)
+                if mp > MAX_MODEL_PROB:
+                    continue
+
                 est_price = mp * price_mult
                 est_price = max(MIN_ENTRY, min(est_price, MAX_ENTRY))
                 edge = mp - est_price
@@ -358,6 +364,8 @@ def run_simulation():
             bkt["model_prob"] = compute_prob(members, bkt["lo"], bkt["hi"], bias, extra)
         for bkt in sorted(buckets, key=lambda b: b["model_prob"], reverse=True):
             mp = bkt["model_prob"]
+            if mp > MAX_MODEL_PROB:
+                continue
             ep = max(MIN_ENTRY, min(mp * 0.70, MAX_ENTRY))
             edge = mp - ep
             if edge < MIN_EDGE or ep < MIN_ENTRY or ep > MAX_ENTRY:

@@ -39,7 +39,8 @@ class WeatherConfig:
     kelly_fraction: float = 0.5     # half-Kelly
     max_position_pct: float = 0.20  # max 20% bankroll per trade
     min_entry_price: float = 0.01   # floor (weather buckets can be 1-2c)
-    max_entry_price: float = 0.50   # cap — don't buy expensive buckets
+    max_entry_price: float = 0.35   # cap — avoid overpriced favorites
+    max_model_prob: float = 0.40    # model is overconfident above 40% (backtest: 30% actual WR)
     scan_interval: int = 300        # rescan every 5 min
     settle_interval: int = 300      # check settlements every 5 min
     cities: list = field(default_factory=lambda: list(CITIES.keys()))  # Seoul/Seattle excluded from CITIES
@@ -271,6 +272,10 @@ class WeatherEdgeBot:
 
         # Price range filter
         if price < self.config.min_entry_price or price > self.config.max_entry_price:
+            return None
+
+        # Model overconfidence filter: above 40%, model says 50% but actual WR is ~30%
+        if model_prob > self.config.max_model_prob:
             return None
 
         # Already have position
