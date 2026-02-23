@@ -470,10 +470,10 @@ class WeatherForecaster:
 
             consensus_prob = weighted_prob / total_weight if total_weight > 0 else 0.0
 
-            # Penalize low-agreement buckets: if fewer than min_models_agree
-            # see meaningful probability, halve the consensus
+            # Reject low-agreement buckets: if fewer than min_models_agree
+            # see meaningful probability, zero out the consensus
             if models_above_threshold < min_models_agree:
-                consensus_prob *= 0.5
+                consensus_prob = 0.0
 
             # HRRR boost: if HRRR deterministic temp falls in this bucket,
             # boost consensus by 20% (capped at 0.95)
