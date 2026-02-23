@@ -257,22 +257,19 @@ class WeatherEdgeBot:
         def _fetch_hrrr(city_key):
             return city_key, self.forecaster.get_hrrr_forecast(city_key, days=2)
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            # Fetch multi-model ensembles
-            futs = [pool.submit(_fetch_multi, c) for c in cities_needed]
-            # Fetch HRRR for US cities
-            if self.config.use_hrrr:
+        # Serialize ensemble calls with delay to avoid 429 rate limiting
+        for city_key in cities_needed:
+            _, data = _fetch_multi(city_key)
+            city_forecasts[city_key] = data
+            time.sleep(5)  # 5s gap between ensemble API calls
+
+        # HRRR uses different endpoint (api.open-meteo.com), can be parallel
+        if self.config.use_hrrr:
+            with ThreadPoolExecutor(max_workers=3) as pool:
                 hrrr_futs = [pool.submit(_fetch_hrrr, c) for c in cities_needed if c in US_CITIES]
-            else:
-                hrrr_futs = []
-
-            for fut in as_completed(futs):
-                city_key, data = fut.result()
-                city_forecasts[city_key] = data
-
-            for fut in as_completed(hrrr_futs):
-                city_key, data = fut.result()
-                city_hrrr[city_key] = data
+                for fut in as_completed(hrrr_futs):
+                    city_key, data = fut.result()
+                    city_hrrr[city_key] = data
 
         # 3. Match markets to forecasts and compute consensus edge
         for mkt in markets:
@@ -717,9 +714,14 @@ class WeatherEdgeBot:
                 cycle += 1
                 now = time.time()
 
-                # Scan for opportunities
-                print(f"[Cycle {cycle}] Scanning {len(self.config.cities)} cities...")
-                opps = self.scan_opportunities()
+                # Skip scanning if balance too low to place any trade
+                available = self.config.bankroll - self.paper_deployed
+                if available < 1.0:
+                    print(f"[Cycle {cycle}] Balance too low (${available:.2f} available) — skipping scan, checking settlements only")
+                    opps = []
+                else:
+                    print(f"[Cycle {cycle}] Scanning {len(self.config.cities)} cities...")
+                    opps = self.scan_opportunities()
 
                 if opps:
                     print(f"[Cycle {cycle}] Found {len(opps)} consensus opportunities (edge >= {self.config.min_edge:.0%}, >={self.config.min_models_agree} models)")
