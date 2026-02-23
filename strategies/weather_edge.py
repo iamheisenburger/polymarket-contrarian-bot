@@ -49,7 +49,7 @@ class WeatherConfig:
     kelly_fraction: float = 0.5     # half-Kelly
     max_position_pct: float = 0.15  # max 15% bankroll per trade
     min_entry_price: float = 0.01   # allow cheap longshots for ladder legs
-    max_entry_price: float = 0.35   # cap — avoid overpriced favorites
+    max_entry_price: float = 0.50   # raised for prob-sorted ladder (peak buckets cost more)
     max_model_prob: float = 0.50    # consensus overconfidence cap
     min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
     max_bets_per_city_date: int = 4 # ladder: bet on top 4 adjacent buckets per city-date
@@ -429,6 +429,9 @@ class WeatherEdgeBot:
                     city_hrrr[city_key] = data
 
         # 3. Match markets to forecasts and compute consensus edge
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        current_utc_hour = datetime.now(timezone.utc).hour
+
         for mkt in markets:
             forecasts = city_forecasts.get(mkt.city, {})
             if mkt.date not in forecasts:
@@ -444,6 +447,30 @@ class WeatherEdgeBot:
 
             # Get HRRR temp if available for this city-date
             hrrr_temp = city_hrrr.get(mkt.city, {}).get(mkt.date)
+
+            # Peak hour gate: skip same-day markets if past peak temp hour
+            # US cities with HRRR are exempt (HRRR updates hourly, still valid)
+            if mkt.date == today_str and city_cfg and city_cfg.peak_hour_utc is not None:
+                past_peak = current_utc_hour > city_cfg.peak_hour_utc + 1
+                has_hrrr = mkt.city in US_CITIES and hrrr_temp is not None
+                if past_peak and not has_hrrr:
+                    logger.info(
+                        f"PEAK GATE {mkt.city} {mkt.bucket_label} {mkt.date}: "
+                        f"UTC {current_utc_hour}h > peak {city_cfg.peak_hour_utc}+1h"
+                    )
+                    continue
+
+            # HRRR Hard Gate: block US city entries where HRRR contradicts bucket
+            if hrrr_temp is not None and mkt.city in US_CITIES:
+                threshold = 2.0 if city_cfg.unit == "fahrenheit" else 1.0
+                hrrr_corrected = hrrr_temp + bias
+                if hrrr_corrected < mkt.bucket_low - threshold or hrrr_corrected > mkt.bucket_high + threshold:
+                    logger.info(
+                        f"HRRR BLOCK {mkt.city} {mkt.bucket_label} {mkt.date}: "
+                        f"HRRR={hrrr_corrected:.1f}, bucket={mkt.bucket_low:.0f}-{mkt.bucket_high:.0f}, "
+                        f"threshold={threshold}"
+                    )
+                    continue
 
             # Compute consensus probability
             bucket_probs = self.forecaster.compute_consensus_probability(
@@ -483,8 +510,9 @@ class WeatherEdgeBot:
                     "hrrr_boost": bp.get("hrrr_boost", False),
                 })
 
-        # Sort by edge descending
-        opportunities.sort(key=lambda x: x["edge"], reverse=True)
+        # Sort by model probability descending (center ladder on peak, not tails)
+        # Tiebreak by edge so we still prefer underpriced within the same prob tier
+        opportunities.sort(key=lambda x: (x["model_prob"], x["edge"]), reverse=True)
 
         # Limit to max_bets_per_city_date per city-date
         if self.config.max_bets_per_city_date > 0:
@@ -517,9 +545,10 @@ class WeatherEdgeBot:
             logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: price ${price:.3f} outside [{self.config.min_entry_price}, {self.config.max_entry_price}]")
             return None
 
-        # Model overconfidence filter
-        if model_prob > self.config.max_model_prob:
-            logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {self.config.max_model_prob:.0%}")
+        # Model overconfidence filter — relaxed when HRRR confirms
+        prob_cap = 0.85 if opp.get("hrrr_boost", False) else self.config.max_model_prob
+        if model_prob > prob_cap:
+            logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {prob_cap:.0%}")
             return None
 
         # Already have position for this exact bucket
@@ -599,7 +628,17 @@ class WeatherEdgeBot:
         remaining_budget = self.config.max_cost_per_city_date - existing_cost_cd
         if remaining_budget < 1.0:
             return None
-        bet_amount = min(bet_amount, remaining_budget)
+        # HRRR-priority: confirmed legs get 70% of remaining budget, tails get 30%
+        # Only apply split for US cities where HRRR data exists
+        if mkt.city in US_CITIES:
+            if opp.get("hrrr_boost", False):
+                leg_budget = remaining_budget * 0.70
+            else:
+                leg_budget = remaining_budget * 0.30
+            bet_amount = min(bet_amount, leg_budget)
+        else:
+            # International cities: no HRRR, equal budget access
+            bet_amount = min(bet_amount, remaining_budget)
 
         if bet_amount < 1.0:
             # Force $1.00 minimum (Polymarket floor) if balance allows
@@ -607,7 +646,7 @@ class WeatherEdgeBot:
         if bet_amount > self.balance:
             return None
 
-        num_tokens = int(bet_amount / price)  # integer tokens: Polymarket requires clean amounts
+        num_tokens = math.ceil(bet_amount / price)  # round UP to meet $1.00 min cost
         num_tokens = max(5, num_tokens)
         cost = round(num_tokens * price, 2)
 
