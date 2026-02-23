@@ -297,6 +297,25 @@ class WeatherEdgeBot:
             for slug in phantoms:
                 del self.positions[slug]
 
+            # Update existing positions: sync token counts from on-chain
+            updated = 0
+            for slug, p in on_chain.items():
+                if slug in self.positions and not self.positions[slug].resolved:
+                    pos = self.positions[slug]
+                    chain_size = float(p.get("size", 0))
+                    chain_avg = float(p.get("avgPrice", 0))
+                    chain_cost = round(chain_size * chain_avg, 2)
+                    if abs(pos.num_tokens - chain_size) > 0.1 or abs(pos.cost - chain_cost) > 0.05:
+                        logger.info(
+                            f"SYNC {pos.city} {pos.bucket_label}: "
+                            f"tokens {pos.num_tokens:.1f}→{chain_size:.1f}, "
+                            f"cost ${pos.cost:.2f}→${chain_cost:.2f}"
+                        )
+                        pos.num_tokens = chain_size
+                        pos.entry_price = chain_avg
+                        pos.cost = chain_cost
+                        updated += 1
+
             # Find missing: on-chain but NOT in pending
             added = 0
             for slug, p in on_chain.items():
@@ -347,11 +366,11 @@ class WeatherEdgeBot:
                     f"{size:.1f} tok @ ${avg_price:.3f} = ${cost:.2f}"
                 )
 
-            if phantoms or added:
+            if phantoms or added or updated:
                 self._save_pending()
                 logger.info(
                     f"Reconciliation complete: removed {len(phantoms)} phantoms, "
-                    f"recovered {added} missing positions. "
+                    f"recovered {added} missing, updated {updated} stale. "
                     f"Total tracked: {sum(1 for p in self.positions.values() if not p.resolved)}"
                 )
             else:
