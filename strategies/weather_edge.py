@@ -715,9 +715,8 @@ class WeatherEdgeBot:
                 now = time.time()
 
                 # Skip scanning if balance too low to place any trade
-                available = self.config.bankroll - self.paper_deployed
-                if available < 1.0:
-                    print(f"[Cycle {cycle}] Balance too low (${available:.2f} available) — skipping scan, checking settlements only")
+                if self.balance < 1.0:
+                    print(f"[Cycle {cycle}] Balance too low (${self.balance:.2f}) — skipping scan, checking settlements only")
                     opps = []
                 else:
                     print(f"[Cycle {cycle}] Scanning {len(self.config.cities)} cities...")
