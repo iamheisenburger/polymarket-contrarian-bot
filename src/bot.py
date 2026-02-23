@@ -472,6 +472,45 @@ class TradingBot:
                 f"(token: {token_id[:16]}...) -> {order_id[:20]}..."
             )
 
+            # For FOK orders, verify the order actually filled by checking status
+            # The CLOB returns success=True even when FOK orders have no match
+            if success and order_id and order_type.upper() == "FOK":
+                import time
+                time.sleep(0.5)  # Brief delay for order to settle
+                try:
+                    order_data = await self._run_in_thread(
+                        self._official_client.get_order,
+                        order_id,
+                    )
+                    order_status = order_data.get("status", "UNKNOWN")
+                    size_matched = float(order_data.get("size_matched", "0"))
+
+                    if order_status != "MATCHED" or size_matched == 0:
+                        logger.warning(
+                            f"FOK order NOT filled: {order_id[:20]}... "
+                            f"status={order_status} size_matched={size_matched}"
+                        )
+                        return OrderResult(
+                            success=False,
+                            order_id=order_id,
+                            status=order_status,
+                            message=f"FOK not filled: status={order_status}, matched={size_matched}",
+                            data=order_data,
+                        )
+                    logger.info(
+                        f"FOK verified MATCHED: {order_id[:20]}... "
+                        f"matched={size_matched}"
+                    )
+                except Exception as ve:
+                    logger.warning(f"FOK verification failed (treating as unfilled): {ve}")
+                    return OrderResult(
+                        success=False,
+                        order_id=order_id,
+                        status="UNVERIFIED",
+                        message=f"Could not verify FOK fill: {ve}",
+                        data=response,
+                    )
+
             return OrderResult(
                 success=success,
                 order_id=order_id,
