@@ -42,17 +42,18 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 
 @dataclass
 class WeatherConfig:
-    """Configuration for the weather edge bot v3."""
+    """Configuration for the weather edge bot v3 — Temperature Laddering."""
     bankroll: float = 50.0
     observe_only: bool = True
-    min_edge: float = 0.05          # only trade when consensus_prob - price > 5c
+    min_edge: float = 0.03          # lower edge OK when laddering (spread across buckets)
     kelly_fraction: float = 0.5     # half-Kelly
     max_position_pct: float = 0.15  # max 15% bankroll per trade
-    min_entry_price: float = 0.03   # floor — skip $0.01 extreme longshots
+    min_entry_price: float = 0.01   # allow cheap longshots for ladder legs
     max_entry_price: float = 0.35   # cap — avoid overpriced favorites
-    max_model_prob: float = 0.50    # consensus overconfidence cap (v3 multi-model is better calibrated)
+    max_model_prob: float = 0.50    # consensus overconfidence cap
     min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
-    max_bets_per_city_date: int = 1 # only bet on best bucket per city-date (no scatter)
+    max_bets_per_city_date: int = 4 # ladder: bet on top 4 adjacent buckets per city-date
+    max_cost_per_city_date: float = 2.50  # budget cap per city-date (ladder total)
     use_hrrr: bool = True           # use HRRR for US same-day predictions
     scan_interval: int = 600        # rescan every 10 min (avoid Open-Meteo 429 rate limits)
     settle_interval: int = 60       # check settlements every 60s
@@ -365,13 +366,21 @@ class WeatherEdgeBot:
             logger.debug(f"SKIP {mkt.city} {mkt.bucket_label}: model_prob {model_prob:.1%} > cap {self.config.max_model_prob:.0%}")
             return None
 
-        # Already have position for this slug OR this city-date
+        # Already have position for this exact bucket
         if mkt.slug in self.positions:
             return None
+
+        # Laddering: allow multiple buckets per city-date, but cap count and budget
         city_date_key = f"{mkt.city}|{mkt.date}"
-        for pos in self.positions.values():
-            if not pos.resolved and f"{pos.city}|{pos.market_date}" == city_date_key:
-                return None
+        existing_for_cd = [
+            pos for pos in self.positions.values()
+            if not pos.resolved and f"{pos.city}|{pos.market_date}" == city_date_key
+        ]
+        if len(existing_for_cd) >= self.config.max_bets_per_city_date:
+            return None
+        existing_cost_cd = sum(pos.cost for pos in existing_for_cd)
+        if existing_cost_cd >= self.config.max_cost_per_city_date:
+            return None
 
         # WU cross-reference for same-day markets
         wu_adj = 1.0
@@ -429,6 +438,13 @@ class WeatherEdgeBot:
         kelly_f *= self.config.kelly_fraction  # half-Kelly
 
         bet_amount = self.balance * kelly_f
+
+        # Laddering: cap each leg to fit within city-date budget
+        remaining_budget = self.config.max_cost_per_city_date - existing_cost_cd
+        if remaining_budget < 1.0:
+            return None
+        bet_amount = min(bet_amount, remaining_budget)
+
         if bet_amount < 1.0:
             # Force $1.00 minimum (Polymarket floor) if balance allows
             bet_amount = 1.0
@@ -676,14 +692,14 @@ class WeatherEdgeBot:
         pending = sum(1 for p in self.positions.values() if not p.resolved)
 
         print(f"\n{'='*60}")
-        print(f"  WEATHER EDGE v3 — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
+        print(f"  STORMCHASER v4 — Temperature Laddering — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
         print(f"  Models: ECMWF + GFS + ICON + GEM (4-model consensus)")
         print(f"  Balance: ${self.balance:.2f} (started: ${self.starting_balance:.2f})")
         print(f"  Trades: {self.total_trades} | W:{self.wins} L:{self.losses} P:{pending}")
         print(f"  Win Rate: {wr:.1f}% | PnL: ${pnl:+.2f}")
         print(f"  Cities: {', '.join(self.config.cities)}")
         print(f"  Min edge: {self.config.min_edge:.0%} | Kelly: {self.config.kelly_fraction:.0%}")
-        print(f"  Min models agree: {self.config.min_models_agree}/4 | Max bets/city-date: {self.config.max_bets_per_city_date}")
+        print(f"  Min models agree: {self.config.min_models_agree}/4 | LADDER {self.config.max_bets_per_city_date} buckets, ${self.config.max_cost_per_city_date:.2f}/city-date")
         print(f"  HRRR: {'ON' if self.config.use_hrrr else 'OFF'} (US cities: {', '.join(c for c in self.config.cities if c in US_CITIES)})")
         print(f"{'='*60}\n")
 
@@ -694,13 +710,13 @@ class WeatherEdgeBot:
     async def run(self):
         """Main event loop."""
         print("\n" + "=" * 60)
-        print("  WEATHER EDGE v3 — 4-Model Consensus vs. Polymarket")
+        print("  STORMCHASER v4 — Temperature Laddering")
         print(f"  Models: ECMWF (51) + GFS (31) + ICON (40) + GEM (21) = 143 members")
         print(f"  Mode: {'OBSERVE (paper)' if self.config.observe_only else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:.2f}")
         print(f"  Cities: {', '.join(self.config.cities)}")
         print(f"  Min edge: {self.config.min_edge:.0%} | Kelly: {self.config.kelly_fraction:.0%}")
-        print(f"  Min models agree: {self.config.min_models_agree}/4 | Max bets/city-date: {self.config.max_bets_per_city_date}")
+        print(f"  Min models agree: {self.config.min_models_agree}/4 | LADDER {self.config.max_bets_per_city_date} buckets, ${self.config.max_cost_per_city_date:.2f}/city-date")
         print(f"  HRRR: {'ON' if self.config.use_hrrr else 'OFF'}")
         print(f"  Scan interval: {self.config.scan_interval}s")
         print("=" * 60 + "\n")

@@ -29,8 +29,10 @@ def main():
                         help=f"Cities to trade (default: all). Options: {', '.join(CITIES.keys())}")
     parser.add_argument("--min-models", type=int, default=2,
                         help="Min models that must agree on >=5%% prob (default: 2)")
-    parser.add_argument("--max-bets-per-city", type=int, default=1,
-                        help="Max bets per city-date combination (default: 1)")
+    parser.add_argument("--max-bets-per-city", type=int, default=4,
+                        help="Max bets per city-date — ladder legs (default: 4)")
+    parser.add_argument("--max-cost-per-city", type=float, default=2.50,
+                        help="Max USDC budget per city-date ladder (default: $2.50)")
     parser.add_argument("--no-hrrr", action="store_true",
                         help="Disable HRRR for US same-day predictions")
     parser.add_argument("--scan-interval", type=int, default=300,
@@ -65,6 +67,7 @@ def main():
         max_position_pct=args.max_pos,
         min_models_agree=args.min_models,
         max_bets_per_city_date=args.max_bets_per_city,
+        max_cost_per_city_date=args.max_cost_per_city,
         use_hrrr=not args.no_hrrr,
         cities=args.cities,
         scan_interval=args.scan_interval,
