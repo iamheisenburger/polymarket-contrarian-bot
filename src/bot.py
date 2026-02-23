@@ -482,6 +482,16 @@ class TradingBot:
                         self._official_client.get_order,
                         order_id,
                     )
+                    if order_data is None:
+                        logger.warning(
+                            f"FOK order not found (killed): {order_id[:20]}..."
+                        )
+                        return OrderResult(
+                            success=False,
+                            order_id=order_id,
+                            status="NOT_FOUND",
+                            message="FOK order not found in CLOB (killed without fill)",
+                        )
                     order_status = order_data.get("status", "UNKNOWN")
                     size_matched = float(order_data.get("size_matched", "0"))
 
