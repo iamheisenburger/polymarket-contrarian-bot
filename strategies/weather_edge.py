@@ -32,7 +32,7 @@ import requests
 
 from lib.weather_api import CITIES, US_CITIES, ENSEMBLE_MODELS, WeatherForecaster
 from lib.weather_markets import WeatherMarket, WeatherMarketScanner
-from lib.wu_monitor import validate_forecast
+from lib.wu_monitor import get_current_observations, validate_forecast
 from src.bot import TradingBot
 
 logger = logging.getLogger(__name__)
@@ -45,15 +45,15 @@ class WeatherConfig:
     """Configuration for the weather edge bot v3 — Temperature Laddering."""
     bankroll: float = 50.0
     observe_only: bool = True
-    min_edge: float = 0.03          # lower edge OK when laddering (spread across buckets)
+    min_edge: float = 0.05          # 5% min edge — only bet on clear mispricings
     kelly_fraction: float = 0.5     # half-Kelly
     max_position_pct: float = 0.15  # max 15% bankroll per trade
-    min_entry_price: float = 0.01   # allow cheap longshots for ladder legs
+    min_entry_price: float = 0.05   # no tail chasing — min $0.05 entry
     max_entry_price: float = 0.50   # raised for prob-sorted ladder (peak buckets cost more)
     max_model_prob: float = 0.50    # consensus overconfidence cap
-    min_models_agree: int = 2       # require >=2 of 4 models to show >=5% for bucket
-    max_bets_per_city_date: int = 4 # ladder: bet on top 4 adjacent buckets per city-date
-    max_cost_per_city_date: float = 2.50  # budget cap per city-date (ladder total)
+    min_models_agree: int = 3       # require >=3 of 4 models to show >=5% for bucket
+    max_bets_per_city_date: int = 2 # ladder: bet on top 2 buckets per city-date (tight)
+    max_cost_per_city_date: float = 1.50  # budget cap per city-date (ladder total)
     use_hrrr: bool = True           # use HRRR for US same-day predictions
     scan_interval: int = 600        # rescan every 10 min (avoid Open-Meteo 429 rate limits)
     settle_interval: int = 60       # check settlements every 60s
@@ -448,29 +448,66 @@ class WeatherEdgeBot:
             # Get HRRR temp if available for this city-date
             hrrr_temp = city_hrrr.get(mkt.city, {}).get(mkt.date)
 
-            # Peak hour gate: skip same-day markets if past peak temp hour
-            # US cities with HRRR are exempt (HRRR updates hourly, still valid)
+            # Late entry gate: ONLY allow same-day bets AFTER peak temp hour
+            # Before peak, the max temp hasn't been reached — predictions unreliable
+            # After peak, WU station data shows the actual max
             if mkt.date == today_str and city_cfg and city_cfg.peak_hour_utc is not None:
-                past_peak = current_utc_hour > city_cfg.peak_hour_utc + 1
-                has_hrrr = mkt.city in US_CITIES and hrrr_temp is not None
-                if past_peak and not has_hrrr:
+                before_peak = current_utc_hour < city_cfg.peak_hour_utc
+                if before_peak:
                     logger.info(
-                        f"PEAK GATE {mkt.city} {mkt.bucket_label} {mkt.date}: "
-                        f"UTC {current_utc_hour}h > peak {city_cfg.peak_hour_utc}+1h"
+                        f"LATE ENTRY GATE {mkt.city} {mkt.bucket_label} {mkt.date}: "
+                        f"UTC {current_utc_hour}h < peak {city_cfg.peak_hour_utc}h — too early"
                     )
                     continue
 
             # HRRR Hard Gate: block US city entries where HRRR contradicts bucket
             if hrrr_temp is not None and mkt.city in US_CITIES:
                 threshold = 2.0 if city_cfg.unit == "fahrenheit" else 1.0
-                hrrr_corrected = hrrr_temp + bias
-                if hrrr_corrected < mkt.bucket_low - threshold or hrrr_corrected > mkt.bucket_high + threshold:
+                if hrrr_temp < mkt.bucket_low - threshold or hrrr_temp > mkt.bucket_high + threshold:
                     logger.info(
                         f"HRRR BLOCK {mkt.city} {mkt.bucket_label} {mkt.date}: "
-                        f"HRRR={hrrr_corrected:.1f}, bucket={mkt.bucket_low:.0f}-{mkt.bucket_high:.0f}, "
+                        f"HRRR={hrrr_temp:.1f}, bucket={mkt.bucket_low:.0f}-{mkt.bucket_high:.0f}, "
                         f"threshold={threshold}"
                     )
                     continue
+
+            # WU Hard Gate: for same-day markets, check station observations
+            # If current max already exceeds bucket ceiling, this bucket is DEAD
+            wu_size_mult = 1.0
+            if mkt.date == today_str and city_cfg and city_cfg.station_code:
+                wu_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+                try:
+                    wu_obs = get_current_observations(
+                        city_cfg.station_code, wu_date, city_cfg.unit
+                    )
+                except Exception:
+                    wu_obs = None
+
+                if wu_obs:
+                    wu_max = wu_obs["max_temp"]
+                    if wu_max >= mkt.bucket_high:
+                        # Current max already above this bucket — impossible
+                        logger.info(
+                            f"WU GATE REJECT {mkt.city} {mkt.bucket_label} {mkt.date}: "
+                            f"WU max={wu_max:.0f} >= bucket ceiling {mkt.bucket_high:.0f}"
+                        )
+                        continue
+                    elif mkt.bucket_low <= wu_max < mkt.bucket_high:
+                        # Currently IN this bucket — boost confidence
+                        wu_size_mult = 1.5
+                        logger.info(
+                            f"WU GATE CONFIRM {mkt.city} {mkt.bucket_label} {mkt.date}: "
+                            f"WU max={wu_max:.0f} IN bucket [{mkt.bucket_low:.0f}-{mkt.bucket_high:.0f}]"
+                        )
+                    else:
+                        # Bucket still reachable
+                        wu_size_mult = 1.0
+                else:
+                    # Same-day but no WU data — reduce confidence
+                    wu_size_mult = 0.5
+
+            # For next-day markets with no WU data, full confidence in models
+            # (wu_size_mult stays 1.0)
 
             # Compute consensus probability
             bucket_probs = self.forecaster.compute_consensus_probability(
@@ -492,7 +529,7 @@ class WeatherEdgeBot:
                 # Compute consensus mean for diagnostics
                 all_members = []
                 for members in model_members.values():
-                    all_members.extend(m + bias for m in members)
+                    all_members.extend(members)
                 mean = sum(all_members) / len(all_members) if all_members else 0
                 variance = sum((m - mean) ** 2 for m in all_members) / len(all_members) if all_members else 0
                 std = math.sqrt(variance + extra ** 2)
@@ -508,6 +545,7 @@ class WeatherEdgeBot:
                     "models_agreeing": bp.get("models_agreeing", 0),
                     "per_model": bp.get("per_model", {}),
                     "hrrr_boost": bp.get("hrrr_boost", False),
+                    "wu_size_mult": wu_size_mult,
                 })
 
         # Sort by model probability descending (center ladder on peak, not tails)
@@ -622,7 +660,10 @@ class WeatherEdgeBot:
         kelly_f = max(0, min(kelly_f, self.config.max_position_pct))
         kelly_f *= self.config.kelly_fraction  # half-Kelly
 
-        bet_amount = self.balance * kelly_f
+        # Apply WU size multiplier (from scan_opportunities WU hard gate)
+        wu_size_mult = opp.get("wu_size_mult", 1.0)
+
+        bet_amount = self.balance * kelly_f * wu_size_mult
 
         # Laddering: cap each leg to fit within city-date budget
         remaining_budget = self.config.max_cost_per_city_date - existing_cost_cd
@@ -937,7 +978,7 @@ class WeatherEdgeBot:
         pending = sum(1 for p in self.positions.values() if not p.resolved)
 
         print(f"\n{'='*60}")
-        print(f"  STORMCHASER v4 — Temperature Laddering — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
+        print(f"  STORMCHASER v5 — Temperature Laddering — {'OBSERVE' if self.config.observe_only else 'LIVE'}")
         print(f"  Models: ECMWF + GFS + ICON + GEM (4-model consensus)")
         print(f"  Balance: ${self.balance:.2f} (started: ${self.starting_balance:.2f})")
         print(f"  Trades: {self.total_trades} | W:{self.wins} L:{self.losses} P:{pending}")
@@ -955,7 +996,7 @@ class WeatherEdgeBot:
     async def run(self):
         """Main event loop."""
         print("\n" + "=" * 60)
-        print("  STORMCHASER v4 — Temperature Laddering")
+        print("  STORMCHASER v5 — Temperature Laddering")
         print(f"  Models: ECMWF (51) + GFS (31) + ICON (40) + GEM (21) = 143 members")
         print(f"  Mode: {'OBSERVE (paper)' if self.config.observe_only else 'LIVE'}")
         print(f"  Bankroll: ${self.config.bankroll:.2f}")

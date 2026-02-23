@@ -68,36 +68,36 @@ class CityConfig:
 # Bias corrections calibrated from Feb 18-21 2026 (OM observed vs WU actual).
 CITIES = {
     "NYC": CityConfig("NYC", 40.7772, -73.8726, "fahrenheit", 2, "new york city",
-                       bias_correction=0.0, extra_std=3.0, station_code="KLGA", peak_hour_utc=20),
+                       bias_correction=0.0, extra_std=0.0, station_code="KLGA", peak_hour_utc=20),
     "London": CityConfig("London", 51.5053, 0.0553, "celsius", 1, "london",
-                          bias_correction=0.8, extra_std=0.5, station_code="EGLC", peak_hour_utc=15),
+                          bias_correction=0.0, extra_std=0.0, station_code="EGLC", peak_hour_utc=15),
     "Chicago": CityConfig("Chicago", 41.9742, -87.9073, "fahrenheit", 2, "chicago",
-                           bias_correction=0.0, extra_std=1.5, station_code="KORD", peak_hour_utc=21),
+                           bias_correction=0.0, extra_std=0.0, station_code="KORD", peak_hour_utc=21),
     "Miami": CityConfig("Miami", 25.7959, -80.2870, "fahrenheit", 2, "miami",
-                         bias_correction=0.5, extra_std=0.3, station_code="KMIA", peak_hour_utc=20),
+                         bias_correction=0.0, extra_std=0.0, station_code="KMIA", peak_hour_utc=20),
     "Dallas": CityConfig("Dallas", 32.8471, -96.8518, "fahrenheit", 2, "dallas",
-                          bias_correction=0.5, extra_std=1.5, station_code="KDAL", peak_hour_utc=21),
+                          bias_correction=0.0, extra_std=0.0, station_code="KDAL", peak_hour_utc=21),
     "Paris": CityConfig("Paris", 49.0097, 2.5478, "celsius", 1, "paris",
-                         bias_correction=0.8, extra_std=0.8, station_code="LFPG", peak_hour_utc=14),
+                         bias_correction=0.0, extra_std=0.0, station_code="LFPG", peak_hour_utc=14),
     "Toronto": CityConfig("Toronto", 43.6772, -79.6306, "celsius", 1, "toronto",
-                           bias_correction=0.5, extra_std=1.0, station_code="CYYZ", peak_hour_utc=20),
+                           bias_correction=0.0, extra_std=0.0, station_code="CYYZ", peak_hour_utc=20),
     "Atlanta": CityConfig("Atlanta", 33.6407, -84.4277, "fahrenheit", 2, "atlanta",
-                           bias_correction=0.8, extra_std=1.0, station_code="KATL", peak_hour_utc=20),
+                           bias_correction=0.0, extra_std=0.0, station_code="KATL", peak_hour_utc=20),
     "Ankara": CityConfig("Ankara", 40.1281, 32.9951, "celsius", 1, "ankara",
-                          bias_correction=0.8, extra_std=0.5, station_code="LTAC", peak_hour_utc=12),
+                          bias_correction=0.0, extra_std=0.0, station_code="LTAC", peak_hour_utc=12),
     "Wellington": CityConfig("Wellington", -41.3272, 174.8051, "celsius", 1, "wellington",
-                              bias_correction=2.0, extra_std=0.8, station_code="NZWN", peak_hour_utc=2),
+                              bias_correction=0.0, extra_std=0.0, station_code="NZWN", peak_hour_utc=2),
     "Sao Paulo": CityConfig("Sao Paulo", -23.4356, -46.4731, "celsius", 1, "sao paulo",
-                              bias_correction=0.5, extra_std=1.2, station_code="SBGR", peak_hour_utc=18),
+                              bias_correction=0.0, extra_std=0.0, station_code="SBGR", peak_hour_utc=18),
     "Buenos Aires": CityConfig("Buenos Aires", -34.8222, -58.5358, "celsius", 1, "buenos aires",
-                                bias_correction=1.0, extra_std=0.8, station_code="SAEZ", peak_hour_utc=18),
+                                bias_correction=0.0, extra_std=0.0, station_code="SAEZ", peak_hour_utc=18),
 }
 
 EXCLUDED_CITIES = {
     "Seoul": CityConfig("Seoul", 37.4692, 126.4505, "celsius", 1, "seoul",
-                         bias_correction=3.8, extra_std=2.0, station_code="RKSI", peak_hour_utc=6),
+                         bias_correction=0.0, extra_std=0.0, station_code="RKSI", peak_hour_utc=6),
     "Seattle": CityConfig("Seattle", 47.4502, -122.3088, "fahrenheit", 2, "seattle",
-                           bias_correction=2.6, extra_std=3.0, station_code="KSEA", peak_hour_utc=22),
+                           bias_correction=0.0, extra_std=0.0, station_code="KSEA", peak_hour_utc=22),
 }
 
 
@@ -479,7 +479,7 @@ class WeatherForecaster:
             # HRRR boost: if HRRR deterministic temp falls in this bucket,
             # boost consensus by 20% (capped at 0.95)
             hrrr_boost = False
-            if hrrr_temp is not None and low <= (hrrr_temp + bias_correction) < high:
+            if hrrr_temp is not None and low <= hrrr_temp < high:
                 consensus_prob = min(0.95, consensus_prob * 1.2)
                 hrrr_boost = True
 

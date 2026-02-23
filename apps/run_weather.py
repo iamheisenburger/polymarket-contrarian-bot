@@ -56,19 +56,19 @@ def main():
     parser = argparse.ArgumentParser(description="Weather Edge Bot")
     parser.add_argument("--bankroll", type=float, default=12.95)
     parser.add_argument("--min-edge", type=float, default=0.05,
-                        help="Minimum edge (model_prob - price) to trade (default: 0.05)")
+                        help="Minimum edge (model_prob - price) to trade (default: 0.05 = 5%%)")
     parser.add_argument("--kelly", type=float, default=0.5,
                         help="Kelly fraction (default: 0.5 = half-Kelly)")
     parser.add_argument("--max-pos", type=float, default=0.20,
                         help="Max position as fraction of bankroll (default: 0.20)")
     parser.add_argument("--cities", nargs="+", default=list(CITIES.keys()),
                         help=f"Cities to trade (default: all). Options: {', '.join(CITIES.keys())}")
-    parser.add_argument("--min-models", type=int, default=2,
-                        help="Min models that must agree on >=5%% prob (default: 2)")
-    parser.add_argument("--max-bets-per-city", type=int, default=4,
-                        help="Max bets per city-date — ladder legs (default: 4)")
-    parser.add_argument("--max-cost-per-city", type=float, default=2.50,
-                        help="Max USDC budget per city-date ladder (default: $2.50)")
+    parser.add_argument("--min-models", type=int, default=3,
+                        help="Min models that must agree on >=5%% prob (default: 3)")
+    parser.add_argument("--max-bets-per-city", type=int, default=2,
+                        help="Max bets per city-date — ladder legs (default: 2)")
+    parser.add_argument("--max-cost-per-city", type=float, default=1.50,
+                        help="Max USDC budget per city-date ladder (default: $1.50)")
     parser.add_argument("--no-hrrr", action="store_true",
                         help="Disable HRRR for US same-day predictions")
     parser.add_argument("--scan-interval", type=int, default=300,
