@@ -153,11 +153,20 @@ class WeatherForecaster:
 
         return result
 
+    # Deterministic model params for fallback (regular forecast API)
+    DETERMINISTIC_MODELS = {
+        "ecmwf": "ecmwf_ifs025",
+        "gfs": "gfs_seamless",
+        "icon": "icon_seamless",
+        "gem": "gem_seamless",
+    }
+
     def get_multi_model_forecast(
         self, city: str, days: int = 3, models: Optional[List[str]] = None
     ) -> Dict[str, Dict[str, List[float]]]:
         """
         Fetch ensemble forecasts from multiple models in a SINGLE API call.
+        Falls back to deterministic multi-model if ensemble API is rate limited.
 
         Returns {date_str: {model_key: [member_temps...]}}
         e.g. {"2026-02-23": {"ecmwf": [5.1, 5.3, ...], "gfs": [5.0, 5.4, ...], ...}}
@@ -182,8 +191,18 @@ class WeatherForecaster:
                 "models": model_params,
                 "forecast_days": days,
             }, timeout=30)
+            # Check for rate limiting before raise_for_status
+            if resp.status_code == 429 or "limit exceeded" in resp.text.lower():
+                logger.warning(f"{city}: Ensemble API rate limited, using deterministic fallback")
+                return self._get_deterministic_fallback(city, cfg, days, models)
             resp.raise_for_status()
             data = resp.json()
+        except requests.exceptions.HTTPError as e:
+            if "429" in str(e) or "limit" in str(e).lower():
+                logger.warning(f"{city}: Ensemble API rate limited, using deterministic fallback")
+                return self._get_deterministic_fallback(city, cfg, days, models)
+            logger.error(f"Multi-model API error for {city}: {e}")
+            return {}
         except Exception as e:
             logger.error(f"Multi-model API error for {city}: {e}")
             return {}
@@ -216,6 +235,70 @@ class WeatherForecaster:
                 f"{k}={len(v)}" for k, v in result[first_date].items()
             )
             logger.info(f"{city}: multi-model [{model_summary}], {len(result)} days")
+
+        return result
+
+    def _get_deterministic_fallback(
+        self, city: str, cfg, days: int, models: List[str]
+    ) -> Dict[str, Dict[str, List[float]]]:
+        """
+        Fallback: use regular forecast API with multiple deterministic models.
+        Generates synthetic ensemble members around each model's point estimate
+        to produce data compatible with the ensemble probability computation.
+        """
+        import random
+
+        det_params = ",".join(
+            self.DETERMINISTIC_MODELS.get(m, m)
+            for m in models if m in self.DETERMINISTIC_MODELS
+        )
+        try:
+            resp = requests.get(FORECAST_URL, params={
+                "latitude": cfg.lat,
+                "longitude": cfg.lon,
+                "daily": "temperature_2m_max",
+                "temperature_unit": cfg.unit,
+                "timezone": "auto",
+                "models": det_params,
+                "forecast_days": days,
+            }, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Deterministic fallback error for {city}: {e}")
+            return {}
+
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+
+        # Map response keys back to our model keys
+        model_key_map = {
+            f"temperature_2m_max_{v}": k
+            for k, v in self.DETERMINISTIC_MODELS.items()
+        }
+
+        result: Dict[str, Dict[str, List[float]]] = {}
+        for i, date in enumerate(dates):
+            result[date] = {}
+            for resp_key, model_key in model_key_map.items():
+                if model_key not in models:
+                    continue
+                vals = daily.get(resp_key, [])
+                if i < len(vals) and vals[i] is not None:
+                    point = float(vals[i])
+                    # Generate 15 synthetic members around the point estimate
+                    # Use std=1.5 (typical model uncertainty for daily max temp)
+                    std = 1.5
+                    random.seed(hash((city, date, model_key)))
+                    members = [round(random.gauss(point, std), 1) for _ in range(15)]
+                    result[date][model_key] = members
+
+        if result:
+            first_date = list(result.keys())[0]
+            model_summary = ", ".join(
+                f"{k}={len(v)}" for k, v in result[first_date].items()
+            )
+            logger.info(f"{city}: FALLBACK deterministic [{model_summary}], {len(result)} days")
 
         return result
 
