@@ -9,11 +9,47 @@ Usage:
 
 import argparse
 import asyncio
+import atexit
 import logging
+import os
 import sys
 
 from lib.weather_api import CITIES
 from strategies.weather_edge import WeatherConfig, WeatherEdgeBot
+
+LOCKFILE = "/tmp/stormchaser.pid"
+
+
+def acquire_lock():
+    """Prevent duplicate bot instances. Exits if another is running."""
+    if os.path.exists(LOCKFILE):
+        try:
+            with open(LOCKFILE) as f:
+                old_pid = int(f.read().strip())
+            # Check if that PID is actually alive
+            os.kill(old_pid, 0)
+            print(f"ABORT: Another Stormchaser instance is running (PID {old_pid}). "
+                  f"Kill it first or remove {LOCKFILE}")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Old PID is dead, stale lockfile — safe to overwrite
+            pass
+        except PermissionError:
+            # Process exists but we can't signal it — still running
+            print(f"ABORT: Another Stormchaser instance is running. Remove {LOCKFILE} if stale.")
+            sys.exit(1)
+
+    with open(LOCKFILE, "w") as f:
+        f.write(str(os.getpid()))
+    atexit.register(release_lock)
+
+
+def release_lock():
+    """Remove lockfile on clean exit."""
+    try:
+        os.remove(LOCKFILE)
+    except OSError:
+        pass
 
 
 def main():
@@ -72,6 +108,10 @@ def main():
         cities=args.cities,
         scan_interval=args.scan_interval,
     )
+
+    # Prevent duplicate instances (live mode only)
+    if args.live:
+        acquire_lock()
 
     bot = WeatherEdgeBot(config)
 

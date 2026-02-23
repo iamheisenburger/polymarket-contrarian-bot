@@ -128,8 +128,12 @@ class WeatherEdgeBot:
         self.pending_path = self.csv_path.with_suffix(".pending.json")
         self._load_pending()
 
+        # In live mode: reconcile pending against on-chain, then sync balance
+        if self.trading_bot:
+            self._reconcile_positions()
+
         # In live mode, override balance with actual USDC from chain
-        # (must come AFTER _load_pending so paper deductions don't apply)
+        # (must come AFTER _load_pending and reconcile so cost deductions are correct)
         if self.trading_bot:
             real_bal = self.trading_bot.get_usdc_balance()
             if real_bal is not None:
@@ -137,7 +141,14 @@ class WeatherEdgeBot:
                 self.starting_balance = real_bal
                 logger.info(f"Live USDC balance: ${real_bal:.2f}")
             else:
-                logger.warning(f"Could not fetch USDC balance, using --bankroll ${config.bankroll:.2f}")
+                # CRITICAL: Do NOT trade with a fake balance. Set to 0 so no trades fire
+                # until we can successfully query the exchange balance.
+                self.balance = 0.0
+                self.starting_balance = 0.0
+                logger.error(
+                    f"CANNOT fetch USDC balance — setting balance to $0 to prevent untracked trades. "
+                    f"Will retry on next scan cycle."
+                )
 
     # ------------------------------------------------------------------
     # CSV I/O
@@ -222,6 +233,132 @@ class WeatherEdgeBot:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save pending: {e}")
+
+    # ------------------------------------------------------------------
+    # On-chain reconciliation
+    # ------------------------------------------------------------------
+
+    def _reconcile_positions(self):
+        """Sync pending file against actual Polymarket positions API.
+
+        - Adds on-chain positions missing from pending (crash recovery)
+        - Removes phantom positions not found on-chain
+        - Logs every discrepancy
+        """
+        import re
+        safe = self.trading_bot.config.safe_address if self.trading_bot else None
+        if not safe:
+            logger.warning("No safe address for reconciliation")
+            return
+
+        try:
+            # Fetch ALL positions from Polymarket (paginate if needed)
+            all_positions = []
+            offset = 0
+            while True:
+                r = requests.get(
+                    f"https://data-api.polymarket.com/positions",
+                    params={"user": safe, "sizeThreshold": 0, "limit": 500, "offset": offset},
+                    timeout=15,
+                )
+                if r.status_code != 200:
+                    logger.error(f"Positions API returned {r.status_code}")
+                    return
+                batch = r.json()
+                if not batch:
+                    break
+                all_positions.extend(batch)
+                if len(batch) < 500:
+                    break
+                offset += len(batch)
+
+            # Filter to weather positions with size > 0
+            on_chain = {}
+            for p in all_positions:
+                title = p.get("title", "")
+                size = float(p.get("size", 0))
+                slug = p.get("slug", "")
+                if "temperature" in title.lower() and size > 0 and slug:
+                    on_chain[slug] = p
+
+            logger.info(f"Reconciliation: {len(on_chain)} weather positions on-chain")
+
+            # Find phantoms: in pending but NOT on-chain
+            phantoms = []
+            for slug, pos in list(self.positions.items()):
+                if pos.resolved:
+                    continue
+                if slug not in on_chain:
+                    phantoms.append(slug)
+                    logger.warning(
+                        f"PHANTOM removed: {pos.city} {pos.market_date} {pos.bucket_label} "
+                        f"${pos.cost:.2f} (not on-chain)"
+                    )
+            for slug in phantoms:
+                del self.positions[slug]
+
+            # Find missing: on-chain but NOT in pending
+            added = 0
+            for slug, p in on_chain.items():
+                if slug in self.positions:
+                    continue
+                # Reconstruct position from on-chain data
+                title = p.get("title", "")
+                size = float(p.get("size", 0))
+                avg_price = float(p.get("avgPrice", 0))
+                cost = round(size * avg_price, 2)
+
+                # Extract city
+                city = "Unknown"
+                m = re.search(r"temperature in (.+?) be", title)
+                if m:
+                    city = m.group(1)
+
+                # Extract date
+                market_date = "Unknown"
+                dm = re.search(r"on (February \d+)", title)
+                if dm:
+                    day = re.search(r"\d+", dm.group(1)).group()
+                    market_date = f"2026-02-{int(day):02d}"
+
+                # Extract bucket
+                bucket = title.split("be ")[-1].split(" on ")[0] if "be " in title else "?"
+
+                pos = PaperPosition(
+                    slug=slug,
+                    market_question=title,
+                    event_slug=p.get("eventSlug", ""),
+                    token_id=p.get("tokenId", p.get("asset", "")),
+                    condition_id=p.get("conditionId", ""),
+                    bucket_label=bucket,
+                    city=city,
+                    market_date=market_date,
+                    entry_price=avg_price,
+                    model_prob=0.0,  # unknown for recovered positions
+                    edge=0.0,
+                    num_tokens=size,
+                    cost=cost,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+                self.positions[slug] = pos
+                added += 1
+                logger.warning(
+                    f"RECOVERED from chain: {city} {market_date} {bucket} "
+                    f"{size:.1f} tok @ ${avg_price:.3f} = ${cost:.2f}"
+                )
+
+            if phantoms or added:
+                self._save_pending()
+                logger.info(
+                    f"Reconciliation complete: removed {len(phantoms)} phantoms, "
+                    f"recovered {added} missing positions. "
+                    f"Total tracked: {sum(1 for p in self.positions.values() if not p.resolved)}"
+                )
+            else:
+                logger.info("Reconciliation: pending file matches on-chain perfectly")
+
+        except Exception as e:
+            logger.error(f"Reconciliation failed: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Opportunity scanning
@@ -533,7 +670,11 @@ class WeatherEdgeBot:
         )
 
     async def execute_live_trade(self, trade: Dict[str, Any]) -> bool:
-        """Execute a REAL trade on Polymarket via FOK order."""
+        """Execute a REAL trade on Polymarket via FOK order.
+
+        Records position BEFORE sending order to prevent crash-induced tracking loss.
+        If order fails, the pre-recorded position is removed.
+        """
         if not self.trading_bot:
             logger.error("Live trade called but no trading bot!")
             return False
@@ -542,6 +683,28 @@ class WeatherEdgeBot:
         price = mkt.best_ask
         tokens = trade["num_tokens"]
         cost = trade["cost"]
+
+        # PRE-RECORD: Save position BEFORE sending order so crashes can't lose it
+        pos = PaperPosition(
+            slug=mkt.slug,
+            market_question=mkt.question,
+            event_slug=mkt.event_slug,
+            token_id=mkt.token_id,
+            condition_id=mkt.condition_id,
+            bucket_label=mkt.bucket_label,
+            city=mkt.city,
+            market_date=mkt.date,
+            entry_price=price,
+            model_prob=trade["model_prob"],
+            edge=trade["edge"],
+            num_tokens=tokens,
+            cost=cost,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        self.positions[mkt.slug] = pos
+        self.balance -= cost
+        self._save_pending()
+        logger.info(f"Pre-recorded position: {mkt.city} {mkt.bucket_label} ${cost:.2f}")
 
         try:
             result = await self.trading_bot.place_order(
@@ -553,17 +716,41 @@ class WeatherEdgeBot:
             )
         except Exception as e:
             logger.error(f"Live order FAILED for {mkt.city} {mkt.bucket_label}: {e}")
+            # ROLLBACK: remove pre-recorded position
+            self.positions.pop(mkt.slug, None)
+            self.balance += cost
+            self._save_pending()
+            logger.info(f"Rolled back pre-recorded position: {mkt.city} {mkt.bucket_label}")
             return False
 
         if not result.success:
             logger.warning(
                 f"Live order REJECTED {mkt.city} {mkt.bucket_label}: {result.message}"
             )
+            # ROLLBACK: remove pre-recorded position
+            self.positions.pop(mkt.slug, None)
+            self.balance += cost
+            self._save_pending()
+            logger.info(f"Rolled back pre-recorded position: {mkt.city} {mkt.bucket_label}")
             return False
 
-        # FOK filled — record position and deduct cost
-        # (don't trust chain balance query right after fill — it can be stale)
-        self.execute_paper_trade(trade)
+        # FOK filled and verified — position was already recorded
+        self.total_trades += 1
+        self.total_wagered += cost
+
+        mode = "LIVE"
+        models_info = trade.get("models_agreeing", "?")
+        hrrr = " +HRRR" if trade.get("hrrr_boost") else ""
+        per_model = trade.get("per_model", {})
+        model_str = " ".join(f"{k}={v:.0%}" for k, v in per_model.items()) if per_model else ""
+        print(
+            f"[{mode}] WEATHER {mkt.city} {mkt.date} {mkt.bucket_label} "
+            f"@ ${price:.3f} (consensus: {trade['model_prob']:.1%}, edge: {trade['edge']:.1%}) "
+            f"| {models_info}/4 models agree{hrrr} "
+            f"| {tokens:.0f} tokens, ${cost:.2f} "
+            f"| [{model_str}] "
+            f"| Bal: ${self.balance:.2f}"
+        )
 
         logger.info(
             f"LIVE FILLED {mkt.city} {mkt.date} {mkt.bucket_label} "
@@ -729,6 +916,17 @@ class WeatherEdgeBot:
             try:
                 cycle += 1
                 now = time.time()
+
+                # Live mode: refresh balance from exchange every cycle
+                if self.trading_bot:
+                    real_bal = self.trading_bot.get_usdc_balance()
+                    if real_bal is not None:
+                        old_bal = self.balance
+                        self.balance = real_bal
+                        if abs(old_bal - real_bal) > 0.10:
+                            logger.info(f"Balance sync: ${old_bal:.2f} → ${real_bal:.2f}")
+                    else:
+                        logger.warning(f"Balance sync failed — keeping ${self.balance:.2f}")
 
                 # Skip scanning if balance too low to place any trade
                 if self.balance < 1.0:
