@@ -147,6 +147,11 @@ def main():
         help="Min model confidence to trade (default: 0.70). Only trade when model is highly confident."
     )
     parser.add_argument(
+        "--min-window-elapsed", type=float, default=0,
+        help="Min seconds into the window before entering (default: 0 = disabled). "
+             "600 = wait 10 min into 15m window (5 min left)."
+    )
+    parser.add_argument(
         "--price-source", type=str, default="binance",
         choices=["binance", "chainlink"],
         help="Price feed for fair value (default: binance). "
@@ -223,6 +228,7 @@ def main():
         min_momentum=args.min_momentum,
         momentum_lookback=args.momentum_lookback,
         min_fair_value=args.min_fair_value,
+        min_window_elapsed=args.min_window_elapsed,
         price_source=args.price_source,
         observe_only=args.observe,
         log_file=args.log_file,

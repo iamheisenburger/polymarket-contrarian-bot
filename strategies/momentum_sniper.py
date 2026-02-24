@@ -120,6 +120,11 @@ class SniperConfig:
     # Data: FV >= 0.60 → 80% WR. FV 0.50-0.52 → 26% WR.
     min_fair_value: float = 0.50     # 0.50 = disabled (default). 0.58+ recommended.
 
+    # Late entry: minimum seconds elapsed in the window before considering trades.
+    # 0 = disabled (enter any time). 600 = wait 10 min (5 min left in 15m window).
+    # Forces the bot to wait for the trend to establish before entering.
+    min_window_elapsed: float = 0
+
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
@@ -616,6 +621,12 @@ class MomentumSniperStrategy:
             # Only skip if market is literally expired (0 seconds left)
             if state.seconds_to_expiry() <= 0:
                 continue
+
+            # Late entry filter: wait for trend to establish before entering.
+            if self.config.min_window_elapsed > 0 and state.market_start_time > 0:
+                elapsed = time.time() - state.market_start_time
+                if elapsed < self.config.min_window_elapsed:
+                    continue
 
             # Volatility filter: only trade in low-vol regimes.
             # Data: vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
