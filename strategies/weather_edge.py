@@ -119,8 +119,8 @@ class WeatherEdgeBot:
         self.total_wagered = 0.0
         self.total_payout = 0.0
 
-        # CSV logger
-        self.csv_path = Path("data/weather_trades.csv")
+        # CSV logger — v5 gets a fresh file
+        self.csv_path = Path("data/weather_trades_v5.csv")
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_csv()
 

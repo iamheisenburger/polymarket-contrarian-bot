@@ -440,10 +440,12 @@ class TradingBot:
             clob_side = CLOB_BUY if side.upper() == "BUY" else CLOB_SELL
 
             # Map string order_type to py_clob_client OrderType enum
-            # NOTE: order_type goes to post_order(), NOT PartialCreateOrderOptions
             from py_clob_client.clob_types import OrderType as ClobOrderType
             ot_map = {"GTC": ClobOrderType.GTC, "FOK": ClobOrderType.FOK, "GTD": ClobOrderType.GTD}
             ot = ot_map.get(order_type.upper(), ClobOrderType.GTC)
+
+            # Snapshot balance before order for FOK verification
+            bal_before = self.get_usdc_balance() if order_type.upper() == "FOK" else None
 
             # Step 1: Create and sign the order
             order = await self._run_in_thread(
@@ -472,54 +474,47 @@ class TradingBot:
                 f"(token: {token_id[:16]}...) -> {order_id[:20]}..."
             )
 
-            # For FOK orders, verify the order actually filled by checking status
-            # The CLOB returns success=True even when FOK orders have no match
+            # FOK verification: check if balance actually decreased
+            # The CLOB order lookup is unreliable (indexing lag causes false negatives).
+            # Instead, compare USDC balance before and after — ground truth.
             if success and order_id and order_type.upper() == "FOK":
                 import time
-                time.sleep(0.5)  # Brief delay for order to settle
-                try:
-                    order_data = await self._run_in_thread(
-                        self._official_client.get_order,
-                        order_id,
-                    )
-                    if order_data is None:
-                        logger.warning(
-                            f"FOK order not found (killed): {order_id[:20]}..."
-                        )
-                        return OrderResult(
-                            success=False,
-                            order_id=order_id,
-                            status="NOT_FOUND",
-                            message="FOK order not found in CLOB (killed without fill)",
-                        )
-                    order_status = order_data.get("status", "UNKNOWN")
-                    size_matched = float(order_data.get("size_matched", "0"))
+                expected_cost = round(price * size, 2)
+                time.sleep(3)  # Wait for settlement to propagate
 
-                    if order_status != "MATCHED" or size_matched == 0:
+                bal_after = self.get_usdc_balance()
+                if bal_after is not None and bal_before is not None:
+                    spent = round(bal_before - bal_after, 2)
+                    if spent >= expected_cost * 0.8:  # Allow 20% tolerance for fees
+                        logger.info(
+                            f"FOK FILLED (balance check): {order_id[:20]}... "
+                            f"spent=${spent:.2f} (expected ${expected_cost:.2f})"
+                        )
+                        # Order filled — success
+                    else:
                         logger.warning(
-                            f"FOK order NOT filled: {order_id[:20]}... "
-                            f"status={order_status} size_matched={size_matched}"
+                            f"FOK NOT FILLED (balance check): {order_id[:20]}... "
+                            f"spent=${spent:.2f} < expected ${expected_cost:.2f}"
                         )
                         return OrderResult(
                             success=False,
                             order_id=order_id,
-                            status=order_status,
-                            message=f"FOK not filled: status={order_status}, matched={size_matched}",
-                            data=order_data,
+                            status="NOT_FILLED",
+                            message=f"FOK not filled: balance dropped ${spent:.2f}, expected ${expected_cost:.2f}",
                         )
-                    logger.info(
-                        f"FOK verified MATCHED: {order_id[:20]}... "
-                        f"matched={size_matched}"
-                    )
-                except Exception as ve:
-                    logger.warning(f"FOK verification failed (treating as unfilled): {ve}")
-                    return OrderResult(
-                        success=False,
-                        order_id=order_id,
-                        status="UNVERIFIED",
-                        message=f"Could not verify FOK fill: {ve}",
-                        data=response,
-                    )
+                else:
+                    # Can't verify via balance — fall back to CLOB order lookup
+                    time.sleep(2)
+                    try:
+                        order_data = await self._run_in_thread(
+                            self._official_client.get_order, order_id,
+                        )
+                        if order_data and order_data.get("status") == "MATCHED":
+                            logger.info(f"FOK FILLED (CLOB fallback): {order_id[:20]}...")
+                        else:
+                            logger.warning(f"FOK status unclear: {order_id[:20]}... treating as filled (balance unavailable)")
+                    except Exception:
+                        logger.warning(f"FOK verification unavailable: {order_id[:20]}... treating as filled")
 
             return OrderResult(
                 success=success,
