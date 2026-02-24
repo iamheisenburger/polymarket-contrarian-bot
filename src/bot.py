@@ -474,47 +474,59 @@ class TradingBot:
                 f"(token: {token_id[:16]}...) -> {order_id[:20]}..."
             )
 
-            # FOK verification: check if balance actually decreased
-            # The CLOB order lookup is unreliable (indexing lag causes false negatives).
-            # Instead, compare USDC balance before and after — ground truth.
+            # FOK verification: confirm fill via balance diff + CLOB lookup.
+            # IMPORTANT: Default to FILLED. Only report NOT_FILLED if we have
+            # strong positive evidence (CLOB says CANCELLED/DEAD). A false
+            # negative (thinking filled when not) wastes a position slot.
+            # A false "not filled" (the old bug) causes untracked spending
+            # and duplicate orders — far worse.
             if success and order_id and order_type.upper() == "FOK":
                 import time
                 expected_cost = round(price * size, 2)
-                time.sleep(3)  # Wait for settlement to propagate
+                filled = False
 
-                bal_after = self.get_usdc_balance()
-                if bal_after is not None and bal_before is not None:
-                    spent = round(bal_before - bal_after, 2)
-                    if spent >= expected_cost * 0.8:  # Allow 20% tolerance for fees
-                        logger.info(
-                            f"FOK FILLED (balance check): {order_id[:20]}... "
-                            f"spent=${spent:.2f} (expected ${expected_cost:.2f})"
-                        )
-                        # Order filled — success
-                    else:
-                        logger.warning(
-                            f"FOK NOT FILLED (balance check): {order_id[:20]}... "
-                            f"spent=${spent:.2f} < expected ${expected_cost:.2f}"
-                        )
-                        return OrderResult(
-                            success=False,
-                            order_id=order_id,
-                            status="NOT_FILLED",
-                            message=f"FOK not filled: balance dropped ${spent:.2f}, expected ${expected_cost:.2f}",
-                        )
-                else:
-                    # Can't verify via balance — fall back to CLOB order lookup
-                    time.sleep(2)
+                # Try balance diff with retries (balance API can lag)
+                for attempt in range(3):
+                    time.sleep(3 if attempt == 0 else 4)
+                    bal_after = self.get_usdc_balance()
+                    if bal_after is not None and bal_before is not None:
+                        spent = round(bal_before - bal_after, 2)
+                        if spent >= expected_cost * 0.5:
+                            logger.info(
+                                f"FOK FILLED (balance, attempt {attempt+1}): {order_id[:20]}... "
+                                f"spent=${spent:.2f} (expected ${expected_cost:.2f})"
+                            )
+                            filled = True
+                            break
+
+                # If balance check inconclusive, try CLOB order lookup
+                if not filled:
                     try:
                         order_data = await self._run_in_thread(
                             self._official_client.get_order, order_id,
                         )
-                        if order_data and order_data.get("status") == "MATCHED":
-                            logger.info(f"FOK FILLED (CLOB fallback): {order_id[:20]}...")
-                        else:
-                            logger.warning(f"FOK status unclear: {order_id[:20]}... treating as filled (balance unavailable)")
+                        status = (order_data or {}).get("status", "")
+                        if status == "MATCHED":
+                            logger.info(f"FOK FILLED (CLOB lookup): {order_id[:20]}...")
+                            filled = True
+                        elif status in ("CANCELLED", "DEAD"):
+                            logger.warning(f"FOK NOT FILLED (CLOB={status}): {order_id[:20]}...")
+                            return OrderResult(
+                                success=False,
+                                order_id=order_id,
+                                status="NOT_FILLED",
+                                message=f"FOK not filled: CLOB status={status}",
+                            )
                     except Exception:
-                        logger.warning(f"FOK verification unavailable: {order_id[:20]}... treating as filled")
+                        pass
+
+                # Default: treat as FILLED. It's safer to track a position
+                # we might not have than to miss one we DO have.
+                if not filled:
+                    logger.warning(
+                        f"FOK verification inconclusive: {order_id[:20]}... "
+                        f"ASSUMING FILLED (safe default)"
+                    )
 
             return OrderResult(
                 success=success,
