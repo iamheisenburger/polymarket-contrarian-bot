@@ -137,6 +137,9 @@ class SniperConfig:
     # "chainlink" = Polymarket RTDS Chainlink feed (settlement source)
     price_source: str = "binance"
 
+    # Vatic API: use exact Chainlink strike prices instead of Binance approximation
+    use_vatic: bool = True
+
     # Logging
     log_file: str = "data/longshot_trades.csv"
     observe_only: bool = False
@@ -150,6 +153,9 @@ class CoinMarketState:
     strike_price: float = 0.0
     market_end_ts: float = 0.0
     current_slug: str = ""
+
+    # Strike source tracking (vatic, binance, backsolve)
+    _strike_source: str = "unknown"
 
     # Positions held in this market
     up_tokens: float = 0.0
@@ -255,6 +261,15 @@ class MomentumSniperStrategy:
             self._deribit_feed = DeribitVolFeed(coins=config.coins)
         except Exception:
             pass
+
+        # Vatic API client for exact Chainlink strikes
+        self._vatic = None
+        if config.use_vatic:
+            try:
+                from lib.vatic_client import VaticClient
+                self._vatic = VaticClient()
+            except Exception:
+                pass
 
         # Per-coin market managers
         self.coin_states: Dict[str, CoinMarketState] = {}
@@ -422,12 +437,10 @@ class MomentumSniperStrategy:
     def _set_strike(self, state: CoinMarketState):
         """Determine strike price for the current market.
 
-        Primary: Use Binance spot at window open (first 60s of market).
-        Binance closely tracks Chainlink at the start of the window,
-        so this is the most reliable approximation of the actual strike.
-
-        Fallback: If joining mid-window (startup), back-solve from
-        Polymarket mid price + Binance spot + volatility.
+        Priority chain:
+        1. Vatic API — exact Chainlink opening price (settlement source)
+        2. Binance spot at window open (first 60s) — close approximation
+        3. Back-solve from Polymarket mid price (least accurate)
         """
         market = state.manager.current_market
         if not market:
@@ -436,6 +449,7 @@ class MomentumSniperStrategy:
         slug = market.slug
         state.current_slug = slug
         state.market_start_time = time.time()
+        strike_source = "unknown"
 
         # Parse market start/end time from slug or end_date
         market_start_ts = 0
@@ -459,13 +473,24 @@ class MomentumSniperStrategy:
 
         secs_since_window_open = time.time() - market_start_ts if market_start_ts > 0 else 999
 
-        if secs_since_window_open < 60:
-            # Early in window — Binance spot ≈ Chainlink opening price ≈ strike.
-            # This is more reliable than back-solving from a potentially stale orderbook.
+        # 1. Try Vatic API first — exact Chainlink strike
+        if self._vatic:
+            vatic_strike = self._vatic.get_strike(
+                state.coin, self.config.timeframe, market_start_ts
+            )
+            if vatic_strike and vatic_strike > 0:
+                state.strike_price = vatic_strike
+                strike_source = "vatic"
+                self.log(f"{state.coin} strike from Vatic (exact Chainlink)")
+
+        # 2. Binance spot early in window
+        if strike_source == "unknown" and secs_since_window_open < 60:
             state.strike_price = spot
+            strike_source = "binance"
             self.log(f"{state.coin} strike from Binance spot (window {secs_since_window_open:.0f}s old)")
-        else:
-            # Joined mid-window — back-solve from Polymarket mid price.
+
+        # 3. Back-solve from Polymarket mid price
+        if strike_source == "unknown":
             up_price = state.manager.get_mid_price("up")
             if 0.1 < up_price < 0.9:
                 vol, _ = self._get_volatility(state.coin)
@@ -476,11 +501,17 @@ class MomentumSniperStrategy:
                     sigma_sqrt_t = vol * math.sqrt(T)
                     d = self._approx_inv_normal(up_price)
                     state.strike_price = spot * math.exp(-d * sigma_sqrt_t)
+                    strike_source = "backsolve"
                     self.log(f"{state.coin} strike back-solved from mid={up_price:.2f} (window {secs_since_window_open:.0f}s old)")
                 else:
                     state.strike_price = spot
+                    strike_source = "binance"
             else:
                 state.strike_price = spot
+                strike_source = "binance"
+
+        # Store strike source for trade logging
+        state._strike_source = strike_source
 
         # Format strike with appropriate precision
         if state.strike_price < 10:
@@ -490,7 +521,7 @@ class MomentumSniperStrategy:
         else:
             strike_str = f"${state.strike_price:,.0f}"
         self.log(
-            f"{state.coin} strike: {strike_str} | "
+            f"{state.coin} strike: {strike_str} [{strike_source}] | "
             f"expiry: {state.seconds_to_expiry():.0f}s"
         )
 
@@ -676,8 +707,8 @@ class MomentumSniperStrategy:
                 if side == "down" and state.has_up_position:
                     continue
 
-                # Calculate edge using actual buy price (we pay ask + 1 cent for fill)
-                buy_price = min(round(best_ask + 0.01, 2), 0.99)
+                # Calculate edge at exact ask price (FOK handles stale prices)
+                buy_price = round(best_ask, 2)
 
                 # Net edge = fair value - buy price - taker fee
                 fee = taker_fee_per_token(buy_price, self.config.timeframe)
@@ -715,11 +746,26 @@ class MomentumSniperStrategy:
     ) -> bool:
         """Execute a snipe trade."""
         if self.config.observe_only:
-            # Paper trading: track virtual positions so settlement logs to CSV
+            # Paper trading with realistic simulation
             fair_prob = fv.fair_up if side == "up" else fv.fair_down
             num_tokens = 5.0
-            buy_price = min(round(entry_price + 0.01, 2), 0.99)
-            actual_cost = buy_price * num_tokens
+            buy_price = round(entry_price, 2)
+
+            # FOK rejection simulation: check orderbook depth
+            ob = state.manager.get_orderbook(side)
+            if ob and ob.asks:
+                best_ask_size = ob.asks[0].size
+                if best_ask_size < num_tokens:
+                    self.log(
+                        f"[PAPER SKIP] {state.coin} {side.upper()} @ {buy_price:.2f} "
+                        f"FOK killed (depth={best_ask_size:.0f} < {num_tokens:.0f})",
+                        "warning"
+                    )
+                    return False
+
+            # Fee-inclusive cost basis
+            fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
+            actual_cost = (buy_price + fee_per_token) * num_tokens
 
             if side == "up":
                 state.up_tokens += num_tokens
@@ -737,6 +783,7 @@ class MomentumSniperStrategy:
             spot = self.binance.get_price(state.coin)
             vol, vol_src = self._get_volatility(state.coin)
             other_price = state.manager.get_mid_price("down" if side == "up" else "up")
+            strike_src = getattr(state, '_strike_source', 'unknown')
 
             self.trade_logger.log_trade(
                 market_slug=state.current_slug,
@@ -761,12 +808,13 @@ class MomentumSniperStrategy:
                 order_latency_ms=0,
                 total_latency_ms=0,
                 vol_source=vol_src,
+                strike_source=strike_src,
             )
 
             self.log(
                 f"[PAPER] {state.coin} {side.upper()} @ {buy_price:.2f} "
-                f"x{num_tokens:.0f} (${actual_cost:.2f}) edge={edge:.2f} "
-                f"FV={fair_prob:.2f} vol={vol_src}",
+                f"x{num_tokens:.0f} (${actual_cost:.2f} inc fees) edge={edge:.2f} "
+                f"FV={fair_prob:.2f} strike={strike_src}",
                 "trade"
             )
             return True
@@ -804,8 +852,8 @@ class MomentumSniperStrategy:
             return False
 
         # Place FOK (Fill Or Kill) order — fills immediately or is cancelled.
-        # This prevents phantom positions from unfilled GTC orders sitting on the book.
-        buy_price = min(round(entry_price + 0.01, 2), 0.99)
+        # Enter at exact ask price; FOK handles stale prices naturally.
+        buy_price = round(entry_price, 2)
 
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
@@ -871,6 +919,7 @@ class MomentumSniperStrategy:
             # Get real USDC balance for accurate logging
             real_balance = self.bot.get_usdc_balance() or self._balance
 
+            strike_src = getattr(state, '_strike_source', 'unknown')
             self.trade_logger.log_trade(
                 market_slug=state.current_slug,
                 coin=state.coin,
@@ -894,6 +943,7 @@ class MomentumSniperStrategy:
                 order_latency_ms=order_latency_ms,
                 total_latency_ms=total_latency_ms,
                 vol_source=vol_src,
+                strike_source=strike_src,
             )
 
             kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
@@ -903,7 +953,7 @@ class MomentumSniperStrategy:
                 f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
                 f"x{num_tokens:.0f} (${actual_cost:.2f}) "
                 f"edge={edge:.2f} [{strength}] kelly={kelly_pct:.0f}% "
-                f"vol={vol_src} lat={total_latency_ms:.0f}ms",
+                f"strike={strike_src} lat={total_latency_ms:.0f}ms",
                 "success"
             )
             return True
