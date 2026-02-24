@@ -152,10 +152,18 @@ def main():
              "600 = wait 10 min into 15m window (5 min left)."
     )
     parser.add_argument(
+        "--market-check-interval", type=float, default=30.0,
+        help="Seconds between market polls (default: 30). Use 10 for 5m late-entry."
+    )
+    parser.add_argument(
         "--price-source", type=str, default="binance",
         choices=["binance", "chainlink"],
         help="Price feed for fair value (default: binance). "
              "'chainlink' uses Polymarket's settlement source — eliminates Binance/Chainlink divergence."
+    )
+    parser.add_argument(
+        "--no-vatic", action="store_true",
+        help="Disable Vatic API for strike prices (fall back to Binance/backsolve)"
     )
 
     args = parser.parse_args()
@@ -229,7 +237,9 @@ def main():
         momentum_lookback=args.momentum_lookback,
         min_fair_value=args.min_fair_value,
         min_window_elapsed=args.min_window_elapsed,
+        market_check_interval=args.market_check_interval,
         price_source=args.price_source,
+        use_vatic=not args.no_vatic,
         observe_only=args.observe,
         log_file=args.log_file,
     )
@@ -245,6 +255,8 @@ def main():
     print(f"  Coins:          {', '.join(coins)}")
     print(f"  Timeframe:      {args.timeframe}")
     print(f"  Price source:   {price_src}")
+    vatic_status = f"{Colors.GREEN}ON (exact Chainlink strikes){Colors.RESET}" if not args.no_vatic else "OFF"
+    print(f"  Vatic strikes:  {vatic_status}")
     print(f"  Bankroll:       ${args.bankroll:.2f}")
     print()
 
