@@ -68,6 +68,7 @@ class TradeRecord:
     order_latency_ms: float = 0.0          # ms for order round-trip to Polymarket
     total_latency_ms: float = 0.0          # ms from signal to fill
     vol_source: str = ""                   # "IV" (Deribit) or "RV" (Binance realized)
+    strike_source: str = ""                # "vatic", "binance", or "backsolve"
 
     @property
     def trade_key(self) -> str:
@@ -148,7 +149,7 @@ class TradeLogger:
         "fair_value_at_entry", "time_to_expiry_at_entry",
         "momentum_at_entry", "volatility_at_entry",
         "signal_to_order_ms", "order_latency_ms", "total_latency_ms",
-        "vol_source",
+        "vol_source", "strike_source",
     ]
 
     def __init__(self, filepath: str = "data/trades.csv"):
@@ -256,6 +257,7 @@ class TradeLogger:
         order_latency_ms: float = 0.0,
         total_latency_ms: float = 0.0,
         vol_source: str = "",
+        strike_source: str = "",
     ) -> TradeRecord:
         """
         Log a new trade entry. Stored in pending JSON only (not CSV yet).
@@ -283,6 +285,7 @@ class TradeLogger:
             order_latency_ms=order_latency_ms,
             total_latency_ms=total_latency_ms,
             vol_source=vol_source,
+            strike_source=strike_source,
         )
 
         trade_key = record.trade_key
@@ -372,6 +375,7 @@ class TradeLogger:
                     f"{record.order_latency_ms:.0f}",
                     f"{record.total_latency_ms:.0f}",
                     record.vol_source,
+                    record.strike_source,
                 ])
         except Exception as e:
             logger.error(f"CRITICAL: Failed to write trade to CSV {self.filepath}: {e}")
