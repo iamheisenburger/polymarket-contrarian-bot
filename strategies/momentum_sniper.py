@@ -719,15 +719,18 @@ class MomentumSniperStrategy:
                     if fair_prob < self.config.min_fair_value:
                         continue  # Model not confident enough
 
-                    # Momentum filter: Binance must be moving in our direction
-                    if self.config.min_momentum > 0:
-                        momentum = self.binance.get_momentum(
-                            state.coin, self.config.momentum_lookback
-                        )
-                        if side == "up" and momentum < self.config.min_momentum:
-                            continue  # Price not trending up
-                        if side == "down" and momentum > -self.config.min_momentum:
-                            continue  # Price not trending down
+                    # Momentum filter: price must have displaced from strike
+                    # in the direction we're betting. This matches the backtest
+                    # logic exactly: mom = (spot - strike) / strike.
+                    # DO NOT use binance.get_momentum() — that measures 30s
+                    # price change, which is a different (weaker) signal.
+                    if self.config.min_momentum > 0 and state.strike_price > 0:
+                        spot = self.binance.get_price(state.coin)
+                        displacement = (spot - state.strike_price) / state.strike_price
+                        if side == "up" and displacement < self.config.min_momentum:
+                            continue  # Price below strike — don't buy Up
+                        if side == "down" and displacement > -self.config.min_momentum:
+                            continue  # Price above strike — don't buy Down
 
                     opportunities.append((state, side, best_ask, edge, fv))
 
@@ -800,9 +803,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
                 fair_value_at_entry=fair_prob,
                 time_to_expiry_at_entry=state.seconds_to_expiry(),
-                momentum_at_entry=self.binance.get_momentum(
-                    state.coin, self.config.momentum_lookback
-                ),
+                momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
                 volatility_at_entry=vol,
                 signal_to_order_ms=0,
                 order_latency_ms=0,
@@ -935,9 +936,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
                 fair_value_at_entry=fair_prob,
                 time_to_expiry_at_entry=state.seconds_to_expiry(),
-                momentum_at_entry=self.binance.get_momentum(
-                    state.coin, self.config.momentum_lookback
-                ),
+                momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
                 volatility_at_entry=vol,
                 signal_to_order_ms=signal_to_order_ms,
                 order_latency_ms=order_latency_ms,
