@@ -856,18 +856,20 @@ class MomentumSniperStrategy:
             if state.seconds_to_expiry() <= 0:
                 continue
 
-            # Late entry filter: wait for trend to establish before entering.
-            if self.config.min_window_elapsed > 0 and state.market_start_time > 0:
-                elapsed = time.time() - state.market_start_time
-                if elapsed < self.config.min_window_elapsed:
-                    continue
-
-            # Max entry filter: stop entering after this many seconds.
-            # Prevents late entries where latency arbitrage has disappeared.
-            if self.config.max_window_elapsed > 0 and state.market_start_time > 0:
-                elapsed = time.time() - state.market_start_time
-                if elapsed > self.config.max_window_elapsed:
-                    continue
+            # Late/max entry filter using REAL market time (not discovery time).
+            # Bug fix: previously used time.time() - market_start_time which drifts
+            # when market is discovered late, causing entries before min TTE.
+            if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
+                tte = state.seconds_to_expiry()
+                duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                if self.config.min_window_elapsed > 0:
+                    max_tte = duration - self.config.min_window_elapsed  # 300-120=180
+                    if tte > max_tte:
+                        continue
+                if self.config.max_window_elapsed > 0:
+                    min_tte = duration - self.config.max_window_elapsed  # 300-180=120
+                    if tte < min_tte:
+                        continue
 
             # Volatility filter: only trade in low-vol regimes.
             # Data: vol < 0.50 -> 35.8% WR vs 22.4% when vol > 0.50.
