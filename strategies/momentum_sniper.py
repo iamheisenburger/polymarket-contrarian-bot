@@ -409,8 +409,10 @@ class MomentumSniperStrategy:
         # Pending signals awaiting confirmation
         self._pending_signals: Dict[str, PendingSignal] = {}
 
-        # Circuit breaker: consecutive loss tracking
-        self._consecutive_losses: int = 0
+        # Circuit breaker: consecutive losing WINDOWS (not individual trades)
+        # 3 coins losing in the same 5m window = 1 losing window, not 3 losses
+        self._consecutive_loss_windows: int = 0
+        self._last_loss_window: str = ""  # slug window timestamp of last counted loss
         self._circuit_breaker_tripped: bool = False
 
         # Running state
@@ -1253,16 +1255,20 @@ class MomentumSniperStrategy:
                 if side_won:
                     self.stats.wins += 1
                     self.stats.total_payout += payout
-                    self._consecutive_losses = 0  # Reset streak on win
+                    self._consecutive_loss_windows = 0
+                    self._last_loss_window = ""
                 else:
                     self.stats.losses += 1
-                    self._consecutive_losses += 1
-                    # Circuit breaker check
+                    # Count per-window: same window = 1 event
+                    window_id = record.market_slug.rsplit("-", 1)[-1]
+                    if window_id != self._last_loss_window:
+                        self._consecutive_loss_windows += 1
+                        self._last_loss_window = window_id
                     if (self.config.max_consecutive_losses > 0 and
-                            self._consecutive_losses >= self.config.max_consecutive_losses):
+                            self._consecutive_loss_windows >= self.config.max_consecutive_losses):
                         self._circuit_breaker_tripped = True
                         self.log(
-                            f"CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses! "
+                            f"CIRCUIT BREAKER: {self._consecutive_loss_windows} consecutive losing windows! "
                             f"Trading paused. Investigate before resuming.",
                             level="error",
                         )
@@ -1310,15 +1316,19 @@ class MomentumSniperStrategy:
                     if side_won:
                         self.stats.wins += 1
                         self.stats.total_payout += side_payout
-                        self._consecutive_losses = 0  # Reset streak on win
+                        self._consecutive_loss_windows = 0
+                        self._last_loss_window = ""
                     else:
                         self.stats.losses += 1
-                        self._consecutive_losses += 1
+                        window_id = old_slug.rsplit("-", 1)[-1]
+                        if window_id != self._last_loss_window:
+                            self._consecutive_loss_windows += 1
+                            self._last_loss_window = window_id
                         if (self.config.max_consecutive_losses > 0 and
-                                self._consecutive_losses >= self.config.max_consecutive_losses):
+                                self._consecutive_loss_windows >= self.config.max_consecutive_losses):
                             self._circuit_breaker_tripped = True
                             self.log(
-                                f"CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses! "
+                                f"CIRCUIT BREAKER: {self._consecutive_loss_windows} consecutive losing windows! "
                                 f"Trading paused. Investigate before resuming.",
                                 level="error",
                             )
@@ -1642,9 +1652,9 @@ class MomentumSniperStrategy:
         if amp_parts:
             lines.append(f"  Edge Amp: {' | '.join(amp_parts)}")
         if self._circuit_breaker_tripped:
-            lines.append(f"  {Colors.RED}CIRCUIT BREAKER TRIPPED: {self._consecutive_losses} consecutive losses — TRADING PAUSED{Colors.RESET}")
+            lines.append(f"  {Colors.RED}CIRCUIT BREAKER TRIPPED: {self._consecutive_loss_windows} consecutive losing windows — TRADING PAUSED{Colors.RESET}")
         elif self.config.max_consecutive_losses > 0:
-            lines.append(f"  Circuit Breaker: {self._consecutive_losses}/{self.config.max_consecutive_losses} consecutive losses")
+            lines.append(f"  Circuit Breaker: {self._consecutive_loss_windows}/{self.config.max_consecutive_losses} losing windows")
 
         lines.append(f"{'─' * 70}")
 
