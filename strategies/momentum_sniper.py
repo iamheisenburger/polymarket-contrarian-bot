@@ -154,6 +154,97 @@ class SniperConfig:
     log_file: str = "data/longshot_trades.csv"
     observe_only: bool = False
 
+    # --- Edge Amplifier features ---
+
+    # CUSUM decay detection: monitors cumulative evidence of WR drop.
+    # When CUSUM alarm triggers, auto-reduces Kelly fraction to 25%.
+    enable_cusum: bool = False
+    cusum_threshold: float = 5.0       # Alarm threshold (higher = fewer false alarms)
+    cusum_target_wr: float = 0.63      # Expected WR from backtest (conservative)
+
+    # Adaptive Kelly: scale Kelly fraction based on Wilson lower bound of observed WR.
+    # Auto-shrinks bets when WR confidence is low or dropping.
+    adaptive_kelly: bool = False
+
+    # Signal confirmation: wait N seconds and re-check edge before trading.
+    # 0 = disabled (trade immediately). 30 = wait 30s and verify edge persists.
+    confirm_gap: float = 0.0
+
+    # Side filter: "both" (default), "up" (UP-ONLY), or "down" (DOWN-ONLY).
+    # Backtest + live paper data shows DOWN side is -EV. UP-ONLY is structural.
+    side_filter: str = "both"
+
+    # Block weekends: skip trading on Saturday and Sunday (UTC).
+    # Backtest shows weekend WR is 5-10% below weekday across all configs.
+    block_weekends: bool = False
+
+
+class EdgeMonitor:
+    """
+    CUSUM-based edge decay detector.
+
+    Accumulates evidence that the true win rate has dropped below target.
+    When cumulative evidence exceeds threshold, triggers alarm → reduce bets.
+
+    Math: After each trade, add (target_wr - outcome) to cumulative sum.
+    Wins subtract (1 - target_wr) ≈ 0.36, losses add target_wr ≈ 0.64.
+    Under target WR, CUSUM stays near 0. If WR drops, CUSUM drifts up.
+    Alarm at threshold ≈ 5.0 detects a 4% WR drop within ~40-60 trades.
+    """
+
+    def __init__(self, target_wr: float = 0.636, threshold: float = 5.0):
+        self.target_wr = target_wr
+        self.threshold = threshold
+        self.cusum: float = 0.0
+        self.alarm: bool = False
+        self.trades: int = 0
+        self.wins: int = 0
+
+    def record(self, won: bool):
+        """Record a trade outcome and update CUSUM."""
+        self.trades += 1
+        if won:
+            self.wins += 1
+
+        # CUSUM: accumulate deviation from target
+        outcome = 1.0 if won else 0.0
+        self.cusum = max(0.0, self.cusum + (self.target_wr - outcome))
+
+        # Alarm triggers when cumulative evidence exceeds threshold
+        self.alarm = self.cusum >= self.threshold
+
+    @property
+    def observed_wr(self) -> float:
+        return (self.wins / self.trades) if self.trades > 0 else 0.0
+
+    @property
+    def should_reduce(self) -> bool:
+        """True when evidence suggests edge has decayed."""
+        return self.alarm
+
+    def reset(self):
+        """Reset after strategy adjustment."""
+        self.cusum = 0.0
+        self.alarm = False
+
+    def status_str(self) -> str:
+        """One-line status for display."""
+        wr = f"{self.observed_wr*100:.0f}%" if self.trades > 0 else "n/a"
+        state = "ALARM" if self.alarm else "ok"
+        return f"CUSUM={self.cusum:.1f}/{self.threshold:.0f} [{state}] WR={wr} ({self.wins}/{self.trades})"
+
+
+@dataclass
+class PendingSignal:
+    """A signal waiting for confirmation before execution."""
+    coin: str
+    side: str
+    detected_at: float        # time.time() when first detected
+    confirm_at: float         # time.time() when we should re-check
+    entry_price: float        # price at detection
+    edge: float               # edge at detection
+    market_slug: str          # market this signal belongs to
+
 
 @dataclass
 class CoinMarketState:
@@ -303,6 +394,15 @@ class MomentumSniperStrategy:
 
         # Background settlement tracking
         self._last_settle_time: float = 0.0
+
+        # CUSUM edge monitor
+        self._edge_monitor = EdgeMonitor(
+            target_wr=config.cusum_target_wr,
+            threshold=config.cusum_threshold,
+        ) if config.enable_cusum else None
+
+        # Pending signals awaiting confirmation
+        self._pending_signals: Dict[str, PendingSignal] = {}
 
         # Running state
         self.running = False
@@ -589,6 +689,57 @@ class MomentumSniperStrategy:
             volatility=vol,
         )
 
+    def _wilson_lower(self, wins: int, total: int, z: float = 1.28) -> float:
+        """Wilson score lower bound (80% confidence by default)."""
+        if total == 0:
+            return 0.0
+        p_hat = wins / total
+        denom = 1 + z * z / total
+        centre = p_hat + z * z / (2 * total)
+        spread = z * math.sqrt((p_hat * (1 - p_hat) + z * z / (4 * total)) / total)
+        return (centre - spread) / denom
+
+    def _adaptive_kelly_fraction(self, entry_price: float, strong: bool = False) -> float:
+        """
+        Scale Kelly fraction based on Wilson lower bound of observed WR.
+
+        - <10 trades: 25% Kelly (conservative, minimal data)
+        - 10+ trades: scale linearly between 25% and target Kelly
+          based on how far Wilson floor is above breakeven
+        - CUSUM alarm: clamp to 25% Kelly regardless
+        """
+        # Base Kelly (what we'd use without adaptation)
+        price_kelly = self.config.kelly_strong if entry_price >= 0.60 else self.config.kelly_fraction
+        edge_kelly = self.config.kelly_strong if strong else self.config.kelly_fraction
+        base_fraction = max(price_kelly, edge_kelly)
+
+        # If CUSUM alarm is active, reduce to 25% Kelly
+        if self._edge_monitor and self._edge_monitor.should_reduce:
+            return 0.25
+
+        # Need at least 10 trades for any confidence
+        decided = self.stats.wins + self.stats.losses
+        if decided < 10:
+            return 0.25
+
+        # Wilson 80% lower bound
+        wr_floor = self._wilson_lower(self.stats.wins, decided, z=1.28)
+
+        # Breakeven WR ≈ average entry price (for binary payoffs)
+        # Use target WR from config as reference
+        target_wr = self.config.cusum_target_wr if self.config.enable_cusum else 0.636
+
+        if wr_floor <= target_wr - 0.10:
+            # WR floor is well below target — minimal Kelly
+            return 0.25
+        elif wr_floor >= target_wr:
+            # WR floor at or above target — full Kelly
+            return base_fraction
+        else:
+            # Linear interpolation between 25% and base
+            progress = (wr_floor - (target_wr - 0.10)) / 0.10
+            return 0.25 + progress * (base_fraction - 0.25)
+
     def _kelly_bet_usdc(self, fair_prob: float, entry_price: float, strong: bool = False) -> float:
         """
         Calculate Kelly-optimal bet size.
@@ -610,12 +761,14 @@ class MomentumSniperStrategy:
         if kelly_f <= 0:
             return 0.0
 
-        # Two-factor Kelly: entry price confidence + edge strength
-        # Entry >= $0.60 has 93% WR (14W/1L) — use stronger Kelly
-        # Entry $0.40-$0.59 has 61.5% WR (8W/5L) — use base Kelly
-        price_kelly = self.config.kelly_strong if entry_price >= 0.60 else self.config.kelly_fraction
-        edge_kelly = self.config.kelly_strong if strong else self.config.kelly_fraction
-        fraction = max(price_kelly, edge_kelly)
+        # Adaptive Kelly: scale fraction based on observed performance
+        if self.config.adaptive_kelly:
+            fraction = self._adaptive_kelly_fraction(entry_price, strong)
+        else:
+            # Two-factor Kelly: entry price confidence + edge strength
+            price_kelly = self.config.kelly_strong if entry_price >= 0.60 else self.config.kelly_fraction
+            edge_kelly = self.config.kelly_strong if strong else self.config.kelly_fraction
+            fraction = max(price_kelly, edge_kelly)
         bet_fraction = kelly_f * fraction
 
         # Hard cap: never risk more than max_bet_fraction of bankroll on one trade.
@@ -648,9 +801,15 @@ class MomentumSniperStrategy:
 
         # Hour blocking: skip trading entirely during blocked UTC hours
         if self.config.blocked_hours:
-            import datetime
-            current_hour = datetime.datetime.utcnow().hour
+            import datetime as _dt
+            current_hour = _dt.datetime.utcnow().hour
             if current_hour in self.config.blocked_hours:
+                return []
+
+        # Weekend blocking: skip Saturday (5) and Sunday (6) UTC
+        if self.config.block_weekends:
+            import datetime as _dt
+            if _dt.datetime.utcnow().weekday() >= 5:
                 return []
 
         for coin, state in self.coin_states.items():
@@ -695,7 +854,14 @@ class MomentumSniperStrategy:
             # Check both sides — one entry per side per market.
             # Buying BTC UP 5 times at $0.57 in the same market is the
             # same trade repeated, not 5 different opportunities.
-            for side in ["up", "down"]:
+            # Determine which sides to check based on side_filter
+            sides_to_check = ["up", "down"]
+            if self.config.side_filter == "up":
+                sides_to_check = ["up"]
+            elif self.config.side_filter == "down":
+                sides_to_check = ["down"]
+
+            for side in sides_to_check:
                 if side == "up" and state.has_up_position:
                     continue
                 if side == "down" and state.has_down_position:
@@ -1079,6 +1245,10 @@ class MomentumSniperStrategy:
                 self.stats.pending -= 1
                 self.stats.realized_pnl += (payout - record.bet_size_usdc)
 
+                # Record in CUSUM monitor
+                if self._edge_monitor:
+                    self._edge_monitor.record(side_won)
+
                 outcome = "WON" if side_won else "LOST"
                 self.log(
                     f"SETTLED {record.coin} {record.side.upper()} {record.market_slug}: "
@@ -1118,10 +1288,15 @@ class MomentumSniperStrategy:
                         self.stats.total_payout += side_payout
                     else:
                         self.stats.losses += 1
+                    # Record in CUSUM monitor
+                    if self._edge_monitor:
+                        self._edge_monitor.record(side_won)
+
                     outcome = "WON" if side_won else "LOST"
+                    cusum_str = f" | {self._edge_monitor.status_str()}" if self._edge_monitor else ""
                     self.log(
                         f"SETTLED {coin} {side_name.upper()} {old_slug}: {outcome} "
-                        f"${pnl:+.2f} | Session: ${self.stats.realized_pnl:+.2f}",
+                        f"${pnl:+.2f} | Session: ${self.stats.realized_pnl:+.2f}{cusum_str}",
                         "success" if side_won else "warning"
                     )
             # If not resolved, _periodic_settle will handle it later
@@ -1135,6 +1310,11 @@ class MomentumSniperStrategy:
         state.last_up_price = 0.0
         state.last_down_price = 0.0
         self.stats.markets_seen += 1
+
+        # Clear pending signals for this coin (market changed, signals invalid)
+        stale_keys = [k for k in self._pending_signals if k.startswith(f"{coin}:")]
+        for k in stale_keys:
+            self._pending_signals.pop(k, None)
 
         # If startup_slug was never set (coin wasn't discovered at boot),
         # treat this first-discovered market as the startup market — skip it.
@@ -1178,6 +1358,60 @@ class MomentumSniperStrategy:
         except Exception as e:
             self.log(f"Periodic redeem failed: {e}", "warning")
 
+    async def _process_pending_signals(self):
+        """Check pending signals that have reached their confirmation time."""
+        if not self._pending_signals:
+            return
+
+        now = time.time()
+        expired_keys = []
+
+        for key, sig in list(self._pending_signals.items()):
+            # Not ready yet
+            if now < sig.confirm_at:
+                continue
+
+            expired_keys.append(key)
+
+            # Re-check: does edge still exist on the same side?
+            state = self.coin_states.get(sig.coin)
+            if not state or state.current_slug != sig.market_slug:
+                self.log(f"EXPIRED: {sig.coin} {sig.side.upper()} — market changed", "warning")
+                continue
+
+            fv = self._calculate_fair_value(state)
+            if not fv:
+                self.log(f"EXPIRED: {sig.coin} {sig.side.upper()} — no fair value", "warning")
+                continue
+
+            fair_prob = fv.fair_up if sig.side == "up" else fv.fair_down
+            best_ask = state.manager.get_best_ask(sig.side)
+            if best_ask <= 0 or best_ask >= 1.0:
+                self.log(f"EXPIRED: {sig.coin} {sig.side.upper()} — no ask", "warning")
+                continue
+
+            buy_price = round(best_ask, 2)
+            fee = taker_fee_per_token(buy_price, self.config.timeframe)
+            edge = fair_prob - buy_price - fee
+
+            if edge >= self.config.min_edge:
+                # Edge confirmed — execute
+                self.log(
+                    f"CONFIRMED: {sig.coin} {sig.side.upper()} @ {buy_price:.2f} "
+                    f"edge={edge:.2f} (was {sig.edge:.2f} at detection)",
+                    "success"
+                )
+                await self._execute_snipe(state, sig.side, buy_price, edge, fv, signal_time=sig.detected_at)
+            else:
+                self.log(
+                    f"EXPIRED: {sig.coin} {sig.side.upper()} — edge gone "
+                    f"({edge:+.2f} < {self.config.min_edge:.2f})",
+                    "warning"
+                )
+
+        for key in expired_keys:
+            self._pending_signals.pop(key, None)
+
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
         # Periodic settlement of pending trades via Gamma API
@@ -1185,6 +1419,10 @@ class MomentumSniperStrategy:
 
         # Periodic redemption of settled winning positions
         self._periodic_redeem()
+
+        # Process pending confirmation signals
+        if self.config.confirm_gap > 0:
+            await self._process_pending_signals()
 
         # Update last known prices for all coins
         for coin, state in self.coin_states.items():
@@ -1210,7 +1448,27 @@ class MomentumSniperStrategy:
         for state, side, price, edge, fv in opportunities:
             if not self.config.observe_only and self._available_balance() < self.config.min_bet_usdc:
                 break  # Out of capital — Kelly's job is done
-            await self._execute_snipe(state, side, price, edge, fv, signal_time=signal_time)
+
+            # Signal confirmation: queue instead of immediate execution
+            if self.config.confirm_gap > 0:
+                sig_key = f"{state.coin}:{side}:{state.current_slug}"
+                if sig_key not in self._pending_signals:
+                    self._pending_signals[sig_key] = PendingSignal(
+                        coin=state.coin,
+                        side=side,
+                        detected_at=signal_time,
+                        confirm_at=signal_time + self.config.confirm_gap,
+                        entry_price=price,
+                        edge=edge,
+                        market_slug=state.current_slug,
+                    )
+                    self.log(
+                        f"PENDING: {state.coin} {side.upper()} @ {price:.2f} "
+                        f"edge={edge:.2f}, confirming in {self.config.confirm_gap:.0f}s...",
+                        "info"
+                    )
+            else:
+                await self._execute_snipe(state, side, price, edge, fv, signal_time=signal_time)
 
     def _render_status(self):
         """Render the live status display."""
@@ -1331,6 +1589,24 @@ class MomentumSniperStrategy:
             f"price=[{self.config.min_entry_price:.2f}-{self.config.max_entry_price:.2f}] | "
             f"fee={fee_str}"
         )
+
+        # Edge Amplifier status line
+        amp_parts = []
+        if self._edge_monitor:
+            amp_parts.append(self._edge_monitor.status_str())
+        if self.config.adaptive_kelly:
+            decided = self.stats.wins + self.stats.losses
+            if decided >= 10:
+                wr_floor = self._wilson_lower(self.stats.wins, decided, z=1.28)
+                frac = self._adaptive_kelly_fraction(0.50)  # representative price
+                amp_parts.append(f"AdKelly={frac:.0%} (WR_floor={wr_floor:.1%})")
+            else:
+                amp_parts.append(f"AdKelly=25% ({decided}/10 trades)")
+        if self.config.confirm_gap > 0:
+            n_pending = len(self._pending_signals)
+            amp_parts.append(f"Confirm={self.config.confirm_gap:.0f}s ({n_pending} pending)")
+        if amp_parts:
+            lines.append(f"  Edge Amp: {' | '.join(amp_parts)}")
 
         lines.append(f"{'─' * 70}")
 

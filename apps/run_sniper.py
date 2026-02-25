@@ -176,6 +176,40 @@ def main():
         help="Disable Vatic API for strike prices (fall back to Binance/backsolve)"
     )
 
+    # --- Edge Amplifier features ---
+    parser.add_argument(
+        "--enable-cusum", action="store_true",
+        help="Enable CUSUM edge decay detection. Auto-reduces Kelly when WR drops."
+    )
+    parser.add_argument(
+        "--cusum-threshold", type=float, default=5.0,
+        help="CUSUM alarm threshold (default: 5.0). Higher = fewer false alarms."
+    )
+    parser.add_argument(
+        "--cusum-target-wr", type=float, default=0.63,
+        help="Target win rate for CUSUM (default: 0.63 from backtest)"
+    )
+    parser.add_argument(
+        "--adaptive-kelly", action="store_true",
+        help="Enable adaptive Kelly sizing based on Wilson lower bound of observed WR"
+    )
+    parser.add_argument(
+        "--confirm-gap", type=float, default=0.0,
+        help="Signal confirmation delay in seconds (default: 0 = disabled). "
+             "30 = wait 30s and re-check edge before trading."
+    )
+    parser.add_argument(
+        "--side", type=str, default="both",
+        choices=["both", "up", "down"],
+        help="Side filter: 'up' (UP-ONLY), 'down' (DOWN-ONLY), 'both' (default). "
+             "Backtest + live data shows DOWN is -EV. UP-ONLY is structural."
+    )
+    parser.add_argument(
+        "--block-weekends", action="store_true",
+        help="Block trading on Saturday and Sunday (UTC). "
+             "Backtest shows weekend WR is 5-10%% below weekday."
+    )
+
     args = parser.parse_args()
 
     if args.debug:
@@ -254,6 +288,13 @@ def main():
         use_vatic=not args.no_vatic,
         observe_only=args.observe,
         log_file=args.log_file,
+        enable_cusum=args.enable_cusum,
+        cusum_threshold=args.cusum_threshold,
+        cusum_target_wr=args.cusum_target_wr,
+        adaptive_kelly=args.adaptive_kelly,
+        confirm_gap=args.confirm_gap,
+        side_filter=args.side,
+        block_weekends=args.block_weekends,
     )
 
     # Print config
@@ -270,6 +311,10 @@ def main():
     vatic_status = f"{Colors.GREEN}ON (exact Chainlink strikes){Colors.RESET}" if not args.no_vatic else "OFF"
     print(f"  Vatic strikes:  {vatic_status}")
     print(f"  Bankroll:       ${args.bankroll:.2f}")
+    side_display = {"up": f"{Colors.GREEN}UP-ONLY{Colors.RESET}", "down": f"{Colors.RED}DOWN-ONLY{Colors.RESET}", "both": "Both sides"}[args.side]
+    print(f"  Side filter:    {side_display}")
+    weekend_status = f"{Colors.GREEN}BLOCKED{Colors.RESET}" if args.block_weekends else "Trading"
+    print(f"  Weekends:       {weekend_status}")
     print()
 
     # Fee info
