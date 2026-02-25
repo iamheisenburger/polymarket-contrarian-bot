@@ -157,6 +157,11 @@ def main():
              "600 = wait 10 min into 15m window (5 min left)."
     )
     parser.add_argument(
+        "--max-window-elapsed", type=float, default=0,
+        help="Max seconds into the window to enter (default: 0 = disabled). "
+             "180 = stop entering after 180s (120s left in 5m window)."
+    )
+    parser.add_argument(
         "--market-check-interval", type=float, default=30.0,
         help="Seconds between market polls (default: 30). Use 10 for 5m late-entry."
     )
@@ -243,6 +248,7 @@ def main():
         momentum_lookback=args.momentum_lookback,
         min_fair_value=args.min_fair_value,
         min_window_elapsed=args.min_window_elapsed,
+        max_window_elapsed=args.max_window_elapsed,
         market_check_interval=args.market_check_interval,
         price_source=args.price_source,
         use_vatic=not args.no_vatic,

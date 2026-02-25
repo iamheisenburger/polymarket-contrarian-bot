@@ -130,6 +130,11 @@ class SniperConfig:
     # Forces the bot to wait for the trend to establish before entering.
     min_window_elapsed: float = 0
 
+    # Max entry: maximum seconds elapsed in the window to consider trades.
+    # 0 = disabled (enter until expiry). 180 = stop entering after 180s (120s left in 5m).
+    # Prevents late entries where latency arbitrage has disappeared.
+    max_window_elapsed: float = 0
+
     # Price thresholds (structural, not risk limits)
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
@@ -666,6 +671,13 @@ class MomentumSniperStrategy:
             if self.config.min_window_elapsed > 0 and state.market_start_time > 0:
                 elapsed = time.time() - state.market_start_time
                 if elapsed < self.config.min_window_elapsed:
+                    continue
+
+            # Max entry filter: stop entering after this many seconds.
+            # Prevents late entries where latency arbitrage has disappeared.
+            if self.config.max_window_elapsed > 0 and state.market_start_time > 0:
+                elapsed = time.time() - state.market_start_time
+                if elapsed > self.config.max_window_elapsed:
                     continue
 
             # Volatility filter: only trade in low-vol regimes.
@@ -1307,6 +1319,10 @@ class MomentumSniperStrategy:
             filters += f" | mom>{self.config.min_momentum:.2%}"
         if self.config.min_fair_value > 0.50:
             filters += f" | FV>={self.config.min_fair_value:.2f}"
+        if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
+            lo = f"{self.config.min_window_elapsed:.0f}" if self.config.min_window_elapsed > 0 else "0"
+            hi = f"{self.config.max_window_elapsed:.0f}" if self.config.max_window_elapsed > 0 else "end"
+            filters += f" | entry=[{lo}-{hi}]s"
         fee_rate = TAKER_FEE_RATES.get(self.config.timeframe, 0.0)
         fee_str = "none" if fee_rate == 0 else f"{fee_rate*25:.2f}%@50c"
         lines.append(
