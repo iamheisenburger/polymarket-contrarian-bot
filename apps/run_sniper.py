@@ -135,6 +135,11 @@ def main():
         help="Max volatility to trade (e.g. 0.50). 0 = disabled (default)"
     )
     parser.add_argument(
+        "--fixed-vol", type=float, default=0.0,
+        help="Fixed volatility for FV calculation (e.g. 0.30 = 30%%). "
+             "Overrides dynamic IV/RV. 0 = use dynamic (default)"
+    )
+    parser.add_argument(
         "--min-momentum", type=float, default=0.0,
         help="Min Binance price move in trade direction (e.g. 0.0005 = 0.05%%). 0 = disabled (default)"
     )
@@ -233,6 +238,7 @@ def main():
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
         max_volatility=args.max_vol,
+        fixed_volatility=args.fixed_vol,
         min_momentum=args.min_momentum,
         momentum_lookback=args.momentum_lookback,
         min_fair_value=args.min_fair_value,

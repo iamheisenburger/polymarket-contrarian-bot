@@ -108,6 +108,11 @@ class SniperConfig:
     # Set to 0.0 to disable.
     max_volatility: float = 0.50
 
+    # Fixed volatility: override dynamic IV/RV with a constant value for FV calc.
+    # Backtest shows vol=30% gives best trade selection (67% WR on 395 trades).
+    # Set to 0.0 to use dynamic Deribit IV / Binance RV (default).
+    fixed_volatility: float = 0.0
+
     # Momentum filter: minimum Binance price change (fraction) in trade direction
     # over the lookback period. 0.0005 = 0.05%. Set to 0.0 to disable.
     min_momentum: float = 0.0005
@@ -542,12 +547,16 @@ class MomentumSniperStrategy:
         Get best available volatility estimate for a coin.
 
         Priority:
+        0. Fixed volatility override (for backtest-matched operation)
         1. Deribit implied vol (forward-looking, market consensus)
         2. Binance realized vol (backward-looking, from tick data)
 
         Uses max(deribit_iv, realized_vol) for conservative estimate.
-        Returns (vol, source) where source is "IV" or "RV".
+        Returns (vol, source) where source is "FIXED", "IV", or "RV".
         """
+        if self.config.fixed_volatility > 0:
+            return (self.config.fixed_volatility, "FIXED")
+
         deribit_vol = None
         if self._deribit_feed:
             deribit_vol = self._deribit_feed.get_implied_vol(coin)
@@ -1290,7 +1299,9 @@ class MomentumSniperStrategy:
             sizing = f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
         # Build filters string
         filters = f"edge>={self.config.min_edge:.0%}"
-        if self.config.max_volatility > 0:
+        if self.config.fixed_volatility > 0:
+            filters += f" | vol=FIXED {self.config.fixed_volatility:.0%}"
+        elif self.config.max_volatility > 0:
             filters += f" | vol<{self.config.max_volatility:.2f}"
         if self.config.min_momentum > 0:
             filters += f" | mom>{self.config.min_momentum:.2%}"
