@@ -209,6 +209,11 @@ def main():
         help="Block trading on Saturday and Sunday (UTC). "
              "Backtest shows weekend WR is 5-10%% below weekday."
     )
+    parser.add_argument(
+        "--max-consecutive-losses", type=int, default=0,
+        help="Circuit breaker: pause trading after N consecutive losses. "
+             "At 69%% WR, 5 in a row = 0.29%% chance. 0 = disabled (default)."
+    )
 
     args = parser.parse_args()
 
@@ -295,6 +300,7 @@ def main():
         confirm_gap=args.confirm_gap,
         side_filter=args.side,
         block_weekends=args.block_weekends,
+        max_consecutive_losses=args.max_consecutive_losses,
     )
 
     # Print config

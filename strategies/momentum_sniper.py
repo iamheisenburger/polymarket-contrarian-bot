@@ -178,6 +178,11 @@ class SniperConfig:
     # Backtest shows weekend WR is 5-10% below weekday across all configs.
     block_weekends: bool = False
 
+    # Circuit breaker: pause trading after N consecutive losses.
+    # At 69% WR, 5 in a row = 0.29% chance. Protects bankroll from zeroing.
+    # 0 = disabled. Bot logs CIRCUIT BREAKER and stops placing new trades.
+    max_consecutive_losses: int = 0
+
 
 class EdgeMonitor:
     """
@@ -403,6 +408,10 @@ class MomentumSniperStrategy:
 
         # Pending signals awaiting confirmation
         self._pending_signals: Dict[str, PendingSignal] = {}
+
+        # Circuit breaker: consecutive loss tracking
+        self._consecutive_losses: int = 0
+        self._circuit_breaker_tripped: bool = False
 
         # Running state
         self.running = False
@@ -798,6 +807,10 @@ class MomentumSniperStrategy:
         sorted by edge descending (best opportunity first).
         """
         opportunities = []
+
+        # Circuit breaker: stop trading after N consecutive losses
+        if self._circuit_breaker_tripped:
+            return []
 
         # Hour blocking: skip trading entirely during blocked UTC hours
         if self.config.blocked_hours:
@@ -1240,8 +1253,19 @@ class MomentumSniperStrategy:
                 if side_won:
                     self.stats.wins += 1
                     self.stats.total_payout += payout
+                    self._consecutive_losses = 0  # Reset streak on win
                 else:
                     self.stats.losses += 1
+                    self._consecutive_losses += 1
+                    # Circuit breaker check
+                    if (self.config.max_consecutive_losses > 0 and
+                            self._consecutive_losses >= self.config.max_consecutive_losses):
+                        self._circuit_breaker_tripped = True
+                        self.log(
+                            f"CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses! "
+                            f"Trading paused. Investigate before resuming.",
+                            level="error",
+                        )
                 self.stats.pending -= 1
                 self.stats.realized_pnl += (payout - record.bet_size_usdc)
 
@@ -1286,8 +1310,18 @@ class MomentumSniperStrategy:
                     if side_won:
                         self.stats.wins += 1
                         self.stats.total_payout += side_payout
+                        self._consecutive_losses = 0  # Reset streak on win
                     else:
                         self.stats.losses += 1
+                        self._consecutive_losses += 1
+                        if (self.config.max_consecutive_losses > 0 and
+                                self._consecutive_losses >= self.config.max_consecutive_losses):
+                            self._circuit_breaker_tripped = True
+                            self.log(
+                                f"CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses! "
+                                f"Trading paused. Investigate before resuming.",
+                                level="error",
+                            )
                     # Record in CUSUM monitor
                     if self._edge_monitor:
                         self._edge_monitor.record(side_won)
@@ -1607,6 +1641,10 @@ class MomentumSniperStrategy:
             amp_parts.append(f"Confirm={self.config.confirm_gap:.0f}s ({n_pending} pending)")
         if amp_parts:
             lines.append(f"  Edge Amp: {' | '.join(amp_parts)}")
+        if self._circuit_breaker_tripped:
+            lines.append(f"  {Colors.RED}CIRCUIT BREAKER TRIPPED: {self._consecutive_losses} consecutive losses — TRADING PAUSED{Colors.RESET}")
+        elif self.config.max_consecutive_losses > 0:
+            lines.append(f"  Circuit Breaker: {self._consecutive_losses}/{self.config.max_consecutive_losses} consecutive losses")
 
         lines.append(f"{'─' * 70}")
 
