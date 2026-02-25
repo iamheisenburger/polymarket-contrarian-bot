@@ -34,6 +34,7 @@ Usage:
 """
 
 import asyncio
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -348,6 +349,16 @@ class MomentumSniperStrategy:
         self.bot = bot
         self.config = config
 
+        # Event logger — clean, deduplicated log (no terminal escape codes)
+        self._event_logger = logging.getLogger("sniper.events")
+        self._event_logger.setLevel(logging.INFO)
+        if not self._event_logger.handlers:
+            log_path = config.log_file.replace(".csv", ".events.log") if config.log_file else "data/sniper.events.log"
+            fh = logging.FileHandler(log_path)
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self._event_logger.addHandler(fh)
+            self._event_logger.propagate = False
+
         # Fair value calculator
         self.fv_calc = BinaryFairValue()
 
@@ -420,6 +431,10 @@ class MomentumSniperStrategy:
 
     def log(self, msg: str, level: str = "info"):
         self._log_buffer.add(msg, level)
+        # Write to clean event log (no duplicates from status redraws)
+        log_fn = {"error": self._event_logger.error, "warning": self._event_logger.warning,
+                   "success": self._event_logger.info}.get(level, self._event_logger.info)
+        log_fn(msg)
 
     def _resolve_orphaned_trades(self):
         """Resolve pending trades from previous sessions via Gamma API."""
