@@ -150,6 +150,8 @@ class SniperConfig:
 
     # Vatic API: use exact Chainlink strike prices instead of Binance approximation
     use_vatic: bool = True
+    # Require Vatic strike — skip market entirely if Vatic fails (no Binance/backsolve fallback)
+    require_vatic: bool = False
 
     # Logging
     log_file: str = "data/longshot_trades.csv"
@@ -618,6 +620,14 @@ class MomentumSniperStrategy:
                 state.strike_price = vatic_strike
                 strike_source = "vatic"
                 self.log(f"{state.coin} strike from Vatic (exact Chainlink)")
+
+        # If require_vatic is set and Vatic failed, skip this market entirely
+        # (Binance/backsolve strikes can be wrong, especially near the money)
+        if strike_source == "unknown" and self.config.require_vatic:
+            self.log(f"{state.coin} Vatic strike unavailable — skipping market (require_vatic=True)", "warning")
+            state.strike_price = 0
+            state._strike_source = "skipped"
+            return
 
         # 2. Binance spot early in window
         if strike_source == "unknown" and secs_since_window_open < 60:
@@ -1109,7 +1119,8 @@ class MomentumSniperStrategy:
         # Only track position if order was accepted AND filled
         order_status = (result.status or "").upper()
         if result.success and order_status not in ("LIVE", "OPEN"):
-            actual_cost = buy_price * num_tokens
+            fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
+            actual_cost = (buy_price + fee_per_token) * num_tokens
 
             # Immediately deduct from balance so next Kelly calculation
             # sees the correct available capital (no stale balance)

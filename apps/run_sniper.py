@@ -175,6 +175,10 @@ def main():
         "--no-vatic", action="store_true",
         help="Disable Vatic API for strike prices (fall back to Binance/backsolve)"
     )
+    parser.add_argument(
+        "--require-vatic", action="store_true",
+        help="Require Vatic strike — skip market entirely if Vatic fails (no fallback)"
+    )
 
     # --- Edge Amplifier features ---
     parser.add_argument(
@@ -291,6 +295,7 @@ def main():
         market_check_interval=args.market_check_interval,
         price_source=args.price_source,
         use_vatic=not args.no_vatic,
+        require_vatic=args.require_vatic,
         observe_only=args.observe,
         log_file=args.log_file,
         enable_cusum=args.enable_cusum,
