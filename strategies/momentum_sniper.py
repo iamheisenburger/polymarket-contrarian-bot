@@ -866,6 +866,13 @@ class MomentumSniperStrategy:
             if state.seconds_to_expiry() <= 0:
                 continue
 
+            # Retry Vatic if strike was not set (Vatic may not have had the
+            # target ready at market discovery time — retry each scan cycle)
+            if state.strike_price <= 0 and self.config.require_vatic and self._vatic:
+                self._set_strike(state)
+                if state.strike_price <= 0:
+                    continue  # Still no strike — skip this cycle
+
             # Late/max entry filter using REAL market time (not discovery time).
             # Bug fix: previously used time.time() - market_start_time which drifts
             # when market is discovered late, causing entries before min TTE.
