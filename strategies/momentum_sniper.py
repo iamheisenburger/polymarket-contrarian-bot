@@ -173,9 +173,16 @@ class SniperConfig:
     # 0 = disabled (trade immediately). 30 = wait 30s and verify edge persists.
     confirm_gap: float = 0.0
 
-    # Side filter: "both" (default), "up" (UP-ONLY), or "down" (DOWN-ONLY).
-    # Backtest + live paper data shows DOWN side is -EV. UP-ONLY is structural.
+    # Side filter: "both" (default), "up" (UP-ONLY), "down" (DOWN-ONLY),
+    # or "trend" (EMA-directed — trade UP when bullish, DOWN when bearish).
+    # "trend" requires ema_fast and ema_slow to be set.
     side_filter: str = "both"
+
+    # EMA trend detection: fast/slow EMA crossover on 5-minute prices.
+    # EMA fast > slow = bullish (trade UP), fast < slow = bearish (trade DOWN).
+    # Periods are in 5-minute candles: 6 = 30min, 24 = 2hr.
+    ema_fast: int = 6
+    ema_slow: int = 24
 
     # Block weekends: skip trading on Saturday and Sunday (UTC).
     # Backtest shows weekend WR is 5-10% below weekday across all configs.
@@ -240,6 +247,109 @@ class EdgeMonitor:
         wr = f"{self.observed_wr*100:.0f}%" if self.trades > 0 else "n/a"
         state = "ALARM" if self.alarm else "ok"
         return f"CUSUM={self.cusum:.1f}/{self.threshold:.0f} [{state}] WR={wr} ({self.wins}/{self.trades})"
+
+
+class EMATracker:
+    """
+    EMA crossover trend detector per coin.
+
+    On startup, fetches historical 5m klines from Binance to warm up EMAs
+    immediately (no cold-start delay). Then updates on each new market
+    window with the Vatic strike price (= exact Chainlink open).
+
+    EMA fast > slow = bullish → trade UP.
+    EMA fast < slow = bearish → trade DOWN.
+    """
+
+    def __init__(self, fast_period: int = 6, slow_period: int = 24):
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        self._alpha_fast = 2.0 / (fast_period + 1)
+        self._alpha_slow = 2.0 / (slow_period + 1)
+        self._ema_fast: Dict[str, float] = {}
+        self._ema_slow: Dict[str, float] = {}
+        self._valid: Dict[str, bool] = {}
+        self._last_update_slug: Dict[str, str] = {}  # prevent double-updates
+        self._logger = logging.getLogger("sniper.ema")
+
+    def initialize(self, coin: str) -> bool:
+        """Fetch historical 5m klines from Binance and compute initial EMAs."""
+        import requests as _req
+        symbol = f"{coin.upper()}USDT"
+        limit = self.slow_period * 3
+        try:
+            resp = _req.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": symbol, "interval": "5m", "limit": limit},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                self._logger.warning(f"Binance klines {resp.status_code} for {coin}")
+                self._valid[coin] = False
+                return False
+
+            klines = resp.json()
+            closes = [float(k[4]) for k in klines]  # k[4] = close price
+
+            if len(closes) < self.slow_period:
+                self._valid[coin] = False
+                return False
+
+            # Compute EMAs from historical data
+            ema_fast = closes[0]
+            ema_slow = closes[0]
+            for price in closes[1:]:
+                ema_fast = self._alpha_fast * price + (1 - self._alpha_fast) * ema_fast
+                ema_slow = self._alpha_slow * price + (1 - self._alpha_slow) * ema_slow
+
+            self._ema_fast[coin] = ema_fast
+            self._ema_slow[coin] = ema_slow
+            self._valid[coin] = True
+            return True
+
+        except Exception as e:
+            self._logger.warning(f"EMA init failed for {coin}: {e}")
+            self._valid[coin] = False
+            return False
+
+    def update(self, coin: str, price: float, slug: str = ""):
+        """Update EMAs with a new price observation (once per market window)."""
+        if slug and slug == self._last_update_slug.get(coin):
+            return  # Already updated for this market window
+        if slug:
+            self._last_update_slug[coin] = slug
+
+        if coin not in self._ema_fast:
+            self._ema_fast[coin] = price
+            self._ema_slow[coin] = price
+            return
+
+        self._ema_fast[coin] = (
+            self._alpha_fast * price + (1 - self._alpha_fast) * self._ema_fast[coin]
+        )
+        self._ema_slow[coin] = (
+            self._alpha_slow * price + (1 - self._alpha_slow) * self._ema_slow[coin]
+        )
+
+    def is_bullish(self, coin: str) -> bool:
+        """True if EMA fast > EMA slow (uptrend)."""
+        if coin not in self._ema_fast:
+            return True  # Default bullish if no data
+        return self._ema_fast[coin] > self._ema_slow[coin]
+
+    def is_valid(self, coin: str) -> bool:
+        """True if enough data to trust EMA signals."""
+        return self._valid.get(coin, False)
+
+    def trend_str(self, coin: str) -> str:
+        """One-line status for display."""
+        if not self.is_valid(coin):
+            return "EMA: warmup"
+        fast = self._ema_fast.get(coin, 0)
+        slow = self._ema_slow.get(coin, 0)
+        direction = "BULL" if fast > slow else "BEAR"
+        spread_pct = ((fast - slow) / slow * 100) if slow > 0 else 0
+        return f"EMA({self.fast_period},{self.slow_period}): {direction} ({spread_pct:+.3f}%)"
 
 
 @dataclass
@@ -390,6 +500,14 @@ class MomentumSniperStrategy:
             except Exception:
                 pass
 
+        # EMA trend tracker (initialized in start() with historical data)
+        self._ema_tracker: Optional[EMATracker] = None
+        if config.side_filter == "trend":
+            self._ema_tracker = EMATracker(
+                fast_period=config.ema_fast,
+                slow_period=config.ema_slow,
+            )
+
         # Per-coin market managers
         self.coin_states: Dict[str, CoinMarketState] = {}
 
@@ -520,6 +638,16 @@ class MomentumSniperStrategy:
         for coin in self.config.coins:
             price = self.binance.get_price(coin)
             self.log(f"Binance {coin}: ${price:,.2f}", "success")
+
+        # Initialize EMA trend tracker from historical Binance klines
+        if self._ema_tracker:
+            for coin in self.config.coins:
+                ok = self._ema_tracker.initialize(coin)
+                trend = self._ema_tracker.trend_str(coin)
+                if ok:
+                    self.log(f"{coin} {trend}", "success")
+                else:
+                    self.log(f"{coin} EMA init failed — will warm up from live strikes", "warning")
 
         # Check USDC balance
         self._refresh_balance()
@@ -659,6 +787,10 @@ class MomentumSniperStrategy:
         # Store strike source for trade logging
         state._strike_source = strike_source
 
+        # Update EMA tracker with new strike (once per market window)
+        if self._ema_tracker and state.strike_price > 0 and strike_source != "skipped":
+            self._ema_tracker.update(state.coin, state.strike_price, state.current_slug)
+
         # Format strike with appropriate precision
         if state.strike_price < 10:
             strike_str = f"${state.strike_price:,.4f}"
@@ -666,9 +798,10 @@ class MomentumSniperStrategy:
             strike_str = f"${state.strike_price:,.2f}"
         else:
             strike_str = f"${state.strike_price:,.0f}"
+        ema_str = f" | {self._ema_tracker.trend_str(state.coin)}" if self._ema_tracker else ""
         self.log(
             f"{state.coin} strike: {strike_str} [{strike_source}] | "
-            f"expiry: {state.seconds_to_expiry():.0f}s"
+            f"expiry: {state.seconds_to_expiry():.0f}s{ema_str}"
         )
 
     @staticmethod
@@ -909,6 +1042,13 @@ class MomentumSniperStrategy:
                 sides_to_check = ["up"]
             elif self.config.side_filter == "down":
                 sides_to_check = ["down"]
+            elif self.config.side_filter == "trend" and self._ema_tracker:
+                if not self._ema_tracker.is_valid(coin):
+                    continue  # EMA not warmed up yet — skip this coin
+                if self._ema_tracker.is_bullish(coin):
+                    sides_to_check = ["up"]
+                else:
+                    sides_to_check = ["down"]
 
             for side in sides_to_check:
                 if side == "up" and state.has_up_position:
@@ -1690,6 +1830,13 @@ class MomentumSniperStrategy:
             lines.append(f"  {Colors.RED}CIRCUIT BREAKER TRIPPED: {self._consecutive_loss_windows} consecutive losing windows — TRADING PAUSED{Colors.RESET}")
         elif self.config.max_consecutive_losses > 0:
             lines.append(f"  Circuit Breaker: {self._consecutive_loss_windows}/{self.config.max_consecutive_losses} losing windows")
+
+        # EMA trend status
+        if self._ema_tracker:
+            ema_parts = []
+            for coin in self.config.coins:
+                ema_parts.append(f"{coin}: {self._ema_tracker.trend_str(coin)}")
+            lines.append(f"  Trend: {' | '.join(ema_parts)}")
 
         lines.append(f"{'─' * 70}")
 

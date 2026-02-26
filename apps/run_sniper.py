@@ -204,9 +204,17 @@ def main():
     )
     parser.add_argument(
         "--side", type=str, default="both",
-        choices=["both", "up", "down"],
-        help="Side filter: 'up' (UP-ONLY), 'down' (DOWN-ONLY), 'both' (default). "
-             "Backtest + live data shows DOWN is -EV. UP-ONLY is structural."
+        choices=["both", "up", "down", "trend"],
+        help="Side filter: 'up' (UP-ONLY), 'down' (DOWN-ONLY), 'both' (default), "
+             "'trend' (EMA-directed — trade UP when bullish, DOWN when bearish)."
+    )
+    parser.add_argument(
+        "--ema-fast", type=int, default=6,
+        help="EMA fast period in 5m candles (default: 6 = 30min). Only used with --side trend."
+    )
+    parser.add_argument(
+        "--ema-slow", type=int, default=24,
+        help="EMA slow period in 5m candles (default: 24 = 2hr). Only used with --side trend."
     )
     parser.add_argument(
         "--block-weekends", action="store_true",
@@ -304,6 +312,8 @@ def main():
         adaptive_kelly=args.adaptive_kelly,
         confirm_gap=args.confirm_gap,
         side_filter=args.side,
+        ema_fast=args.ema_fast,
+        ema_slow=args.ema_slow,
         block_weekends=args.block_weekends,
         max_consecutive_losses=args.max_consecutive_losses,
     )
@@ -322,7 +332,13 @@ def main():
     vatic_status = f"{Colors.GREEN}ON (exact Chainlink strikes){Colors.RESET}" if not args.no_vatic else "OFF"
     print(f"  Vatic strikes:  {vatic_status}")
     print(f"  Bankroll:       ${args.bankroll:.2f}")
-    side_display = {"up": f"{Colors.GREEN}UP-ONLY{Colors.RESET}", "down": f"{Colors.RED}DOWN-ONLY{Colors.RESET}", "both": "Both sides"}[args.side]
+    side_displays = {
+        "up": f"{Colors.GREEN}UP-ONLY{Colors.RESET}",
+        "down": f"{Colors.RED}DOWN-ONLY{Colors.RESET}",
+        "both": "Both sides",
+        "trend": f"{Colors.CYAN}EMA TREND ({args.ema_fast},{args.ema_slow}){Colors.RESET}",
+    }
+    side_display = side_displays.get(args.side, args.side)
     print(f"  Side filter:    {side_display}")
     weekend_status = f"{Colors.GREEN}BLOCKED{Colors.RESET}" if args.block_weekends else "Trading"
     print(f"  Weekends:       {weekend_status}")
