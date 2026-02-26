@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Cache: asset -> (expire_ts, targets_list)
 _cache: Dict[str, Tuple[float, list]] = {}
 CACHE_TTL = 30  # 30 seconds — must be short so new 5m markets get fresh data
+NEGATIVE_CACHE_TTL = 10  # Cache failures for 10s to avoid hammering API
 
 
 class VaticClient:
@@ -136,17 +137,31 @@ class VaticClient:
                 params={"asset": asset},
                 timeout=10,
             )
+            if resp.status_code == 429:
+                logger.warning(f"Vatic API rate limited for {asset}")
+                _cache[asset] = (now + NEGATIVE_CACHE_TTL, [])
+                return None
             if resp.status_code != 200:
                 logger.warning(f"Vatic API returned {resp.status_code} for {asset}")
+                _cache[asset] = (now + NEGATIVE_CACHE_TTL, [])
                 return None
 
             data = resp.json()
             targets = data.get("results", [])
 
+            # Filter out targets where ok=false (e.g. "Too Many Requests")
+            ok_targets = [t for t in targets if t.get("ok", True) is not False]
+
+            if not ok_targets:
+                # All targets errored — negative cache
+                _cache[asset] = (now + NEGATIVE_CACHE_TTL, [])
+                return None
+
             # Cache successful response
-            _cache[asset] = (now + CACHE_TTL, targets)
-            return targets
+            _cache[asset] = (now + CACHE_TTL, ok_targets)
+            return ok_targets
 
         except Exception as e:
             logger.warning(f"Vatic API error for {asset}: {e}")
+            _cache[asset] = (now + NEGATIVE_CACHE_TTL, [])
             return None
