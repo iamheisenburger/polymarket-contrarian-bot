@@ -4,7 +4,7 @@ source .env
 export POLYMARKET_API_KEY POLYMARKET_SECRET POLYMARKET_PASSPHRASE
 export PRIVATE_KEY SAFE_ADDRESS RPC_URL
 
-# ETH/SOL/XRP PAPER — V3 EMA Trend config (observe mode)
+# ETH/SOL/XRP PAPER — V4 EMA Trend config (observe mode)
 # Same config as live but --observe. Collecting data for validation.
 nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py \
   --coins ETH SOL XRP \
@@ -13,7 +13,7 @@ nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py \
   --market-check-interval 10 \
   --min-edge 0.02 --min-entry-price 0.30 --max-entry-price 0.90 \
   --min-fair-value 0.65 --min-momentum 0 --fixed-vol 0.15 \
-  --side trend --ema-fast 6 --ema-slow 24 \
+  --side trend --ema-fast 4 --ema-slow 16 \
   --block-weekends \
   --require-vatic \
   --enable-cusum --cusum-target-wr 0.63 --adaptive-kelly \
