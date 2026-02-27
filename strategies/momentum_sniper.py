@@ -193,6 +193,10 @@ class SniperConfig:
     # 0 = disabled. Bot logs CIRCUIT BREAKER and stops placing new trades.
     max_consecutive_losses: int = 0
 
+    # Balance floor: stop trading if USDC balance drops below this amount.
+    # Preserves capital instead of bleeding to zero. 0 = disabled.
+    balance_floor: float = 0.0
+
 
 class EdgeMonitor:
     """
@@ -1217,6 +1221,10 @@ class MomentumSniperStrategy:
             if bet_usdc < 1.0:
                 return False
             if bet_usdc > self._available_balance():
+                return False
+            # Balance floor: preserve capital
+            if self.config.balance_floor > 0 and self._available_balance() - bet_usdc < self.config.balance_floor:
+                self.log(f"BALANCE FLOOR: ${self._available_balance():.2f} - ${bet_usdc:.2f} would drop below ${self.config.balance_floor:.2f} floor. Skipping.", "warning")
                 return False
 
         if num_tokens < 5.0:

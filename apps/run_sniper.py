@@ -226,6 +226,11 @@ def main():
         help="Circuit breaker: pause trading after N consecutive losses. "
              "At 69%% WR, 5 in a row = 0.29%% chance. 0 = disabled (default)."
     )
+    parser.add_argument(
+        "--balance-floor", type=float, default=0.0,
+        help="Stop trading if balance would drop below this amount. "
+             "Preserves capital. 0 = disabled (default)."
+    )
 
     args = parser.parse_args()
 
@@ -316,6 +321,7 @@ def main():
         ema_slow=args.ema_slow,
         block_weekends=args.block_weekends,
         max_consecutive_losses=args.max_consecutive_losses,
+        balance_floor=args.balance_floor,
     )
 
     # Print config
