@@ -5,11 +5,12 @@ export POLYMARKET_API_KEY POLYMARKET_SECRET POLYMARKET_PASSPHRASE
 export PRIVATE_KEY SAFE_ADDRESS RPC_URL
 rm -f data/*.pending.json
 
-# BTC LIVE — V4 EMA Trend config
+# BTC/ETH/SOL LIVE — V4 EMA Trend config
 # EMA(4,16) directs trade side: bullish → UP, bearish → DOWN
-# Backtest: 81.2% WR OOS, +1.1% margin, beats EMA(6,24) by $0.28/day
+# BTC: backtest proven. ETH/SOL: paper 69%/66% WR, deployed live Feb 27.
+# XRP excluded: 55% WR = below breakeven.
 nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py \
-  --coins BTC \
+  --coins BTC ETH SOL \
   --timeframe 5m \
   --min-window-elapsed 120 --max-window-elapsed 210 \
   --market-check-interval 10 \
@@ -24,4 +25,4 @@ nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py \
   --log-file data/late_sniper_5m.csv \
   >> /var/log/late-sniper-5m.log 2>&1 &
 
-echo "BTC live PID: $!"
+echo "BTC/ETH/SOL live PID: $!"
