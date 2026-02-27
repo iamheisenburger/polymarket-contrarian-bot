@@ -10,7 +10,7 @@ nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py \
   --timeframe 5m \
   --min-window-elapsed 120 --max-window-elapsed 210 \
   --market-check-interval 10 \
-  --min-edge 0.02 --min-entry-price 0.30 --max-entry-price 0.70 \
+  --min-edge 0.02 --min-entry-price 0.30 --max-entry-price 0.65 \
   --min-fair-value 0.65 --min-momentum 0 --fixed-vol 0.15 \
   --side trend --ema-fast 4 --ema-slow 16 \
   --block-weekends \
