@@ -238,7 +238,7 @@ def main():
         logging.basicConfig(level=logging.DEBUG)
 
     # Validate coins
-    valid_coins = ["BTC", "ETH", "SOL", "XRP"]
+    valid_coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"]
     coins = [c.upper() for c in args.coins]
     for c in coins:
         if c not in valid_coins:

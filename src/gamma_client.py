@@ -41,6 +41,9 @@ class GammaClient(ThreadLocalSessionMixin):
         "ETH": "eth-updown-5m",
         "SOL": "sol-updown-5m",
         "XRP": "xrp-updown-5m",
+        "DOGE": "doge-updown-5m",
+        "HYPE": "hype-updown-5m",
+        "BNB": "bnb-updown-5m",
     }
 
     COIN_SLUGS_4H = {
@@ -59,6 +62,9 @@ class GammaClient(ThreadLocalSessionMixin):
         "ETH": "Ethereum",
         "SOL": "Solana",
         "XRP": "XRP",
+        "DOGE": "Dogecoin",
+        "HYPE": "Hyperliquid",
+        "BNB": "BNB",
     }
 
     # Timeframe durations in seconds

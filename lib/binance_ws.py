@@ -36,6 +36,8 @@ COIN_SYMBOLS = {
     "ETH": "ethusdt",
     "SOL": "solusdt",
     "XRP": "xrpusdt",
+    "DOGE": "dogeusdt",
+    "BNB": "bnbusdt",
 }
 
 # Seconds in a year for annualization
