@@ -203,10 +203,6 @@ class SniperConfig:
     # (not just trades) for offline filter optimization.
     signal_log_dir: str = ""
 
-    # Per-coin config overrides: dict of coin -> {param: value}.
-    # When set, coin-specific params override global config values.
-    # Loaded from optimizer JSON via --per-coin-config CLI arg.
-    per_coin_overrides: Dict[str, dict] = field(default_factory=dict)
 
 
 class EdgeMonitor:
@@ -981,10 +977,6 @@ class MomentumSniperStrategy:
 
         return usdc
 
-    def _get_coin_param(self, coin: str, param: str, default):
-        """Get a per-coin config parameter, falling back to the global default."""
-        return self.config.per_coin_overrides.get(coin, {}).get(param, default)
-
     def _find_opportunities(self) -> List[Tuple[CoinMarketState, str, float, float, FairValue]]:
         """
         Scan all coins for trading opportunities.
@@ -1030,7 +1022,7 @@ class MomentumSniperStrategy:
 
             # Retry Vatic if strike was not set (Vatic may not have had the
             # target ready at market discovery time — retry each scan cycle)
-            _require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
+            _require_vatic = self.config.require_vatic
             if state.strike_price <= 0 and _require_vatic and self._vatic:
                 self._set_strike(state)
                 if state.strike_price <= 0:
@@ -1039,8 +1031,8 @@ class MomentumSniperStrategy:
             # Late/max entry filter using REAL market time (not discovery time).
             # Bug fix: previously used time.time() - market_start_time which drifts
             # when market is discovered late, causing entries before min TTE.
-            _min_window = self._get_coin_param(coin, 'min_window_elapsed', self.config.min_window_elapsed)
-            _max_window = self._get_coin_param(coin, 'max_window_elapsed', self.config.max_window_elapsed)
+            _min_window = self.config.min_window_elapsed
+            _max_window = self.config.max_window_elapsed
             if _min_window > 0 or _max_window > 0:
                 tte = state.seconds_to_expiry()
                 duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
@@ -1114,12 +1106,12 @@ class MomentumSniperStrategy:
                     strike_src_for_signal = getattr(state, '_strike_source', 'unknown')
 
                     # Evaluate each filter independently (per-coin aware)
-                    _c_max_entry = self._get_coin_param(coin, 'max_entry_price', self.config.max_entry_price)
-                    _c_min_entry = self._get_coin_param(coin, 'min_entry_price', self.config.min_entry_price)
-                    _c_min_edge = self._get_coin_param(coin, 'min_edge', self.config.min_edge)
-                    _c_min_fv = self._get_coin_param(coin, 'min_fair_value', self.config.min_fair_value)
-                    _c_require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
-                    _c_min_mom = self._get_coin_param(coin, 'min_momentum', self.config.min_momentum)
+                    _c_max_entry = self.config.max_entry_price
+                    _c_min_entry = self.config.min_entry_price
+                    _c_min_edge = self.config.min_edge
+                    _c_min_fv = self.config.min_fair_value
+                    _c_require_vatic = self.config.require_vatic
+                    _c_min_mom = self.config.min_momentum
                     _passed_price = (
                         best_ask <= _c_max_entry
                         and best_ask >= _c_min_entry
@@ -1197,15 +1189,14 @@ class MomentumSniperStrategy:
                     )
                     self.signal_logger.log_signal(signal)
 
-                # --- Original filter chain (per-coin aware) ---
+                # --- Filter chain (global config, no per-coin overrides) ---
 
-                # Per-coin filter params
-                coin_max_entry = self._get_coin_param(coin, 'max_entry_price', self.config.max_entry_price)
-                coin_min_entry = self._get_coin_param(coin, 'min_entry_price', self.config.min_entry_price)
-                coin_min_edge = self._get_coin_param(coin, 'min_edge', self.config.min_edge)
-                coin_min_fv = self._get_coin_param(coin, 'min_fair_value', self.config.min_fair_value)
-                coin_min_mom = self._get_coin_param(coin, 'min_momentum', self.config.min_momentum)
-                coin_require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
+                coin_max_entry = self.config.max_entry_price
+                coin_min_entry = self.config.min_entry_price
+                coin_min_edge = self.config.min_edge
+                coin_min_fv = self.config.min_fair_value
+                coin_min_mom = self.config.min_momentum
+                coin_require_vatic = self.config.require_vatic
 
                 # Structural price filters only (not risk limits)
                 if best_ask > coin_max_entry:
@@ -1767,7 +1758,7 @@ class MomentumSniperStrategy:
             fee = taker_fee_per_token(buy_price, self.config.timeframe)
             edge = fair_prob - buy_price - fee
 
-            _coin_min_edge = self._get_coin_param(sig.coin, 'min_edge', self.config.min_edge)
+            _coin_min_edge = self.config.min_edge
             if edge >= _coin_min_edge:
                 # Edge confirmed — execute
                 self.log(

@@ -237,12 +237,6 @@ def main():
         help="Stop trading if balance would drop below this amount. "
              "Preserves capital. 0 = disabled (default)."
     )
-    parser.add_argument(
-        "--per-coin-config", type=str, default="",
-        help="Path to optimizer JSON (e.g. data/optimal_config.json). "
-             "Overrides global filter params with per-coin optimal values."
-    )
-
     args = parser.parse_args()
 
     if args.debug:
@@ -293,29 +287,6 @@ def main():
         print(f"{Colors.RED}Error: Failed to initialize bot{Colors.RESET}")
         sys.exit(1)
 
-    # Load per-coin config overrides from optimizer JSON
-    per_coin_overrides = {}
-    if args.per_coin_config:
-        import json
-        pcc_path = Path(args.per_coin_config)
-        if pcc_path.exists():
-            with open(pcc_path) as f:
-                opt_data = json.load(f)
-            # Extract the filter params we care about from each coin config
-            _override_keys = [
-                'min_edge', 'min_momentum', 'min_fair_value',
-                'min_entry_price', 'max_entry_price',
-                'min_window_elapsed', 'max_window_elapsed', 'require_vatic',
-            ]
-            for coin_name, coin_cfg in opt_data.get('coin_configs', {}).items():
-                overrides = {k: coin_cfg[k] for k in _override_keys if k in coin_cfg}
-                if overrides:
-                    per_coin_overrides[coin_name.upper()] = overrides
-            if per_coin_overrides:
-                print(f"  Per-coin config loaded for: {', '.join(sorted(per_coin_overrides.keys()))}")
-        else:
-            print(f"{Colors.YELLOW}Warning: --per-coin-config file not found: {pcc_path}{Colors.RESET}")
-
     # Create strategy config
     strategy_config = SniperConfig(
         coins=coins,
@@ -357,7 +328,6 @@ def main():
         max_consecutive_losses=args.max_consecutive_losses,
         balance_floor=args.balance_floor,
         signal_log_dir=args.signal_log_dir,
-        per_coin_overrides=per_coin_overrides,
     )
 
     # Print config
@@ -374,8 +344,6 @@ def main():
     vatic_status = f"{Colors.GREEN}ON (exact Chainlink strikes){Colors.RESET}" if not args.no_vatic else "OFF"
     print(f"  Vatic strikes:  {vatic_status}")
     print(f"  Bankroll:       ${args.bankroll:.2f}")
-    if per_coin_overrides:
-        print(f"  Per-coin cfg:   {', '.join(sorted(per_coin_overrides.keys()))}")
     side_displays = {
         "up": f"{Colors.GREEN}UP-ONLY{Colors.RESET}",
         "down": f"{Colors.RED}DOWN-ONLY{Colors.RESET}",
