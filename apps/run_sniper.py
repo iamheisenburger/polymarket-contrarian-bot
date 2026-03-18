@@ -227,6 +227,12 @@ def main():
              "At 69%% WR, 5 in a row = 0.29%% chance. 0 = disabled (default)."
     )
     parser.add_argument(
+        "--signal-log-dir", type=str, default="",
+        help="Directory for per-coin signal CSVs (e.g. data/signals). "
+             "When set, logs every signal evaluation for offline filter optimization. "
+             "Empty = disabled (default)."
+    )
+    parser.add_argument(
         "--balance-floor", type=float, default=0.0,
         help="Stop trading if balance would drop below this amount. "
              "Preserves capital. 0 = disabled (default)."
@@ -322,6 +328,7 @@ def main():
         block_weekends=args.block_weekends,
         max_consecutive_losses=args.max_consecutive_losses,
         balance_floor=args.balance_floor,
+        signal_log_dir=args.signal_log_dir,
     )
 
     # Print config

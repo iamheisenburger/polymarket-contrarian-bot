@@ -45,6 +45,7 @@ from lib.binance_ws import BinancePriceFeed
 from lib.fair_value import BinaryFairValue, FairValue
 from lib.console import Colors, LogBuffer, log
 from lib.trade_logger import TradeLogger
+from lib.signal_logger import SignalLogger, SignalRecord
 from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
@@ -196,6 +197,11 @@ class SniperConfig:
     # Balance floor: stop trading if USDC balance drops below this amount.
     # Preserves capital instead of bleeding to zero. 0 = disabled.
     balance_floor: float = 0.0
+
+    # Signal logging: directory to write per-coin signal CSVs.
+    # Empty string = disabled. When set, logs every signal evaluation
+    # (not just trades) for offline filter optimization.
+    signal_log_dir: str = ""
 
 
 class EdgeMonitor:
@@ -518,6 +524,11 @@ class MomentumSniperStrategy:
         # Trade logger
         self.trade_logger = TradeLogger(config.log_file)
 
+        # Signal logger (Layer 1: captures all signal evaluations)
+        self.signal_logger: Optional[SignalLogger] = None
+        if config.signal_log_dir:
+            self.signal_logger = SignalLogger(log_dir=config.signal_log_dir)
+
         # Session stats
         self.stats = SniperStats()
 
@@ -601,6 +612,11 @@ class MomentumSniperStrategy:
                     payout=payout,
                     usdc_balance=real_balance,
                 )
+                if self.signal_logger:
+                    self.signal_logger.resolve_outcome(
+                        record.market_slug, record.side,
+                        won=side_won, pnl=payout - record.bet_size_usdc,
+                    )
 
                 outcome = "WON" if side_won else "LOST"
                 self.log(f"  Resolved orphan: {record.coin} {record.side.upper()} {record.market_slug} → {outcome}", "info")
@@ -1072,6 +1088,99 @@ class MomentumSniperStrategy:
                 if best_ask <= 0 or best_ask >= 1.0:
                     continue
 
+                # Calculate edge at exact ask price (FOK handles stale prices)
+                buy_price = round(best_ask, 2)
+
+                # Net edge = fair value - buy price - taker fee
+                fee = taker_fee_per_token(buy_price, self.config.timeframe)
+                edge = fair_prob - buy_price - fee
+
+                # --- Signal logging: evaluate all filters and log before filtering ---
+                if self.signal_logger:
+                    spot_for_signal = self.binance.get_price(state.coin)
+                    vol_for_signal, vol_src_for_signal = self._get_volatility(state.coin)
+                    strike_src_for_signal = getattr(state, '_strike_source', 'unknown')
+
+                    # Evaluate each filter independently
+                    _passed_price = (
+                        best_ask <= self.config.max_entry_price
+                        and best_ask >= self.config.min_entry_price
+                    )
+                    _passed_edge = edge >= self.config.min_edge
+                    _passed_fv = fair_prob >= self.config.min_fair_value
+                    _passed_vatic = (
+                        state.strike_price > 0 if self.config.require_vatic else True
+                    )
+
+                    # Momentum filter evaluation
+                    _passed_momentum = True
+                    _displacement = 0.0
+                    if self.config.min_momentum > 0 and state.strike_price > 0:
+                        _displacement = (spot_for_signal - state.strike_price) / state.strike_price
+                        if side == "up" and _displacement < self.config.min_momentum:
+                            _passed_momentum = False
+                        if side == "down" and _displacement > -self.config.min_momentum:
+                            _passed_momentum = False
+                    elif state.strike_price > 0:
+                        _displacement = (spot_for_signal - state.strike_price) / state.strike_price
+
+                    # TTE filter evaluation
+                    _passed_tte = True
+                    if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
+                        _tte = state.seconds_to_expiry()
+                        _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                        if self.config.min_window_elapsed > 0:
+                            if _tte > (_duration - self.config.min_window_elapsed):
+                                _passed_tte = False
+                        if self.config.max_window_elapsed > 0:
+                            if _tte < (_duration - self.config.max_window_elapsed):
+                                _passed_tte = False
+
+                    # Trend filter evaluation
+                    _passed_trend = True
+                    _ema_trend = "none"
+                    if self.config.side_filter == "trend" and self._ema_tracker:
+                        if self._ema_tracker.is_valid(coin):
+                            if self._ema_tracker.is_bullish(coin):
+                                _ema_trend = "bullish"
+                                if side == "down":
+                                    _passed_trend = False
+                            else:
+                                _ema_trend = "bearish"
+                                if side == "up":
+                                    _passed_trend = False
+                        else:
+                            _passed_trend = False
+
+                    signal = SignalRecord(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        coin=coin,
+                        market_slug=state.current_slug,
+                        side=side,
+                        spot_price=spot_for_signal,
+                        strike_price=state.strike_price,
+                        strike_source=strike_src_for_signal,
+                        fair_value=fair_prob,
+                        best_ask=best_ask,
+                        edge=edge,
+                        momentum=_displacement,
+                        volatility=vol_for_signal,
+                        vol_source=vol_src_for_signal,
+                        time_to_expiry=state.seconds_to_expiry(),
+                        ema_trend=_ema_trend,
+                        entry_price=buy_price,
+                        passed_edge_filter=_passed_edge,
+                        passed_price_filter=_passed_price,
+                        passed_momentum_filter=_passed_momentum,
+                        passed_tte_filter=_passed_tte,
+                        passed_fv_filter=_passed_fv,
+                        passed_vatic_filter=_passed_vatic,
+                        passed_trend_filter=_passed_trend,
+                    )
+                    self.signal_logger.log_signal(signal)
+
+                # --- Original filter chain (unchanged) ---
+
                 # Structural price filters only (not risk limits)
                 if best_ask > self.config.max_entry_price:
                     continue
@@ -1086,13 +1195,6 @@ class MomentumSniperStrategy:
                     continue
                 if side == "down" and state.has_up_position:
                     continue
-
-                # Calculate edge at exact ask price (FOK handles stale prices)
-                buy_price = round(best_ask, 2)
-
-                # Net edge = fair value - buy price - taker fee
-                fee = taker_fee_per_token(buy_price, self.config.timeframe)
-                edge = fair_prob - buy_price - fee
 
                 if edge >= self.config.min_edge:
                     # Fair value confidence filter: skip coin-flip trades
@@ -1433,6 +1535,11 @@ class MomentumSniperStrategy:
                     payout=payout,
                     usdc_balance=real_balance,
                 )
+                if self.signal_logger:
+                    self.signal_logger.resolve_outcome(
+                        record.market_slug, record.side,
+                        won=side_won, pnl=payout - record.bet_size_usdc,
+                    )
 
                 # Update session stats
                 if side_won:
@@ -1493,6 +1600,11 @@ class MomentumSniperStrategy:
                         payout=side_payout,
                         usdc_balance=real_balance,
                     )
+                    if self.signal_logger:
+                        self.signal_logger.resolve_outcome(
+                            old_slug, side_name,
+                            won=side_won, pnl=side_payout - record.bet_size_usdc,
+                        )
                     pnl = side_payout - record.bet_size_usdc
                     self.stats.realized_pnl += pnl
                     self.stats.pending -= 1
@@ -1542,6 +1654,10 @@ class MomentumSniperStrategy:
         stale_keys = [k for k in self._pending_signals if k.startswith(f"{coin}:")]
         for k in stale_keys:
             self._pending_signals.pop(k, None)
+
+        # Clear signal logger dedup for old market
+        if self.signal_logger and old_slug:
+            self.signal_logger.clear_slug(old_slug)
 
         # If startup_slug was never set (coin wasn't discovered at boot),
         # treat this first-discovered market as the startup market — skip it.
