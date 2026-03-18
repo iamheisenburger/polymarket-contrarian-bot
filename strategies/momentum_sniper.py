@@ -1412,9 +1412,13 @@ class MomentumSniperStrategy:
         if not token_id:
             return False
 
-        # Place FOK (Fill Or Kill) order — fills immediately or is cancelled.
-        # Enter at exact ask price; FOK handles stale prices naturally.
+        # Place FOK (Fill Or Kill) order with price tolerance to reduce rejections.
+        # Start at exact ask, then retry +1c and +2c if FOK rejects.
+        # Shadow logger captures paper entry (exact ask) vs live fill (actual price)
+        # so the cost of tolerance is automatically tracked.
         buy_price = round(entry_price, 2)
+        max_tolerance = 0.02  # max 2 cents above ask
+        tolerance_step = 0.01
 
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
@@ -1426,6 +1430,27 @@ class MomentumSniperStrategy:
             side="BUY",
             order_type="FOK",
         )
+
+        # Retry with price tolerance if FOK rejected
+        tolerance_used = 0.0
+        while not result.success and tolerance_used < max_tolerance:
+            tolerance_used += tolerance_step
+            retry_price = round(buy_price + tolerance_used, 2)
+            if retry_price > self.config.max_entry_price:
+                break  # Don't exceed our max entry price filter
+            self.log(
+                f"FOK retry +{tolerance_used:.2f}c @ ${retry_price:.2f}",
+                "warning"
+            )
+            result = await self.bot.place_order(
+                token_id=token_id,
+                price=retry_price,
+                size=num_tokens,
+                side="BUY",
+                order_type="FOK",
+            )
+            if result.success:
+                buy_price = retry_price  # Update to actual fill price
 
         # FOK fallback: if Kelly-sized order fails on thin orderbook,
         # retry with minimum 5 tokens (paper-validated fill size).
