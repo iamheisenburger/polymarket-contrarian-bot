@@ -115,6 +115,7 @@ class ShadowLogger:
             "latency_ms": 0.0,
         }
         self._pending[key] = record
+        logger.info(f"Shadow signal: {coin} {side} @ ${ask_price:.4f} edge={edge:.4f} [{market_slug}]")
 
     def log_live_fill(
         self,

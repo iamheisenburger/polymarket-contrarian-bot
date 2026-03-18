@@ -1271,6 +1271,7 @@ class MomentumSniperStrategy:
                             continue  # Price above strike — don't buy Down
 
                     # Shadow log: record paper entry for every qualifying signal
+                    logger.info(f"[SHADOW] Signal passed all filters: {state.coin} {side} @ ${best_ask:.4f} edge={edge:.4f} shadow_logger={'ON' if self.shadow_logger else 'OFF'}")
                     if self.shadow_logger:
                         _spot = self.binance.get_price(state.coin)
                         _mom = (_spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0.0
