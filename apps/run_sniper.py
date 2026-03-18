@@ -244,7 +244,20 @@ def main():
              "gets a paper record alongside the live trade for real-time "
              "degradation measurement. Empty = disabled (default)."
     )
+    parser.add_argument(
+        "--enable-circuit-breaker", action="store_true", default=True,
+        help="Enable enhanced circuit breaker (default: enabled). "
+             "3 consecutive losses = 1hr pause, 5/10 losses = hard stop."
+    )
+    parser.add_argument(
+        "--disable-circuit-breaker", action="store_true",
+        help="Disable enhanced circuit breaker. Use only for manual override."
+    )
     args = parser.parse_args()
+
+    # Resolve circuit breaker flag
+    if args.disable_circuit_breaker:
+        args.enable_circuit_breaker = False
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -336,6 +349,7 @@ def main():
         balance_floor=args.balance_floor,
         signal_log_dir=args.signal_log_dir,
         shadow_log=args.shadow_log,
+        enable_circuit_breaker=args.enable_circuit_breaker,
     )
 
     # Print config

@@ -191,5 +191,14 @@ else
     echo "  All coins are live — no paper collector needed"
 fi
 
+# Step 5: Update benchmark
+echo "[5/5] Updating benchmark..."
+$PYTHON apps/run_benchmark.py \
+    --trade-csv data/live_trades.csv \
+    --benchmark-path data/benchmark.json \
+    --save 2>&1 || echo "  Benchmark update failed (non-fatal)"
+
 echo ""
 echo "Done. Next run in 6 hours."
+echo ""
+echo "Discovery cron (daily): 0 6 * * * /opt/polymarket-bot/scripts/run_discovery.sh"

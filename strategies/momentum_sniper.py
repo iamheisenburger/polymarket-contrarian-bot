@@ -39,7 +39,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from lib.binance_ws import BinancePriceFeed
 from lib.fair_value import BinaryFairValue, FairValue
@@ -209,6 +209,12 @@ class SniperConfig:
     # the live trade, enabling real-time degradation measurement.
     # Empty string = disabled.
     shadow_log: str = ""
+
+    # Enhanced circuit breaker: rolling window of last 10 trade outcomes.
+    # - 3 consecutive losses -> pause trading for 1 hour
+    # - 5 losses out of last 10 -> stop live trading entirely
+    # Cannot be disabled by any automated system — only by explicit CLI flag.
+    enable_circuit_breaker: bool = True
 
 
 
@@ -573,6 +579,11 @@ class MomentumSniperStrategy:
         self._consecutive_loss_windows: int = 0
         self._last_loss_window: str = ""  # slug window timestamp of last counted loss
         self._circuit_breaker_tripped: bool = False
+
+        # Enhanced circuit breaker: rolling window of recent trade outcomes
+        self._cb_recent_outcomes: List[bool] = []  # last 10 trade outcomes (True=win)
+        self._cb_paused_until: Optional[datetime] = None  # 1-hour pause after 3 consecutive losses
+        self._cb_stopped: bool = False  # 5/10 losses -> hard stop
 
         # Running state
         self.running = False
@@ -1004,6 +1015,18 @@ class MomentumSniperStrategy:
         # Circuit breaker: stop trading after N consecutive losses
         if self._circuit_breaker_tripped:
             return []
+
+        # Enhanced circuit breaker checks
+        if self.config.enable_circuit_breaker:
+            if self._cb_stopped:
+                return []
+            if self._cb_paused_until:
+                now = datetime.now(timezone.utc)
+                if now < self._cb_paused_until:
+                    return []
+                else:
+                    self.log("Circuit breaker pause expired — resuming trading", "warning")
+                    self._cb_paused_until = None
 
         # Hour blocking: skip trading entirely during blocked UTC hours
         if self.config.blocked_hours:
@@ -1637,6 +1660,8 @@ class MomentumSniperStrategy:
                 # Record in CUSUM monitor
                 if self._edge_monitor:
                     self._edge_monitor.record(side_won)
+                # Enhanced circuit breaker
+                self._cb_record_outcome(side_won)
 
                 outcome = "WON" if side_won else "LOST"
                 self.log(
@@ -1650,6 +1675,37 @@ class MomentumSniperStrategy:
         # Shadow log: resolve paper-only shadow records that have no trade_logger entry
         if self.shadow_logger and self.shadow_logger.pending_count() > 0:
             self._settle_shadow_pending(gamma)
+
+    def _cb_record_outcome(self, won: bool):
+        """Record a trade outcome in the enhanced circuit breaker rolling window."""
+        if not self.config.enable_circuit_breaker:
+            return
+
+        self._cb_recent_outcomes.append(won)
+        if len(self._cb_recent_outcomes) > 10:
+            self._cb_recent_outcomes = self._cb_recent_outcomes[-10:]
+
+        # Check 1: 3 consecutive losses -> pause for 1 hour
+        if len(self._cb_recent_outcomes) >= 3:
+            if all(not o for o in self._cb_recent_outcomes[-3:]):
+                if not self._cb_paused_until and not self._cb_stopped:
+                    self._cb_paused_until = datetime.now(timezone.utc) + timedelta(hours=1)
+                    self.log(
+                        f"CIRCUIT BREAKER: 3 consecutive losses — pausing for 1 hour "
+                        f"(until {self._cb_paused_until.strftime('%H:%M UTC')})",
+                        level="warning",
+                    )
+
+        # Check 2: 5 losses out of last 10 -> hard stop
+        if len(self._cb_recent_outcomes) >= 10:
+            losses = sum(1 for o in self._cb_recent_outcomes if not o)
+            if losses >= 5:
+                self._cb_stopped = True
+                self.log(
+                    f"CIRCUIT BREAKER STOPPED: {losses}/10 recent trades lost — "
+                    f"live trading halted. Manual restart with --disable-circuit-breaker required.",
+                    level="error",
+                )
 
     def _settle_shadow_pending(self, gamma):
         """Resolve shadow records that are paper-only (no live trade).
@@ -1735,6 +1791,8 @@ class MomentumSniperStrategy:
                     # Record in CUSUM monitor
                     if self._edge_monitor:
                         self._edge_monitor.record(side_won)
+                    # Enhanced circuit breaker
+                    self._cb_record_outcome(side_won)
 
                     outcome = "WON" if side_won else "LOST"
                     cusum_str = f" | {self._edge_monitor.status_str()}" if self._edge_monitor else ""
@@ -2063,6 +2121,17 @@ class MomentumSniperStrategy:
             lines.append(f"  {Colors.RED}CIRCUIT BREAKER TRIPPED: {self._consecutive_loss_windows} consecutive losing windows — TRADING PAUSED{Colors.RESET}")
         elif self.config.max_consecutive_losses > 0:
             lines.append(f"  Circuit Breaker: {self._consecutive_loss_windows}/{self.config.max_consecutive_losses} losing windows")
+        # Enhanced circuit breaker status
+        if self.config.enable_circuit_breaker:
+            recent = self._cb_recent_outcomes
+            n_recent = len(recent)
+            losses_recent = sum(1 for o in recent if not o)
+            if self._cb_stopped:
+                lines.append(f"  {Colors.RED}CIRCUIT BREAKER STOPPED: {losses_recent}/{n_recent} losses in rolling window — TRADING HALTED{Colors.RESET}")
+            elif self._cb_paused_until:
+                lines.append(f"  {Colors.YELLOW}CIRCUIT BREAKER PAUSED until {self._cb_paused_until.strftime('%H:%M UTC')}{Colors.RESET}")
+            else:
+                lines.append(f"  Circuit Breaker: {losses_recent}/{n_recent} losses in rolling window (10)")
 
         # EMA trend status
         if self._ema_tracker:
