@@ -45,8 +45,8 @@ MIN_TRADES_PER_CONFIG = 10
 # Below CRITICAL: maximize WR (survival mode, avoid ruin)
 # Between CRITICAL and HEALTHY: balanced (WR-weighted EV/day)
 # Above HEALTHY: maximize EV/day (growth mode)
-BANKROLL_CRITICAL = 10.0   # Below this: survival mode
-BANKROLL_HEALTHY = 30.0    # Above this: growth mode
+BANKROLL_CRITICAL = 25.0   # Below this: survival mode
+BANKROLL_HEALTHY = 50.0    # Above this: growth mode
 AVG_TRADE_COST = 3.25      # ~5 tokens at ~$0.65 avg entry
 
 # Grid search parameter space
