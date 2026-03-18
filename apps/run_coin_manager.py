@@ -62,6 +62,12 @@ def main():
         help="Output path for coin decisions JSON (default: data/coin_decisions.json)"
     )
     parser.add_argument(
+        "--shadow-csv", type=str, default="",
+        help="Path to shadow log CSV (matched paper-vs-live tracking). "
+             "When available with 10+ matched pairs per coin, provides "
+             "more accurate degradation than the historical model."
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Enable verbose logging"
     )
@@ -109,6 +115,8 @@ def main():
     if args.degradation:
         print(f"Degradation:  {args.degradation}")
     print(f"Balance:      ${balance:.2f}")
+    if args.shadow_csv:
+        print(f"Shadow CSV:   {args.shadow_csv}")
 
     cm = CoinManager()
     max_coins = cm.get_bankroll_coin_limit(balance)
@@ -120,6 +128,7 @@ def main():
         paper_csv=args.paper_csv,
         live_csv=args.live_csv,
         degradation_model_path=args.degradation,
+        shadow_csv=args.shadow_csv,
     )
 
     # Apply bankroll limit

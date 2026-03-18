@@ -46,6 +46,7 @@ from lib.fair_value import BinaryFairValue, FairValue
 from lib.console import Colors, LogBuffer, log
 from lib.trade_logger import TradeLogger
 from lib.signal_logger import SignalLogger, SignalRecord
+from lib.shadow_logger import ShadowLogger
 from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
@@ -202,6 +203,12 @@ class SniperConfig:
     # Empty string = disabled. When set, logs every signal evaluation
     # (not just trades) for offline filter optimization.
     signal_log_dir: str = ""
+
+    # Shadow logging: CSV path for matched paper-vs-live tracking.
+    # When set, every qualifying signal gets a paper record alongside
+    # the live trade, enabling real-time degradation measurement.
+    # Empty string = disabled.
+    shadow_log: str = ""
 
 
 
@@ -529,6 +536,11 @@ class MomentumSniperStrategy:
         self.signal_logger: Optional[SignalLogger] = None
         if config.signal_log_dir:
             self.signal_logger = SignalLogger(log_dir=config.signal_log_dir)
+
+        # Shadow logger: matched paper-vs-live tracking on same markets
+        self.shadow_logger: Optional[ShadowLogger] = None
+        if config.shadow_log:
+            self.shadow_logger = ShadowLogger(config.shadow_log)
 
         # Session stats
         self.stats = SniperStats()
@@ -1235,6 +1247,23 @@ class MomentumSniperStrategy:
                         if side == "down" and displacement > -coin_min_mom:
                             continue  # Price above strike — don't buy Down
 
+                    # Shadow log: record paper entry for every qualifying signal
+                    if self.shadow_logger:
+                        _spot = self.binance.get_price(state.coin)
+                        _mom = (_spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0.0
+                        _strike_src = getattr(state, '_strike_source', 'unknown')
+                        self.shadow_logger.log_signal(
+                            market_slug=state.current_slug,
+                            coin=state.coin,
+                            side=side,
+                            ask_price=best_ask,
+                            fair_value=fair_prob,
+                            edge=edge,
+                            momentum=_mom,
+                            tte=state.seconds_to_expiry(),
+                            strike_source=_strike_src,
+                        )
+
                     opportunities.append((state, side, best_ask, edge, fv))
 
         # Sort by edge, best first
@@ -1453,6 +1482,16 @@ class MomentumSniperStrategy:
                 strike_source=strike_src,
             )
 
+            # Shadow log: record live fill
+            if self.shadow_logger:
+                self.shadow_logger.log_live_fill(
+                    market_slug=state.current_slug,
+                    coin=state.coin,
+                    side=side,
+                    fill_price=buy_price,
+                    latency_ms=total_latency_ms,
+                )
+
             kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
             strength = "STRONG" if is_strong else "NORMAL"
 
@@ -1466,6 +1505,9 @@ class MomentumSniperStrategy:
             return True
         elif result.success and order_status in ("LIVE", "OPEN"):
             # Order was accepted but NOT filled (sat on book) — do NOT track position
+            # Shadow log: FOK-like rejection (order sat on book, not filled)
+            if self.shadow_logger:
+                self.shadow_logger.log_fok_reject(state.current_slug, state.coin, side)
             self.log(
                 f"Order NOT FILLED ({state.coin} {side} @ {buy_price:.2f}) "
                 f"status={result.status} — skipping phantom position",
@@ -1474,6 +1516,9 @@ class MomentumSniperStrategy:
             state.last_fail_time[side] = time.time()
             return False
         else:
+            # Shadow log: order failed (FOK reject or other error)
+            if self.shadow_logger:
+                self.shadow_logger.log_fok_reject(state.current_slug, state.coin, side)
             self.log(f"Order failed ({state.coin} {side}): {result.message}", "error")
             # Cooldown: don't retry this coin/side for 60 seconds
             state.last_fail_time[side] = time.time()
@@ -1561,6 +1606,9 @@ class MomentumSniperStrategy:
                         record.market_slug, record.side,
                         won=side_won, pnl=payout - record.bet_size_usdc,
                     )
+                # Shadow log: resolve both paper and live outcomes
+                if self.shadow_logger:
+                    self.shadow_logger.resolve(record.market_slug, record.side, side_won)
 
                 # Update session stats
                 if side_won:
@@ -1599,6 +1647,39 @@ class MomentumSniperStrategy:
             except Exception as e:
                 self.log(f"Settle check failed for {trade_key}: {e}", "warning")
 
+        # Shadow log: resolve paper-only shadow records that have no trade_logger entry
+        if self.shadow_logger and self.shadow_logger.pending_count() > 0:
+            self._settle_shadow_pending(gamma)
+
+    def _settle_shadow_pending(self, gamma):
+        """Resolve shadow records that are paper-only (no live trade).
+
+        These records exist because a signal passed filters but was in observe mode
+        or the live order was FOK rejected. They still need settlement.
+        """
+        # Get all unique market slugs from shadow pending
+        shadow_slugs = set()
+        for key in list(self.shadow_logger._pending.keys()):
+            slug = key.rsplit(":", 1)[0]
+            shadow_slugs.add(slug)
+
+        for slug in shadow_slugs:
+            try:
+                market_data = gamma.get_market_by_slug(slug)
+                if not market_data:
+                    continue
+                prices = gamma.parse_prices(market_data)
+                up_price = prices.get("up", 0)
+                down_price = prices.get("down", 0)
+
+                if up_price > 0.9:
+                    self.shadow_logger.resolve_all_for_market(slug, "up")
+                elif down_price > 0.9:
+                    self.shadow_logger.resolve_all_for_market(slug, "down")
+            except Exception as e:
+                logger_mod = logging.getLogger(__name__)
+                logger_mod.debug(f"Shadow settle check for {slug}: {e}")
+
     def _handle_market_change(self, coin: str, old_slug: str, new_slug: str):
         """Handle market settlement and transition."""
         state = self.coin_states.get(coin)
@@ -1626,6 +1707,9 @@ class MomentumSniperStrategy:
                             old_slug, side_name,
                             won=side_won, pnl=side_payout - record.bet_size_usdc,
                         )
+                    # Shadow log: resolve both paper and live for this side
+                    if self.shadow_logger:
+                        self.shadow_logger.resolve(old_slug, side_name, side_won)
                     pnl = side_payout - record.bet_size_usdc
                     self.stats.realized_pnl += pnl
                     self.stats.pending -= 1
@@ -1659,6 +1743,9 @@ class MomentumSniperStrategy:
                         f"${pnl:+.2f} | Session: ${self.stats.realized_pnl:+.2f}{cusum_str}",
                         "success" if side_won else "warning"
                     )
+                # Shadow log: also resolve any paper-only shadow records for this market
+                if self.shadow_logger:
+                    self.shadow_logger.resolve_all_for_market(old_slug, winning_side)
             # If not resolved, _periodic_settle will handle it later
 
         # Refresh balance

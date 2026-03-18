@@ -67,6 +67,7 @@ class CoinManager:
         paper_csv: str,
         live_csv: str = "",
         degradation_model_path: str = "",
+        shadow_csv: str = "",
     ) -> Dict[str, List[str]]:
         """Evaluate all coins and decide live vs paper.
 
@@ -74,11 +75,19 @@ class CoinManager:
             paper_csv: Path to paper collector CSV (wide filters, all coins).
             live_csv: Path to live trade CSV (for checking current live coin performance).
             degradation_model_path: Path to degradation model JSON.
+            shadow_csv: Path to shadow log CSV (matched paper-vs-live tracking).
+                When available with 10+ matched pairs, provides more accurate
+                degradation than the historical model.
 
         Returns:
             {'live': ['ETH', 'XRP'], 'paper': ['BTC', 'SOL', 'DOGE', 'BNB']}
         """
-        # Load degradation model if available
+        # Load shadow degradation first (preferred over historical model)
+        shadow_degradation = None
+        if shadow_csv:
+            shadow_degradation = self.get_shadow_degradation(shadow_csv)
+
+        # Load degradation model as fallback
         degradation = None
         if degradation_model_path:
             degradation = self._load_degradation(degradation_model_path)
@@ -103,9 +112,19 @@ class CoinManager:
             n_trades = stats['trades']
             wr = stats['wr']
 
-            # Check degradation
+            # Check degradation: prefer shadow (matched pairs) over historical model
             coin_degradation = self.MAX_DEGRADATION  # conservative default
-            if degradation:
+            shadow_used = False
+            if shadow_degradation and coin in shadow_degradation:
+                sd = shadow_degradation[coin]
+                if sd['sufficient']:
+                    coin_degradation = max(sd['gap'], 0.0)
+                    shadow_used = True
+                    logger.info(
+                        f"{coin} shadow degradation: {sd['gap']:.1%} "
+                        f"(n={sd['n_matched']} matched pairs, fill_rate={sd['fill_rate']:.0%})"
+                    )
+            if not shadow_used and degradation:
                 coin_degradation = degradation.get(coin, self.MAX_DEGRADATION)
 
             # Decision logic
@@ -299,6 +318,32 @@ class CoinManager:
             json.dump(data, f, indent=2)
 
         logger.info(f"Coin decisions saved to {filepath}")
+
+    def get_shadow_degradation(self, shadow_csv: str) -> Optional[Dict[str, dict]]:
+        """Read shadow log and compute real-time degradation per coin from matched pairs.
+
+        Args:
+            shadow_csv: Path to shadow CSV (from ShadowLogger).
+
+        Returns:
+            {coin: {'paper_wr': 0.80, 'live_wr': 0.72, 'gap': 0.08, 'n_matched': 25,
+                     'fill_rate': 0.90, 'sufficient': True}} or None if not available.
+        """
+        path = Path(shadow_csv)
+        if not path.exists():
+            logger.info(f"Shadow CSV not found: {shadow_csv}")
+            return None
+
+        try:
+            from lib.shadow_logger import ShadowLogger
+            shadow = ShadowLogger(shadow_csv)
+            summary = shadow.get_degradation_summary(min_trades=10)
+            if summary:
+                logger.info(f"Shadow degradation loaded: {len(summary)} coins")
+            return summary if summary else None
+        except Exception as e:
+            logger.error(f"Failed to read shadow CSV {shadow_csv}: {e}")
+            return None
 
     def _compute_stats_at_fixed_filters(self, csv_path: str) -> Dict[str, dict]:
         """Parse a trade CSV and compute per-coin WR at the fixed filters.

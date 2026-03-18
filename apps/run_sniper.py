@@ -237,6 +237,13 @@ def main():
         help="Stop trading if balance would drop below this amount. "
              "Preserves capital. 0 = disabled (default)."
     )
+    parser.add_argument(
+        "--shadow-log", type=str, default="",
+        help="Path to shadow CSV for matched paper-vs-live tracking "
+             "(e.g. data/shadow.csv). When set, every qualifying signal "
+             "gets a paper record alongside the live trade for real-time "
+             "degradation measurement. Empty = disabled (default)."
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -328,6 +335,7 @@ def main():
         max_consecutive_losses=args.max_consecutive_losses,
         balance_floor=args.balance_floor,
         signal_log_dir=args.signal_log_dir,
+        shadow_log=args.shadow_log,
     )
 
     # Print config

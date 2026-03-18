@@ -15,6 +15,7 @@ PAPER_CSV="data/paper_collector.csv"
 LIVE_CSV="data/live_trades.csv"
 DEG_MODEL="data/degradation_model.json"
 DECISIONS_FILE="data/coin_decisions.json"
+SHADOW_CSV="data/shadow.csv"
 LIVE_PID_FILE="/var/run/live-sniper.pid"
 PAPER_PID_FILE="/var/run/paper-collector.pid"
 
@@ -41,6 +42,7 @@ $PYTHON apps/run_coin_manager.py \
     --paper-csv "$PAPER_CSV" \
     --live-csv "$LIVE_CSV" \
     --degradation "$DEG_MODEL" \
+    --shadow-csv "$SHADOW_CSV" \
     --balance "$BALANCE" \
     --output "$DECISIONS_FILE"
 
@@ -116,6 +118,7 @@ elif [ -n "$LIVE_COINS" ]; then
             --adaptive-kelly \
             --market-check-interval 10 \
             --signal-log-dir data/signals \
+            --shadow-log "$SHADOW_CSV" \
             --log-file data/live_trades.csv \
             > /var/log/live-sniper.log 2>&1 &
 
