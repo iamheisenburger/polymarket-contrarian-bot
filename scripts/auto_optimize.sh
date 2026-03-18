@@ -51,12 +51,25 @@ else:
     exit(0)
 "
 
-# Step 2: Run optimizer
-echo "[2/4] Running optimizer..."
+# Step 1b: Get current balance
+echo "[1b/4] Querying balance..."
+BANKROLL=$($PYTHON -c "
+from dotenv import load_dotenv; load_dotenv()
+from src.config import Config; from src.bot import TradingBot; import os
+config = Config.from_env()
+bot = TradingBot(config=config, private_key=os.environ.get('POLY_PRIVATE_KEY',''))
+b = bot.get_usdc_balance() or 0.0
+print(f'{b:.2f}')
+" 2>/dev/null || echo "0.00")
+echo "  Balance: \$$BANKROLL"
+
+# Step 2: Run optimizer with bankroll awareness
+echo "[2/4] Running optimizer (bankroll=\$$BANKROLL)..."
 $PYTHON apps/run_optimizer.py \
     --paper-csv "$LIVE_CSV" \
     --degradation "$DEG_MODEL" \
     --window-hours 0 \
+    --bankroll "$BANKROLL" \
     --output "$OPTIMAL_CONFIG"
 
 # Step 3: Compare new config to current

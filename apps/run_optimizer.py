@@ -57,6 +57,12 @@ def main():
         help="Output path for optimization result JSON (default: data/optimal_config.json)"
     )
     parser.add_argument(
+        "--bankroll", type=float, default=0.0,
+        help="Current USDC balance. Determines risk preference: "
+             "<$10 = survival mode (maximize WR), $10-30 = balanced, >$30 = growth (maximize EV/day). "
+             "0 = auto-detect from Polymarket API."
+    )
+    parser.add_argument(
         "--verbose", action="store_true",
         help="Enable verbose logging"
     )
@@ -92,15 +98,37 @@ def main():
         else:
             print(f"WARNING: Degradation model not found at {deg_path}, using default 5pp")
 
+    # Determine bankroll
+    bankroll = args.bankroll
+    if bankroll <= 0:
+        # Try to auto-detect from Polymarket
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            from src.config import Config
+            from src.bot import TradingBot
+            config = Config.from_env()
+            private_key = os.environ.get("POLY_PRIVATE_KEY", "")
+            if private_key:
+                bot = TradingBot(config=config, private_key=private_key)
+                bankroll = bot.get_usdc_balance() or 0.0
+                print(f"Auto-detected bankroll: ${bankroll:.2f}")
+        except Exception:
+            pass
+
     # Run optimizer
     print(f"\nPaper CSV:  {args.paper_csv}")
     if args.live_csv:
         print(f"Live CSV:   {args.live_csv}")
     print(f"Window:     {args.window_hours:.0f} hours ({args.window_hours / 24:.1f} days)")
     print(f"Degradation: {'model' if degradation_model else 'default 5pp'}")
+    if bankroll > 0:
+        from lib.optimizer import BANKROLL_CRITICAL, BANKROLL_HEALTHY
+        mode = "SURVIVAL" if bankroll < BANKROLL_CRITICAL else "BALANCED" if bankroll < BANKROLL_HEALTHY else "GROWTH"
+        print(f"Bankroll:   ${bankroll:.2f} -> {mode} mode")
     print()
 
-    optimizer = StrategyOptimizer(degradation_model=degradation_model)
+    optimizer = StrategyOptimizer(degradation_model=degradation_model, bankroll=bankroll)
     result = optimizer.optimize_from_csvs(
         paper_csv=args.paper_csv,
         live_csv=args.live_csv,

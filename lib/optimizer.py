@@ -41,6 +41,14 @@ DEFAULT_DEGRADATION_PP = 0.05
 # Minimum trades to consider a config viable
 MIN_TRADES_PER_CONFIG = 10
 
+# Bankroll risk tiers — determines optimization objective
+# Below CRITICAL: maximize WR (survival mode, avoid ruin)
+# Between CRITICAL and HEALTHY: balanced (WR-weighted EV/day)
+# Above HEALTHY: maximize EV/day (growth mode)
+BANKROLL_CRITICAL = 10.0   # Below this: survival mode
+BANKROLL_HEALTHY = 30.0    # Above this: growth mode
+AVG_TRADE_COST = 3.25      # ~5 tokens at ~$0.65 avg entry
+
 # Grid search parameter space
 GRID = {
     "min_edge": [0.10, 0.15, 0.20, 0.25, 0.30],
@@ -98,6 +106,8 @@ class OptimizationResult:
     recommended_coins: List[str] = field(default_factory=list)
     dropped_coins: List[str] = field(default_factory=list)
     total_expected_ev_per_day: float = 0.0
+    risk_mode: str = "growth"
+    bankroll: float = 0.0
 
     def to_json(self, path: str) -> None:
         """Save result to JSON file."""
@@ -146,6 +156,12 @@ class OptimizationResult:
             "  STRATEGY OPTIMIZER — RESULTS",
             "=" * 65,
             f"  Timestamp:   {self.timestamp}",
+            f"  Bankroll:    ${self.bankroll:.2f}" if self.bankroll > 0 else "",
+            f"  Risk mode:   {self.risk_mode.upper()}" + (
+                " (maximize WR, avoid ruin)" if self.risk_mode == "survival"
+                else " (WR-weighted EV/day)" if self.risk_mode == "balanced"
+                else " (maximize EV/day)"
+            ),
             f"  Data window: {self.window_hours:.0f} hours ({self.window_hours / 24:.1f} days)",
             "",
         ]
@@ -285,13 +301,57 @@ def _load_trade_csv(filepath: str, window_hours: float = 0) -> pd.DataFrame:
 class StrategyOptimizer:
     """Sweeps filter configs per-coin and finds EV-maximizing parameters."""
 
-    def __init__(self, degradation_model=None):
+    def __init__(self, degradation_model=None, bankroll: float = 0.0):
         """
         Args:
             degradation_model: DegradationEstimator instance from lib/degradation.py.
                              If None, uses conservative 5pp default degradation.
+            bankroll: Current USDC balance. Determines risk preference:
+                     <$10: survival mode (maximize WR, minimize risk of ruin)
+                     $10-30: balanced (WR-weighted EV/day)
+                     >$30: growth mode (maximize EV/day)
         """
         self.degradation = degradation_model
+        self.bankroll = bankroll
+        self.risk_mode = self._determine_risk_mode(bankroll)
+
+    @staticmethod
+    def _determine_risk_mode(bankroll: float) -> str:
+        """Determine risk mode based on bankroll.
+
+        Returns:
+            'survival': bankroll < CRITICAL — maximize WR, only highest-confidence trades
+            'balanced': CRITICAL <= bankroll < HEALTHY — WR-weighted EV/day
+            'growth': bankroll >= HEALTHY — maximize EV/day
+        """
+        if bankroll <= 0:
+            return "growth"  # No bankroll info, default to EV maximization
+        if bankroll < BANKROLL_CRITICAL:
+            return "survival"
+        if bankroll < BANKROLL_HEALTHY:
+            return "balanced"
+        return "growth"
+
+    def _score_config(self, wr: float, ev_per_day: float, trades_per_day: float) -> float:
+        """Score a config based on current risk mode.
+
+        survival: heavily penalizes low WR, prefers fewer high-quality trades
+        balanced: weights WR and EV/day equally
+        growth:   pure EV/day maximization
+        """
+        if self.risk_mode == "survival":
+            # Survival: score = WR^3 * EV/day
+            # WR^3 makes 85% WR score 2.5x higher than 75% WR
+            # Also penalize high trade frequency (more trades = more chances to lose)
+            max_trades = self.bankroll / AVG_TRADE_COST  # max losses before ruin
+            survival_prob = wr ** max_trades  # prob of surviving max_trades trades
+            return (wr ** 3) * ev_per_day * survival_prob
+        elif self.risk_mode == "balanced":
+            # Balanced: score = WR * EV/day
+            return wr * ev_per_day
+        else:
+            # Growth: pure EV/day
+            return ev_per_day
 
     def optimize_from_csvs(
         self,
@@ -353,6 +413,8 @@ class StrategyOptimizer:
         result = OptimizationResult(
             timestamp=datetime.now(timezone.utc).isoformat(),
             window_hours=window_hours,
+            risk_mode=self.risk_mode,
+            bankroll=self.bankroll,
         )
 
         for coin in coins:
@@ -404,7 +466,7 @@ class StrategyOptimizer:
             Best CoinConfig or None if no profitable config found.
         """
         best_cfg = None
-        best_ev_per_day = -999.0
+        best_score = -999.0
 
         total_combos = (
             len(GRID["min_edge"])
@@ -517,8 +579,10 @@ class StrategyOptimizer:
             trades_per_day = n_trades / (total_hours / 24.0)
             ev_per_day = ev_per_trade * trades_per_day
 
-            if ev_per_day > best_ev_per_day:
-                best_ev_per_day = ev_per_day
+            score = self._score_config(live_wr, ev_per_day, trades_per_day)
+
+            if score > best_score:
+                best_score = score
                 best_cfg = CoinConfig(
                     coin=coin,
                     min_edge=min_edge,
