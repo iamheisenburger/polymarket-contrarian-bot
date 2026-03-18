@@ -133,18 +133,10 @@ echo "[4/4] Config changed — restarting bot..."
 # Save new config as current
 cp "$OPTIMAL_CONFIG" "$CURRENT_CONFIG"
 
-# Extract recommended config from JSON
+# Extract recommended coins from JSON (per-coin params handled by --per-coin-config)
 COINS=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); print(' '.join(d.get('recommended_coins',[])))")
-MIN_EDGE=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(max(c.get('min_edge',0.20) for c in configs.values()))")
-MIN_MOM=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(max(c.get('min_momentum',0.0003) for c in configs.values()))")
-MIN_FV=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(max(c.get('min_fair_value',0.70) for c in configs.values()))")
-MIN_PRICE=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(min(c.get('min_entry_price',0.45) for c in configs.values()))")
-MAX_PRICE=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(min(c.get('max_entry_price',0.70) for c in configs.values()))")
-MIN_TTE=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(int(max(c.get('min_window_elapsed',100) for c in configs.values())))")
-MAX_TTE=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); print(int(min(c.get('max_window_elapsed',180) for c in configs.values())))")
-REQ_VATIC=$($PYTHON -c "import json; d=json.load(open('$OPTIMAL_CONFIG')); configs=d.get('coin_configs',{}); v=any(c.get('require_vatic',False) for c in configs.values()); print('--require-vatic' if v else '')")
 
-echo "  New config: coins=$COINS edge=$MIN_EDGE mom=$MIN_MOM fv=$MIN_FV price=$MIN_PRICE-$MAX_PRICE tte=$MIN_TTE-$MAX_TTE"
+echo "  New config: coins=$COINS (per-coin params from $OPTIMAL_CONFIG)"
 
 # Kill current bot
 kill $(cat /var/run/adaptive.pid 2>/dev/null) 2>/dev/null || true
@@ -155,13 +147,7 @@ nohup $PYTHON apps/run_sniper.py \
     --coins $COINS \
     --timeframe 5m \
     --bankroll 10 \
-    --min-edge $MIN_EDGE \
-    --min-entry-price $MIN_PRICE \
-    --max-entry-price $MAX_PRICE \
-    --min-momentum $MIN_MOM \
-    --min-fair-value $MIN_FV \
-    --min-window-elapsed $MIN_TTE \
-    --max-window-elapsed $MAX_TTE \
+    --per-coin-config "$OPTIMAL_CONFIG" \
     --fixed-vol 0.15 \
     --min-size \
     --side trend \
@@ -174,7 +160,6 @@ nohup $PYTHON apps/run_sniper.py \
     --market-check-interval 10 \
     --signal-log-dir data/signals \
     --log-file data/adaptive_live.csv \
-    $REQ_VATIC \
     > /var/log/adaptive-sniper.log 2>&1 &
 
 echo $! > /var/run/adaptive.pid

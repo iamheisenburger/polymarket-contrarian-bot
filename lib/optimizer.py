@@ -204,43 +204,22 @@ class OptimizationResult:
     def _build_cli_command(self) -> str:
         """Build a CLI command from the recommended configs.
 
-        Uses the most conservative (tightest) values across all recommended coins
-        since run_sniper.py uses a single config for all coins.
+        Uses --per-coin-config to pass per-coin optimal values directly.
         """
         if not self.recommended_coins:
             return "# No recommended coins"
-
-        cfgs = [self.coin_configs[c] for c in self.recommended_coins]
-
-        # For shared params, use the tightest (most conservative) across coins
-        min_edge = max(c.min_edge for c in cfgs)
-        min_momentum = max(c.min_momentum for c in cfgs)
-        min_fv = max(c.min_fair_value for c in cfgs)
-        min_entry = max(c.min_entry_price for c in cfgs)
-        max_entry = min(c.max_entry_price for c in cfgs)
-        min_tte = max(c.min_window_elapsed for c in cfgs)
-        max_tte = min(c.max_window_elapsed for c in cfgs)
-        require_vatic = any(c.require_vatic for c in cfgs)
 
         coins_str = " ".join(self.recommended_coins)
         parts = [
             f"python apps/run_sniper.py",
             f"--coins {coins_str}",
             f"--timeframe 5m",
-            f"--min-edge {min_edge:.2f}",
-            f"--min-momentum {min_momentum:.4f}",
-            f"--min-fair-value {min_fv:.2f}",
-            f"--min-entry-price {min_entry:.2f}",
-            f"--max-entry-price {max_entry:.2f}",
-            f"--min-window-elapsed {min_tte:.0f}",
-            f"--max-window-elapsed {max_tte:.0f}",
+            f"--per-coin-config data/optimal_config.json",
             f"--side trend --ema-fast 4 --ema-slow 16",
             f"--block-weekends",
             f"--fixed-vol 0.15",
             f"--min-size",
         ]
-        if require_vatic:
-            parts.append("--require-vatic")
 
         return " \\\n    ".join(parts)
 

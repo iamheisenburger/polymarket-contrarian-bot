@@ -203,6 +203,11 @@ class SniperConfig:
     # (not just trades) for offline filter optimization.
     signal_log_dir: str = ""
 
+    # Per-coin config overrides: dict of coin -> {param: value}.
+    # When set, coin-specific params override global config values.
+    # Loaded from optimizer JSON via --per-coin-config CLI arg.
+    per_coin_overrides: Dict[str, dict] = field(default_factory=dict)
+
 
 class EdgeMonitor:
     """
@@ -976,6 +981,10 @@ class MomentumSniperStrategy:
 
         return usdc
 
+    def _get_coin_param(self, coin: str, param: str, default):
+        """Get a per-coin config parameter, falling back to the global default."""
+        return self.config.per_coin_overrides.get(coin, {}).get(param, default)
+
     def _find_opportunities(self) -> List[Tuple[CoinMarketState, str, float, float, FairValue]]:
         """
         Scan all coins for trading opportunities.
@@ -1021,7 +1030,8 @@ class MomentumSniperStrategy:
 
             # Retry Vatic if strike was not set (Vatic may not have had the
             # target ready at market discovery time — retry each scan cycle)
-            if state.strike_price <= 0 and self.config.require_vatic and self._vatic:
+            _require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
+            if state.strike_price <= 0 and _require_vatic and self._vatic:
                 self._set_strike(state)
                 if state.strike_price <= 0:
                     continue  # Still no strike — skip this cycle
@@ -1029,15 +1039,17 @@ class MomentumSniperStrategy:
             # Late/max entry filter using REAL market time (not discovery time).
             # Bug fix: previously used time.time() - market_start_time which drifts
             # when market is discovered late, causing entries before min TTE.
-            if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
+            _min_window = self._get_coin_param(coin, 'min_window_elapsed', self.config.min_window_elapsed)
+            _max_window = self._get_coin_param(coin, 'max_window_elapsed', self.config.max_window_elapsed)
+            if _min_window > 0 or _max_window > 0:
                 tte = state.seconds_to_expiry()
                 duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
-                if self.config.min_window_elapsed > 0:
-                    max_tte = duration - self.config.min_window_elapsed  # 300-120=180
+                if _min_window > 0:
+                    max_tte = duration - _min_window  # 300-120=180
                     if tte > max_tte:
                         continue
-                if self.config.max_window_elapsed > 0:
-                    min_tte = duration - self.config.max_window_elapsed  # 300-180=120
+                if _max_window > 0:
+                    min_tte = duration - _max_window  # 300-180=120
                     if tte < min_tte:
                         continue
 
@@ -1101,39 +1113,45 @@ class MomentumSniperStrategy:
                     vol_for_signal, vol_src_for_signal = self._get_volatility(state.coin)
                     strike_src_for_signal = getattr(state, '_strike_source', 'unknown')
 
-                    # Evaluate each filter independently
+                    # Evaluate each filter independently (per-coin aware)
+                    _c_max_entry = self._get_coin_param(coin, 'max_entry_price', self.config.max_entry_price)
+                    _c_min_entry = self._get_coin_param(coin, 'min_entry_price', self.config.min_entry_price)
+                    _c_min_edge = self._get_coin_param(coin, 'min_edge', self.config.min_edge)
+                    _c_min_fv = self._get_coin_param(coin, 'min_fair_value', self.config.min_fair_value)
+                    _c_require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
+                    _c_min_mom = self._get_coin_param(coin, 'min_momentum', self.config.min_momentum)
                     _passed_price = (
-                        best_ask <= self.config.max_entry_price
-                        and best_ask >= self.config.min_entry_price
+                        best_ask <= _c_max_entry
+                        and best_ask >= _c_min_entry
                     )
-                    _passed_edge = edge >= self.config.min_edge
-                    _passed_fv = fair_prob >= self.config.min_fair_value
+                    _passed_edge = edge >= _c_min_edge
+                    _passed_fv = fair_prob >= _c_min_fv
                     _passed_vatic = (
-                        state.strike_price > 0 if self.config.require_vatic else True
+                        state.strike_price > 0 if _c_require_vatic else True
                     )
 
                     # Momentum filter evaluation
                     _passed_momentum = True
                     _displacement = 0.0
-                    if self.config.min_momentum > 0 and state.strike_price > 0:
+                    if _c_min_mom > 0 and state.strike_price > 0:
                         _displacement = (spot_for_signal - state.strike_price) / state.strike_price
-                        if side == "up" and _displacement < self.config.min_momentum:
+                        if side == "up" and _displacement < _c_min_mom:
                             _passed_momentum = False
-                        if side == "down" and _displacement > -self.config.min_momentum:
+                        if side == "down" and _displacement > -_c_min_mom:
                             _passed_momentum = False
                     elif state.strike_price > 0:
                         _displacement = (spot_for_signal - state.strike_price) / state.strike_price
 
                     # TTE filter evaluation
                     _passed_tte = True
-                    if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
+                    if _min_window > 0 or _max_window > 0:
                         _tte = state.seconds_to_expiry()
                         _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
-                        if self.config.min_window_elapsed > 0:
-                            if _tte > (_duration - self.config.min_window_elapsed):
+                        if _min_window > 0:
+                            if _tte > (_duration - _min_window):
                                 _passed_tte = False
-                        if self.config.max_window_elapsed > 0:
-                            if _tte < (_duration - self.config.max_window_elapsed):
+                        if _max_window > 0:
+                            if _tte < (_duration - _max_window):
                                 _passed_tte = False
 
                     # Trend filter evaluation
@@ -1179,12 +1197,20 @@ class MomentumSniperStrategy:
                     )
                     self.signal_logger.log_signal(signal)
 
-                # --- Original filter chain (unchanged) ---
+                # --- Original filter chain (per-coin aware) ---
+
+                # Per-coin filter params
+                coin_max_entry = self._get_coin_param(coin, 'max_entry_price', self.config.max_entry_price)
+                coin_min_entry = self._get_coin_param(coin, 'min_entry_price', self.config.min_entry_price)
+                coin_min_edge = self._get_coin_param(coin, 'min_edge', self.config.min_edge)
+                coin_min_fv = self._get_coin_param(coin, 'min_fair_value', self.config.min_fair_value)
+                coin_min_mom = self._get_coin_param(coin, 'min_momentum', self.config.min_momentum)
+                coin_require_vatic = self._get_coin_param(coin, 'require_vatic', self.config.require_vatic)
 
                 # Structural price filters only (not risk limits)
-                if best_ask > self.config.max_entry_price:
+                if best_ask > coin_max_entry:
                     continue
-                if best_ask < self.config.min_entry_price:
+                if best_ask < coin_min_entry:
                     continue
 
                 # Never buy the opposite side of an existing position.
@@ -1196,22 +1222,26 @@ class MomentumSniperStrategy:
                 if side == "down" and state.has_up_position:
                     continue
 
-                if edge >= self.config.min_edge:
+                if edge >= coin_min_edge:
                     # Fair value confidence filter: skip coin-flip trades
-                    if fair_prob < self.config.min_fair_value:
+                    if fair_prob < coin_min_fv:
                         continue  # Model not confident enough
+
+                    # Vatic requirement (per-coin)
+                    if coin_require_vatic and state.strike_price <= 0:
+                        continue
 
                     # Momentum filter: price must have displaced from strike
                     # in the direction we're betting. This matches the backtest
                     # logic exactly: mom = (spot - strike) / strike.
                     # DO NOT use binance.get_momentum() — that measures 30s
                     # price change, which is a different (weaker) signal.
-                    if self.config.min_momentum > 0 and state.strike_price > 0:
+                    if coin_min_mom > 0 and state.strike_price > 0:
                         spot = self.binance.get_price(state.coin)
                         displacement = (spot - state.strike_price) / state.strike_price
-                        if side == "up" and displacement < self.config.min_momentum:
+                        if side == "up" and displacement < coin_min_mom:
                             continue  # Price below strike — don't buy Up
-                        if side == "down" and displacement > -self.config.min_momentum:
+                        if side == "down" and displacement > -coin_min_mom:
                             continue  # Price above strike — don't buy Down
 
                     opportunities.append((state, side, best_ask, edge, fv))
@@ -1737,7 +1767,8 @@ class MomentumSniperStrategy:
             fee = taker_fee_per_token(buy_price, self.config.timeframe)
             edge = fair_prob - buy_price - fee
 
-            if edge >= self.config.min_edge:
+            _coin_min_edge = self._get_coin_param(sig.coin, 'min_edge', self.config.min_edge)
+            if edge >= _coin_min_edge:
                 # Edge confirmed — execute
                 self.log(
                     f"CONFIRMED: {sig.coin} {sig.side.upper()} @ {buy_price:.2f} "
@@ -1748,7 +1779,7 @@ class MomentumSniperStrategy:
             else:
                 self.log(
                     f"EXPIRED: {sig.coin} {sig.side.upper()} — edge gone "
-                    f"({edge:+.2f} < {self.config.min_edge:.2f})",
+                    f"({edge:+.2f} < {_coin_min_edge:.2f})",
                     "warning"
                 )
 
