@@ -1,0 +1,121 @@
+{
+  "total_trades": 1457,
+  "overall_wr": 0.6245710363761153,
+  "buckets": [
+    {
+      "gap_range": "0.00%-0.05%",
+      "time_range": "60-120s",
+      "trades": 60,
+      "wins": 27,
+      "win_rate": 0.45,
+      "gap_mid": 0.00025,
+      "time_mid": 90.0
+    },
+    {
+      "gap_range": "0.00%-0.05%",
+      "time_range": "120-180s",
+      "trades": 365,
+      "wins": 198,
+      "win_rate": 0.542,
+      "gap_mid": 0.00025,
+      "time_mid": 150.0
+    },
+    {
+      "gap_range": "0.00%-0.05%",
+      "time_range": "180-240s",
+      "trades": 355,
+      "wins": 204,
+      "win_rate": 0.575,
+      "gap_mid": 0.00025,
+      "time_mid": 210.0
+    },
+    {
+      "gap_range": "0.00%-0.05%",
+      "time_range": "240-300s",
+      "trades": 164,
+      "wins": 86,
+      "win_rate": 0.524,
+      "gap_mid": 0.00025,
+      "time_mid": 270.0
+    },
+    {
+      "gap_range": "0.05%-0.10%",
+      "time_range": "60-120s",
+      "trades": 8,
+      "wins": 6,
+      "win_rate": 0.75,
+      "gap_mid": 0.00075,
+      "time_mid": 90.0
+    },
+    {
+      "gap_range": "0.05%-0.10%",
+      "time_range": "120-180s",
+      "trades": 111,
+      "wins": 98,
+      "win_rate": 0.883,
+      "gap_mid": 0.00075,
+      "time_mid": 150.0
+    },
+    {
+      "gap_range": "0.05%-0.10%",
+      "time_range": "180-240s",
+      "trades": 129,
+      "wins": 88,
+      "win_rate": 0.682,
+      "gap_mid": 0.00075,
+      "time_mid": 210.0
+    },
+    {
+      "gap_range": "0.05%-0.10%",
+      "time_range": "240-300s",
+      "trades": 124,
+      "wins": 94,
+      "win_rate": 0.758,
+      "gap_mid": 0.00075,
+      "time_mid": 270.0
+    },
+    {
+      "gap_range": "0.10%-0.20%",
+      "time_range": "120-180s",
+      "trades": 20,
+      "wins": 18,
+      "win_rate": 0.9,
+      "gap_mid": 0.0015,
+      "time_mid": 150.0
+    },
+    {
+      "gap_range": "0.10%-0.20%",
+      "time_range": "180-240s",
+      "trades": 54,
+      "wins": 37,
+      "win_rate": 0.685,
+      "gap_mid": 0.0015,
+      "time_mid": 210.0
+    },
+    {
+      "gap_range": "0.10%-0.20%",
+      "time_range": "240-300s",
+      "trades": 54,
+      "wins": 42,
+      "win_rate": 0.778,
+      "gap_mid": 0.0015,
+      "time_mid": 270.0
+    },
+    {
+      "gap_range": "0.20%-0.30%",
+      "time_range": "180-240s",
+      "trades": 5,
+      "wins": 4,
+      "win_rate": 0.8,
+      "gap_mid": 0.0025,
+      "time_mid": 210.0
+    }
+  ],
+  "params": {
+    "k": 900.0,
+    "alpha": 0.4,
+    "ref_time": 300.0,
+    "floor": 0.5,
+    "ceiling": 0.99
+  }
+}

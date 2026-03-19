@@ -180,6 +180,18 @@ def main():
         help="Require Vatic strike — skip market entirely if Vatic fails (no fallback)"
     )
 
+    # --- Direct Fair Value ---
+    parser.add_argument(
+        "--use-direct-fv", action="store_true",
+        help="Use DirectFairValue (empirical sigmoid) instead of Black-Scholes. "
+             "No volatility model — just price gap + time remaining."
+    )
+    parser.add_argument(
+        "--direct-fv-calibration", type=str, default="",
+        help="Path to calibration JSON for DirectFairValue. "
+             "Generate with: python apps/calibrate_fv.py --trade-csv <csv> --output <path>"
+    )
+
     # --- Edge Amplifier features ---
     parser.add_argument(
         "--enable-cusum", action="store_true",
@@ -334,6 +346,8 @@ def main():
         price_source=args.price_source,
         use_vatic=not args.no_vatic,
         require_vatic=args.require_vatic,
+        use_direct_fv=args.use_direct_fv,
+        direct_fv_calibration=args.direct_fv_calibration,
         observe_only=args.observe,
         log_file=args.log_file,
         enable_cusum=args.enable_cusum,

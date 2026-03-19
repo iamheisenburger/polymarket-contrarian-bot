@@ -43,6 +43,7 @@ from datetime import datetime, timezone, timedelta
 
 from lib.binance_ws import BinancePriceFeed
 from lib.fair_value import BinaryFairValue, FairValue
+from lib.direct_fv import DirectFairValue
 from lib.console import Colors, LogBuffer, log
 from lib.trade_logger import TradeLogger
 from lib.signal_logger import SignalLogger, SignalRecord
@@ -149,6 +150,13 @@ class SniperConfig:
     # "binance" = Binance WebSocket (fast but NOT settlement source)
     # "chainlink" = Polymarket RTDS Chainlink feed (settlement source)
     price_source: str = "binance"
+
+    # Direct fair value: use empirical sigmoid model instead of Black-Scholes.
+    # No volatility assumption — just price gap + time remaining.
+    # Calibrate first with: python apps/calibrate_fv.py --trade-csv <csv> --output data/calibration.json
+    use_direct_fv: bool = False
+    # Path to calibration JSON for DirectFairValue (empty = use defaults)
+    direct_fv_calibration: str = ""
 
     # Vatic API: use exact Chainlink strike prices instead of Binance approximation
     use_vatic: bool = True
@@ -496,7 +504,13 @@ class MomentumSniperStrategy:
             self._event_logger.propagate = False
 
         # Fair value calculator
-        self.fv_calc = BinaryFairValue()
+        if config.use_direct_fv:
+            cal_path = config.direct_fv_calibration or None
+            self.fv_calc = DirectFairValue(calibration_path=cal_path)
+            self.log(f"Using DirectFairValue (empirical sigmoid)"
+                     f"{' with calibration: ' + cal_path if cal_path else ' with defaults'}")
+        else:
+            self.fv_calc = BinaryFairValue()
 
         # Real-time price feed (all coins)
         # Chainlink = Polymarket's settlement source (most accurate for outcomes)
