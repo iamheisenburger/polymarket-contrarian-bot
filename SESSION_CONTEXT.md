@@ -138,6 +138,64 @@ python apps/run_sniper.py \
 5. **Circuit breaker stays ON.** 3 consecutive losses = pause.
 6. **Think independently.** Don't just agree with the user. Push back when data says otherwise.
 
+## Background Systems (running alongside live bot)
+
+### Paper Collector
+NOT currently running — was killed during last restart. Should be restarted to collect loose-filter data on all coins. This feeds the discovery layer and coin manager.
+
+```bash
+# Start paper collector (observe mode, loose filters, all coins)
+ssh -i ~/.ssh/polymarket_bot root@134.209.91.109 'cd /opt/polymarket-bot && export $(grep -v "^#" .env | xargs) && nohup /opt/polymarket-bot/venv/bin/python3 apps/run_sniper.py --coins BTC ETH SOL XRP DOGE BNB --timeframe 5m --bankroll 10 --min-edge 0.10 --min-entry-price 0.40 --max-entry-price 0.80 --min-momentum 0.0001 --min-fair-value 0.60 --min-window-elapsed 60 --max-window-elapsed 240 --fixed-vol 0.15 --min-size --side trend --ema-fast 4 --ema-slow 16 --market-check-interval 10 --signal-log-dir data/signals --shadow-log data/shadow_paper.csv --log-file data/paper_collector.csv --observe > /var/log/paper-collector.log 2>&1 & echo $! > /var/run/paper-collector.pid && echo "PAPER: $(cat /var/run/paper-collector.pid)"'
+```
+
+### Coin Manager (`lib/coin_manager.py`)
+- Evaluates which coins qualify for live based on paper WR at fixed filters
+- Promotes coins with >75% WR + 20 trades + <5pp degradation
+- Demotes coins below 65% WR
+- Bankroll-aware: <$5 stop, <$15 one coin, <$30 two coins, $30+ all
+- Runs via `scripts/auto_manage.sh` every 6 hours (cron)
+- Currently: all 6 coins deployed live because the strategy changed to cheap entries
+
+### Discovery Layer (`lib/discovery.py`)
+- Daily sweep of 2,500 filter combos on paper data
+- Finds candidates that beat current benchmark
+- NEVER auto-deploys — only reports to `data/strategy_candidates.json`
+- Runs via `scripts/run_discovery.sh` daily at 6 AM UTC (cron)
+
+### Shadow Logger (`lib/shadow_logger.py`)
+- Records paper entry alongside every live trade
+- Same market, same signal, same second
+- Measures: slippage, adverse selection, fill rate (FOK rejects)
+- CRITICAL FINDING: zero degradation confirmed on all matched pairs so far
+- Data in `data/shadow_v3.csv`
+
+### Benchmark (`lib/benchmark.py`)
+- Tracks live strategy WR over time
+- Provisional until 100 trades, then "official"
+- Discovery layer must beat benchmark by 5pp to flag a candidate
+
+### Signal Logger (`lib/signal_logger.py`)
+- Captures EVERY signal on all coins, pass or fail
+- Per-coin CSVs in `data/signals/`
+- Feeds discovery layer and future analysis
+
+## Historical Data
+
+- `data/paper_collector.csv` — 1,457+ merged paper trades from all sessions
+- `data/live_v3.csv` — current live trades (5W/0L)
+- `data/shadow_v3.csv` — shadow matched pairs (8 signals, 5 filled, 3 FOK rejected)
+- `data/archive/` — old CSVs from previous failed strategies
+- `data/calibration.json` — direct FV calibration parameters (k=900, alpha=0.40)
+
+## What NOT To Do
+
+1. **Don't switch back to Black-Scholes.** We lost $180 on it.
+2. **Don't optimize filters by sweeping combos on the dataset.** That's overfitting — 2.9% of random filters show 84% on a 62% base rate.
+3. **Don't buy at $0.65+.** Breakeven jumps to 68%+ and risk/reward is terrible.
+4. **Don't relax momentum below 0.0005.** Low momentum = noise = coin flips.
+5. **Don't trust any paper WR claim without train/test validation.** Paper always looks good. Validate on out-of-sample data.
+6. **Don't restart the live bot unless there's a bug.** It's working. Leave it alone.
+
 ## Wallet Details
 
 - EOA: 0x788AdB6eaDa73377F7b63F59b2fF0573C86A65E5
