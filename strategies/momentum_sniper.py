@@ -218,6 +218,13 @@ class SniperConfig:
     # Empty string = disabled.
     shadow_log: str = ""
 
+    # FOK price tolerance: add this many cents to the ask price on the initial
+    # FOK submission to absorb orderbook movement and reduce rejections.
+    # Edge is still calculated against the original ask — tolerance just means
+    # we're willing to pay slightly more to ensure the fill.
+    # 0.0 = disabled (submit at exact ask). 0.01 = 1 cent tolerance (default).
+    fok_tolerance: float = 0.01
+
     # Enhanced circuit breaker: rolling window of last 10 trade outcomes.
     # - 3 consecutive losses -> pause trading for 1 hour
     # - 5 losses out of last 10 -> stop live trading entirely
@@ -1431,12 +1438,47 @@ class MomentumSniperStrategy:
             return False
 
         # Place FOK (Fill Or Kill) order with price tolerance to reduce rejections.
-        # Start at exact ask, then retry +1c and +2c if FOK rejects.
-        # Shadow logger captures paper entry (exact ask) vs live fill (actual price)
-        # so the cost of tolerance is automatically tracked.
-        buy_price = round(entry_price, 2)
-        max_tolerance = 0.02  # max 2 cents above ask
-        tolerance_step = 0.01
+        # The tolerance is applied to the submission price (not the edge calc).
+        # Shadow logger captures original ask as paper entry price.
+        original_ask = round(entry_price, 2)
+        tolerance = self.config.fok_tolerance
+        buy_price = round(original_ask + tolerance, 2) if tolerance > 0 else original_ask
+
+        # Don't exceed max entry price with tolerance
+        if buy_price > self.config.max_entry_price:
+            buy_price = self.config.max_entry_price
+
+        # Depth-aware sizing: check how many tokens are available within
+        # the tolerance range and cap our order size accordingly.
+        ob = state.manager.get_orderbook(side)
+        if ob and ob.asks:
+            available_tokens = 0.0
+            for level in ob.asks:
+                if level.price <= buy_price:
+                    available_tokens += level.size
+                else:
+                    break  # asks sorted ascending, no more levels in range
+            if available_tokens > 0:
+                depth_capped = min(num_tokens, available_tokens)
+                # Floor at 1 token, but Polymarket minimum is 5 tokens
+                if depth_capped < 5.0:
+                    self.log(
+                        f"[DEPTH] {state.coin} {side.upper()} only {available_tokens:.0f} "
+                        f"tokens in book <= ${buy_price:.2f} (need 5). Skipping.",
+                        "warning"
+                    )
+                    return False
+                if depth_capped < num_tokens:
+                    # Round down to whole tokens
+                    depth_capped = float(int(depth_capped))
+                    if depth_capped < 5.0:
+                        depth_capped = 5.0
+                    self.log(
+                        f"[DEPTH] {state.coin} {side.upper()} depth={available_tokens:.0f} "
+                        f"<= ${buy_price:.2f}, sizing {num_tokens:.0f} -> {depth_capped:.0f}",
+                        "info"
+                    )
+                    num_tokens = depth_capped
 
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
@@ -1449,26 +1491,23 @@ class MomentumSniperStrategy:
             order_type="FOK",
         )
 
-        # Retry with price tolerance if FOK rejected
-        tolerance_used = 0.0
-        while not result.success and tolerance_used < max_tolerance:
-            tolerance_used += tolerance_step
-            retry_price = round(buy_price + tolerance_used, 2)
-            if retry_price > self.config.max_entry_price:
-                break  # Don't exceed our max entry price filter
-            self.log(
-                f"FOK retry +{tolerance_used:.2f}c @ ${retry_price:.2f}",
-                "warning"
-            )
-            result = await self.bot.place_order(
-                token_id=token_id,
-                price=retry_price,
-                size=num_tokens,
-                side="BUY",
-                order_type="FOK",
-            )
-            if result.success:
-                buy_price = retry_price  # Update to actual fill price
+        # Retry with additional tolerance if FOK rejected (+1c beyond initial tolerance)
+        if not result.success and tolerance > 0:
+            retry_price = round(buy_price + 0.01, 2)
+            if retry_price <= self.config.max_entry_price:
+                self.log(
+                    f"FOK retry +1c @ ${retry_price:.2f} (total +{retry_price - original_ask:.2f}c)",
+                    "warning"
+                )
+                result = await self.bot.place_order(
+                    token_id=token_id,
+                    price=retry_price,
+                    size=num_tokens,
+                    side="BUY",
+                    order_type="FOK",
+                )
+                if result.success:
+                    buy_price = retry_price  # Update to actual fill price
 
         # FOK fallback: if Kelly-sized order fails on thin orderbook,
         # retry with minimum 5 tokens (paper-validated fill size).

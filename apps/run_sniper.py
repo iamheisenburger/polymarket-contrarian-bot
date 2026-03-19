@@ -194,6 +194,12 @@ def main():
 
     # --- Edge Amplifier features ---
     parser.add_argument(
+        "--fok-tolerance", type=float, default=0.01,
+        help="FOK price tolerance in dollars (default: 0.01 = 1 cent above ask). "
+             "Reduces FOK rejections by sweeping one level deeper. "
+             "0 = disabled (submit at exact ask)."
+    )
+    parser.add_argument(
         "--enable-cusum", action="store_true",
         help="Enable CUSUM edge decay detection. Auto-reduces Kelly when WR drops."
     )
@@ -350,6 +356,7 @@ def main():
         direct_fv_calibration=args.direct_fv_calibration,
         observe_only=args.observe,
         log_file=args.log_file,
+        fok_tolerance=args.fok_tolerance,
         enable_cusum=args.enable_cusum,
         cusum_threshold=args.cusum_threshold,
         cusum_target_wr=args.cusum_target_wr,
