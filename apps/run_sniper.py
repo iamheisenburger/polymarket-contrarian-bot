@@ -63,7 +63,7 @@ def main():
     )
     parser.add_argument(
         "--coins", nargs="+", type=str, default=["BTC"],
-        help="Coins to scan (default: BTC). Options: BTC ETH SOL XRP"
+        help="Coins to scan (default: BTC). Options: BTC ETH SOL XRP DOGE HYPE BNB"
     )
     parser.add_argument(
         "--timeframe", type=str, default="5m",
@@ -379,7 +379,12 @@ def main():
     print(f"\n{'='*60}")
     print(f"  MOMENTUM SNIPER — {'/'.join(coins)} {args.timeframe}")
     print(f"{'='*60}\n")
-    price_src = f"{Colors.CYAN}CHAINLINK (settlement source){Colors.RESET}" if args.price_source == "chainlink" else "Binance"
+    if args.price_source == "chainlink":
+        price_src = f"{Colors.CYAN}CHAINLINK (settlement source){Colors.RESET}"
+    else:
+        price_src = "Binance"
+    if "HYPE" in coins:
+        price_src += f" + {Colors.CYAN}Coinbase (HYPE){Colors.RESET}"
     print(f"  Mode:           {mode}")
     print(f"  Coins:          {', '.join(coins)}")
     print(f"  Timeframe:      {args.timeframe}")

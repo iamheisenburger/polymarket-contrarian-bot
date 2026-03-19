@@ -1,18 +1,17 @@
 """
-Chainlink Price Feed via Polymarket RTDS WebSocket.
+Coinbase WebSocket Price Feed — Real-time prices for coins not on Binance.
 
-Provides real-time Chainlink oracle prices — the SAME price feed Polymarket
-uses for settlement. Using this instead of Binance eliminates the
-Binance-vs-Chainlink divergence that caused 35% settlement misclassification.
+Used for HYPE (Hyperliquid) which is available on Coinbase but not Binance.
+Same interface as BinancePriceFeed so the strategy can use it interchangeably.
 
 Usage:
-    from lib.chainlink_ws import ChainlinkPriceFeed
+    from lib.coinbase_ws import CoinbasePriceFeed
 
-    feed = ChainlinkPriceFeed(coins=["BTC", "ETH", "SOL", "XRP"])
+    feed = CoinbasePriceFeed(coins=["HYPE"])
     await feed.start()
 
-    price = feed.get_price("BTC")       # Latest Chainlink price
-    vol = feed.get_volatility("BTC")     # Annualized vol from Chainlink data
+    price = feed.get_price("HYPE")       # Latest price
+    vol = feed.get_volatility("HYPE")     # Annualized vol
 
     await feed.stop()
 """
@@ -28,22 +27,16 @@ from typing import Dict, Optional, Deque
 
 logger = logging.getLogger(__name__)
 
-# Polymarket RTDS WebSocket URL
-RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+# Coinbase WebSocket URL
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
-# Coin to Chainlink symbol mapping (slash-separated)
-CHAINLINK_SYMBOLS = {
-    "BTC": "btc/usd",
-    "ETH": "eth/usd",
-    "SOL": "sol/usd",
-    "XRP": "xrp/usd",
-    "DOGE": "doge/usd",
-    "BNB": "bnb/usd",
-    "HYPE": "hype/usd",
+# Coin to Coinbase product ID mapping
+COINBASE_SYMBOLS = {
+    "HYPE": "HYPE-USD",
 }
 
-# Reverse mapping for fast lookup
-SYMBOL_TO_COIN = {v: k for k, v in CHAINLINK_SYMBOLS.items()}
+# Reverse mapping
+PRODUCT_TO_COIN = {v: k for k, v in COINBASE_SYMBOLS.items()}
 
 # Seconds in a year for annualization
 SECONDS_PER_YEAR = 365.25 * 24 * 3600
@@ -69,13 +62,13 @@ class CoinState:
     _vol_calc_time: float = 0.0
 
 
-class ChainlinkPriceFeed:
+class CoinbasePriceFeed:
     """
-    Real-time price feed from Chainlink via Polymarket RTDS.
+    Real-time price feed from Coinbase WebSocket.
 
-    Connects to Polymarket's WebSocket and subscribes to the
-    crypto_prices_chainlink topic. This is the SAME price source
-    Polymarket uses for settlement — no more Binance divergence.
+    Connects to Coinbase's ticker channel for sub-second price updates.
+    Calculates rolling realized volatility from ticker prices.
+    Same interface as BinancePriceFeed.
     """
 
     def __init__(
@@ -85,42 +78,56 @@ class ChainlinkPriceFeed:
         vol_sample_interval: float = 5.0,
         vol_recalc_interval: float = 10.0,
     ):
-        self.coins = [c.upper() for c in (coins or ["BTC"])]
+        """
+        Args:
+            coins: List of coin symbols (default: ["HYPE"])
+            vol_window_seconds: Window for volatility calculation (default: 5 min)
+            vol_sample_interval: Seconds between price samples for vol calc
+            vol_recalc_interval: How often to recalculate volatility
+        """
+        self.coins = [c.upper() for c in (coins or ["HYPE"])]
         self.vol_window_seconds = vol_window_seconds
         self.vol_sample_interval = vol_sample_interval
         self.vol_recalc_interval = vol_recalc_interval
 
+        # State per coin
         self._state: Dict[str, CoinState] = {}
         for coin in self.coins:
-            sym = CHAINLINK_SYMBOLS.get(coin)
+            sym = COINBASE_SYMBOLS.get(coin)
             if not sym:
-                raise ValueError(f"Unsupported coin: {coin}. Use: {list(CHAINLINK_SYMBOLS.keys())}")
+                raise ValueError(f"Unsupported coin for Coinbase: {coin}. Use: {list(COINBASE_SYMBOLS.keys())}")
             self._state[coin] = CoinState(symbol=sym)
 
+        # Last sample time per coin (for vol sampling)
         self._last_sample: Dict[str, float] = {c: 0.0 for c in self.coins}
+
         self._ws = None
         self._task: Optional[asyncio.Task] = None
-        self._ping_task: Optional[asyncio.Task] = None
         self._running = False
 
     @property
     def connected(self) -> bool:
         return self._running and self._ws is not None
 
-    def get_price(self, coin: str = "BTC") -> float:
-        """Get latest Chainlink price for a coin. Returns 0.0 if unavailable."""
+    def get_price(self, coin: str = "HYPE") -> float:
+        """Get latest price for a coin. Returns 0.0 if unavailable."""
         state = self._state.get(coin.upper())
         return state.price if state else 0.0
 
-    def get_age(self, coin: str = "BTC") -> float:
+    def get_age(self, coin: str = "HYPE") -> float:
         """Get seconds since last price update."""
         state = self._state.get(coin.upper())
         if not state or state.last_update == 0:
             return float("inf")
         return time.time() - state.last_update
 
-    def get_volatility(self, coin: str = "BTC") -> float:
-        """Get annualized realized volatility from Chainlink price history."""
+    def get_volatility(self, coin: str = "HYPE") -> float:
+        """
+        Get annualized realized volatility for a coin.
+
+        Calculated from rolling price samples. Returns default (0.50)
+        if insufficient data.
+        """
         coin = coin.upper()
         state = self._state.get(coin)
         if not state:
@@ -134,7 +141,12 @@ class ChainlinkPriceFeed:
         return state._cached_vol
 
     def get_momentum(self, coin: str, lookback_seconds: float = 30.0) -> float:
-        """Return price change % over last N seconds. Positive = price going up."""
+        """
+        Return price change % over last N seconds. Positive = price going up.
+
+        Used as a momentum filter: only enter trades when price
+        is moving in the direction of our bet.
+        """
         coin = coin.upper()
         state = self._state.get(coin)
         if not state or not state.history:
@@ -144,11 +156,13 @@ class ChainlinkPriceFeed:
         if current_price <= 0:
             return 0.0
 
+        # Find the most recent price at or before the cutoff time
         cutoff = time.time() - lookback_seconds
         past_price = None
         for point in state.history:
             if point.timestamp <= cutoff:
                 past_price = point.price
+        # If no point old enough, use the oldest available
         if past_price is None and state.history:
             past_price = state.history[0].price
         if not past_price or past_price <= 0:
@@ -162,8 +176,9 @@ class ChainlinkPriceFeed:
         points = list(state.history)
 
         if len(points) < 10:
-            return 0.50
+            return 0.50  # Default: 50% annualized
 
+        # Calculate log returns between consecutive samples
         returns = []
         for i in range(1, len(points)):
             if points[i - 1].price > 0 and points[i].price > 0:
@@ -175,14 +190,18 @@ class ChainlinkPriceFeed:
         if len(returns) < 5:
             return 0.50
 
+        # Variance of returns, annualized
         sum_sq = sum(r * r for r, _ in returns)
         sum_dt = sum(dt for _, dt in returns)
 
         if sum_dt <= 0:
             return 0.50
 
+        # Variance per second, then annualize
         var_per_sec = sum_sq / sum_dt
         annualized_vol = math.sqrt(var_per_sec * SECONDS_PER_YEAR)
+
+        # Clamp to reasonable range
         return max(0.10, min(2.0, annualized_vol))
 
     async def start(self) -> bool:
@@ -193,25 +212,18 @@ class ChainlinkPriceFeed:
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
 
-        # Wait for first price (Chainlink updates slower than Binance)
-        for _ in range(100):  # 10 seconds max
+        # Wait for first price
+        for _ in range(50):  # 5 seconds max
             await asyncio.sleep(0.1)
             if all(self._state[c].price > 0 for c in self.coins):
                 return True
 
-        logger.warning("ChainlinkPriceFeed: timeout waiting for initial prices")
+        logger.warning("CoinbasePriceFeed: timeout waiting for initial prices")
         return self._running
 
     async def stop(self):
         """Stop the WebSocket connection."""
         self._running = False
-        if self._ping_task:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-            self._ping_task = None
         if self._task:
             self._task.cancel()
             try:
@@ -219,18 +231,6 @@ class ChainlinkPriceFeed:
             except asyncio.CancelledError:
                 pass
             self._task = None
-
-    async def _ping_loop(self, ws):
-        """Send PING every 5 seconds to keep connection alive (per RTDS docs)."""
-        try:
-            while self._running:
-                await asyncio.sleep(5)
-                try:
-                    await ws.ping()
-                except Exception:
-                    break
-        except asyncio.CancelledError:
-            pass
 
     async def _run_loop(self):
         """Main WebSocket loop with auto-reconnect."""
@@ -247,25 +247,20 @@ class ChainlinkPriceFeed:
 
         while self._running:
             try:
-                logger.info(f"ChainlinkPriceFeed connecting to {RTDS_WS_URL}")
+                logger.info(f"CoinbasePriceFeed connecting: {self.coins}")
 
-                async with ws_connect(RTDS_WS_URL) as ws:
+                async with ws_connect(COINBASE_WS_URL) as ws:
                     self._ws = ws
+                    logger.info("CoinbasePriceFeed connected")
 
-                    # Subscribe to Chainlink crypto prices
+                    # Subscribe to ticker channel for our products
+                    product_ids = [COINBASE_SYMBOLS[c] for c in self.coins]
                     subscribe_msg = json.dumps({
-                        "action": "subscribe",
-                        "subscriptions": [{
-                            "topic": "crypto_prices_chainlink",
-                            "type": "*",
-                            "filters": "",
-                        }]
+                        "type": "subscribe",
+                        "product_ids": product_ids,
+                        "channels": ["ticker"],
                     })
                     await ws.send(subscribe_msg)
-                    logger.info(f"ChainlinkPriceFeed subscribed: {self.coins}")
-
-                    # Start ping loop
-                    self._ping_task = asyncio.create_task(self._ping_loop(ws))
 
                     async for msg in ws:
                         if not self._running:
@@ -275,45 +270,40 @@ class ChainlinkPriceFeed:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning(f"ChainlinkPriceFeed error: {e}, reconnecting in 3s")
+                logger.warning(f"CoinbasePriceFeed error: {e}, reconnecting in 2s")
                 self._ws = None
-                if self._ping_task:
-                    self._ping_task.cancel()
-                    self._ping_task = None
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
         self._ws = None
 
     def _handle_message(self, raw: str):
-        """Process incoming RTDS message."""
+        """Process incoming WebSocket message."""
         try:
             data = json.loads(raw)
 
-            if data.get("topic") != "crypto_prices_chainlink":
+            # Coinbase ticker message
+            if data.get("type") != "ticker":
                 return
 
-            payload = data.get("payload", {})
-            symbol = payload.get("symbol", "")  # e.g., "btc/usd"
-            value = payload.get("value")
-            ts_ms = payload.get("timestamp", 0)
-
-            if not symbol or value is None:
+            product_id = data.get("product_id", "")  # e.g., "HYPE-USD"
+            price_str = data.get("price")
+            if not price_str:
                 return
 
-            price = float(value)
-            ts = ts_ms / 1000.0 if ts_ms > 1e12 else float(ts_ms)
+            price = float(price_str)
+            ts = time.time()  # Coinbase ticker doesn't always have a clean epoch
 
-            coin = SYMBOL_TO_COIN.get(symbol)
+            # Find which coin this is
+            coin = PRODUCT_TO_COIN.get(product_id)
             if coin and coin in self._state:
                 state = self._state[coin]
                 state.price = price
-                state.last_update = ts if ts > 0 else time.time()
+                state.last_update = ts
 
                 # Sample for volatility calculation
-                sample_ts = state.last_update
-                if sample_ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
-                    state.history.append(PricePoint(price=price, timestamp=sample_ts))
-                    self._last_sample[coin] = sample_ts
+                if ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
+                    state.history.append(PricePoint(price=price, timestamp=ts))
+                    self._last_sample[coin] = ts
 
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        except (json.JSONDecodeError, KeyError, ValueError):
             pass

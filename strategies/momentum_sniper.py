@@ -42,6 +42,7 @@ from typing import Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 
 from lib.binance_ws import BinancePriceFeed
+from lib.coinbase_ws import CoinbasePriceFeed, COINBASE_SYMBOLS
 from lib.fair_value import BinaryFairValue, FairValue
 from lib.direct_fv import DirectFairValue
 from lib.console import Colors, LogBuffer, log
@@ -52,6 +53,68 @@ from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
 from src.gamma_client import GammaClient
+
+# Coins that use Coinbase instead of Binance for price data
+COINBASE_COINS = set(COINBASE_SYMBOLS.keys())  # {"HYPE"}
+
+
+class MultiPriceFeed:
+    """
+    Routes price queries to the correct source per coin.
+
+    HYPE -> CoinbasePriceFeed (not on Binance)
+    Everything else -> BinancePriceFeed (or ChainlinkPriceFeed)
+
+    Exposes the same interface as BinancePriceFeed so the strategy
+    doesn't need any per-call routing logic.
+    """
+
+    def __init__(self, primary_feed, coinbase_feed=None):
+        """
+        Args:
+            primary_feed: BinancePriceFeed or ChainlinkPriceFeed for most coins
+            coinbase_feed: CoinbasePriceFeed for HYPE (None if HYPE not in coin list)
+        """
+        self._primary = primary_feed
+        self._coinbase = coinbase_feed
+
+    def _feed_for(self, coin: str):
+        """Return the correct feed for a given coin."""
+        if self._coinbase and coin.upper() in COINBASE_COINS:
+            return self._coinbase
+        return self._primary
+
+    @property
+    def connected(self) -> bool:
+        ok = self._primary.connected
+        if self._coinbase:
+            ok = ok and self._coinbase.connected
+        return ok
+
+    def get_price(self, coin: str = "BTC") -> float:
+        return self._feed_for(coin).get_price(coin)
+
+    def get_age(self, coin: str = "BTC") -> float:
+        return self._feed_for(coin).get_age(coin)
+
+    def get_volatility(self, coin: str = "BTC") -> float:
+        return self._feed_for(coin).get_volatility(coin)
+
+    def get_momentum(self, coin: str, lookback_seconds: float = 30.0) -> float:
+        return self._feed_for(coin).get_momentum(coin, lookback_seconds)
+
+    async def start(self) -> bool:
+        ok = await self._primary.start()
+        if self._coinbase:
+            ok2 = await self._coinbase.start()
+            ok = ok and ok2
+        return ok
+
+    async def stop(self):
+        await self._primary.stop()
+        if self._coinbase:
+            await self._coinbase.stop()
+
 
 # Taker fee rates per timeframe.
 # Fee per token = price * (1 - price) * rate.
@@ -312,25 +375,20 @@ class EMATracker:
         self._logger = logging.getLogger("sniper.ema")
 
     def initialize(self, coin: str) -> bool:
-        """Fetch historical 5m klines from Binance and compute initial EMAs."""
+        """Fetch historical 5m klines and compute initial EMAs.
+
+        Uses Coinbase for HYPE, Binance for everything else.
+        """
         import requests as _req
-        symbol = f"{coin.upper()}USDT"
         limit = self.slow_period * 3
+
         try:
-            resp = _req.get(
-                "https://api.binance.com/api/v3/klines",
-                params={"symbol": symbol, "interval": "5m", "limit": limit},
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                self._logger.warning(f"Binance klines {resp.status_code} for {coin}")
-                self._valid[coin] = False
-                return False
+            if coin.upper() in COINBASE_COINS:
+                closes = self._fetch_coinbase_candles(_req, coin, limit)
+            else:
+                closes = self._fetch_binance_candles(_req, coin, limit)
 
-            klines = resp.json()
-            closes = [float(k[4]) for k in klines]  # k[4] = close price
-
-            if len(closes) < self.slow_period:
+            if closes is None or len(closes) < self.slow_period:
                 self._valid[coin] = False
                 return False
 
@@ -350,6 +408,43 @@ class EMATracker:
             self._logger.warning(f"EMA init failed for {coin}: {e}")
             self._valid[coin] = False
             return False
+
+    def _fetch_binance_candles(self, _req, coin: str, limit: int):
+        """Fetch historical 5m klines from Binance."""
+        symbol = f"{coin.upper()}USDT"
+        resp = _req.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": "5m", "limit": limit},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            self._logger.warning(f"Binance klines {resp.status_code} for {coin}")
+            return None
+        klines = resp.json()
+        return [float(k[4]) for k in klines]  # k[4] = close price
+
+    def _fetch_coinbase_candles(self, _req, coin: str, limit: int):
+        """Fetch historical 5m candles from Coinbase for coins not on Binance."""
+        from lib.coinbase_ws import COINBASE_SYMBOLS
+        product_id = COINBASE_SYMBOLS.get(coin.upper())
+        if not product_id:
+            self._logger.warning(f"No Coinbase symbol for {coin}")
+            return None
+        # Coinbase candles endpoint: granularity 300 = 5 min
+        resp = _req.get(
+            f"https://api.exchange.coinbase.com/products/{product_id}/candles",
+            params={"granularity": 300},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            self._logger.warning(f"Coinbase candles {resp.status_code} for {coin}")
+            return None
+        candles = resp.json()
+        # Coinbase returns [time, low, high, open, close, volume] in DESCENDING order
+        # Reverse to chronological and extract close prices
+        candles.reverse()
+        closes = [float(c[4]) for c in candles[-limit:]]
+        return closes
 
     def update(self, coin: str, price: float, slug: str = ""):
         """Update EMAs with a new price observation (once per market window)."""
@@ -522,11 +617,25 @@ class MomentumSniperStrategy:
         # Real-time price feed (all coins)
         # Chainlink = Polymarket's settlement source (most accurate for outcomes)
         # Binance = faster updates, but diverges from settlement on close markets
+        # HYPE uses Coinbase (not on Binance)
+        binance_coins = [c for c in config.coins if c not in COINBASE_COINS]
+        coinbase_coins = [c for c in config.coins if c in COINBASE_COINS]
+
         if config.price_source == "chainlink":
             from lib.chainlink_ws import ChainlinkPriceFeed
-            self.binance = ChainlinkPriceFeed(coins=config.coins)
+            primary_feed = ChainlinkPriceFeed(coins=binance_coins) if binance_coins else None
         else:
-            self.binance = BinancePriceFeed(coins=config.coins)
+            primary_feed = BinancePriceFeed(coins=binance_coins) if binance_coins else None
+
+        coinbase_feed = CoinbasePriceFeed(coins=coinbase_coins) if coinbase_coins else None
+
+        # If only Coinbase coins (e.g. only HYPE), coinbase IS the primary
+        if primary_feed is None and coinbase_feed is not None:
+            self.binance = coinbase_feed
+        elif coinbase_feed is not None:
+            self.binance = MultiPriceFeed(primary_feed, coinbase_feed)
+        else:
+            self.binance = primary_feed
 
         # Deribit implied volatility feed (forward-looking, market consensus)
         self._deribit_feed = None
@@ -698,15 +807,18 @@ class MomentumSniperStrategy:
         """Start the strategy: Binance feed + market managers for each coin."""
         self.running = True
 
-        # Start Binance price feed
-        self.log("Starting Binance price feed...")
+        # Start price feeds (Binance + Coinbase for HYPE if needed)
+        coinbase_coins = [c for c in self.config.coins if c in COINBASE_COINS]
+        feed_label = "price feeds" if coinbase_coins else "Binance price feed"
+        self.log(f"Starting {feed_label}...")
         if not await self.binance.start():
-            self.log("Failed to start Binance feed", "error")
+            self.log("Failed to start price feed", "error")
             return False
 
         for coin in self.config.coins:
             price = self.binance.get_price(coin)
-            self.log(f"Binance {coin}: ${price:,.2f}", "success")
+            source = "Coinbase" if coin in COINBASE_COINS else "Binance"
+            self.log(f"{source} {coin}: ${price:,.2f}", "success")
 
         # Initialize EMA trend tracker from historical Binance klines
         if self._ema_tracker:
