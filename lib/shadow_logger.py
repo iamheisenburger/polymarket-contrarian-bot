@@ -210,6 +210,33 @@ class ShadowLogger:
             won = (side == winning_side)
             self.resolve(market_slug, side, won)
 
+    def flush_stale(self, max_age_seconds: int = 600):
+        """Write any pending records older than max_age_seconds as unresolved.
+
+        Safety net: if resolve() never gets called (websocket errors, crashes),
+        we still capture the record with outcome='unresolved' so nothing is lost.
+        """
+        now = datetime.utcnow()
+        stale_keys = []
+        for key, record in self._pending.items():
+            try:
+                ts = datetime.fromisoformat(record["timestamp"].replace("+00:00", ""))
+                age = (now - ts).total_seconds()
+                if age > max_age_seconds:
+                    stale_keys.append(key)
+            except Exception:
+                stale_keys.append(key)
+
+        for key in stale_keys:
+            record = self._pending.pop(key, None)
+            if record:
+                if record["paper_outcome"] == "pending":
+                    record["paper_outcome"] = "unresolved"
+                if record.get("was_live_trade") and record.get("live_outcome") == "pending":
+                    record["live_outcome"] = "unresolved"
+                self._write_row(record)
+                logger.warning(f"Shadow flushed stale record: {key} (age > {max_age_seconds}s)")
+
     def _write_row(self, record: dict):
         """Append a single row to the CSV."""
         try:

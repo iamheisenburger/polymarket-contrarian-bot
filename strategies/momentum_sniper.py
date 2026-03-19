@@ -2013,6 +2013,10 @@ class MomentumSniperStrategy:
         # Periodic redemption of settled winning positions
         self._periodic_redeem()
 
+        # Flush stale shadow records that were never resolved
+        if self.shadow_logger:
+            self.shadow_logger.flush_stale(max_age_seconds=600)
+
         # Process pending confirmation signals
         if self.config.confirm_gap > 0:
             await self._process_pending_signals()
