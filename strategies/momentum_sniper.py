@@ -223,7 +223,7 @@ class SniperConfig:
     # Edge is still calculated against the original ask — tolerance just means
     # we're willing to pay slightly more to ensure the fill.
     # 0.0 = disabled (submit at exact ask). 0.01 = 1 cent tolerance (default).
-    fok_tolerance: float = 0.01
+    fok_tolerance: float = 0.02
 
     # Enhanced circuit breaker: rolling window of last 10 trade outcomes.
     # - 3 consecutive losses -> pause trading for 1 hour
@@ -1461,18 +1461,18 @@ class MomentumSniperStrategy:
             if available_tokens > 0:
                 depth_capped = min(num_tokens, available_tokens)
                 # Floor at 1 token, but Polymarket minimum is 5 tokens
-                if depth_capped < 5.0:
+                if depth_capped < 4.0:
                     self.log(
                         f"[DEPTH] {state.coin} {side.upper()} only {available_tokens:.0f} "
-                        f"tokens in book <= ${buy_price:.2f} (need 5). Skipping.",
+                        f"tokens in book <= ${buy_price:.2f} (need 4). Skipping.",
                         "warning"
                     )
                     return False
                 if depth_capped < num_tokens:
                     # Round down to whole tokens
                     depth_capped = float(int(depth_capped))
-                    if depth_capped < 5.0:
-                        depth_capped = 5.0
+                    if depth_capped < 4.0:
+                        depth_capped = 4.0
                     self.log(
                         f"[DEPTH] {state.coin} {side.upper()} depth={available_tokens:.0f} "
                         f"<= ${buy_price:.2f}, sizing {num_tokens:.0f} -> {depth_capped:.0f}",
