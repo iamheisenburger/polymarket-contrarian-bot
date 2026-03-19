@@ -507,10 +507,10 @@ class MomentumSniperStrategy:
         if config.use_direct_fv:
             cal_path = config.direct_fv_calibration or None
             self.fv_calc = DirectFairValue(calibration_path=cal_path)
-            self.log(f"Using DirectFairValue (empirical sigmoid)"
-                     f"{' with calibration: ' + cal_path if cal_path else ' with defaults'}")
+            self._direct_fv_msg = f"Using DirectFairValue (empirical sigmoid){' with calibration: ' + cal_path if cal_path else ' with defaults'}"
         else:
             self.fv_calc = BinaryFairValue()
+            self._direct_fv_msg = None
 
         # Real-time price feed (all coins)
         # Chainlink = Polymarket's settlement source (most accurate for outcomes)
@@ -571,6 +571,10 @@ class MomentumSniperStrategy:
 
         # Log buffer for display
         self._log_buffer = LogBuffer(max_size=8)
+
+        # Deferred log messages from before buffer was ready
+        if self._direct_fv_msg:
+            self.log(self._direct_fv_msg, "info")
 
         # Redemption tracking
         self._last_redeem_time: float = 0.0
