@@ -1451,17 +1451,18 @@ class MomentumSniperStrategy:
             num_tokens = 5.0
             buy_price = round(entry_price, 2)
 
-            # FOK rejection simulation: check orderbook depth
+            # FOK rejection simulation: log depth but don't skip.
+            # Paper should capture all signals regardless of book state
+            # so we get an unbiased view of signal quality.
             ob = state.manager.get_orderbook(side)
             if ob and ob.asks:
                 best_ask_size = ob.asks[0].size
                 if best_ask_size < num_tokens:
                     self.log(
-                        f"[PAPER SKIP] {state.coin} {side.upper()} @ {buy_price:.2f} "
-                        f"FOK killed (depth={best_ask_size:.0f} < {num_tokens:.0f})",
-                        "warning"
+                        f"[PAPER] {state.coin} {side.upper()} @ {buy_price:.2f} "
+                        f"thin book (depth={best_ask_size:.0f} < {num_tokens:.0f}), logging anyway",
+                        "info"
                     )
-                    return False
 
             # Fee-inclusive cost basis
             fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
@@ -1564,8 +1565,9 @@ class MomentumSniperStrategy:
         if buy_price > self.config.max_entry_price:
             buy_price = self.config.max_entry_price
 
-        # Depth-aware sizing: check how many tokens are available within
-        # the tolerance range and cap our order size accordingly.
+        # Depth-aware sizing: log book state but ALWAYS attempt the order.
+        # Thin books are common on 5m markets — let the FOK fail naturally
+        # rather than pre-filtering. Every signal is worth attempting.
         ob = state.manager.get_orderbook(side)
         if ob and ob.asks:
             available_tokens = 0.0
@@ -1574,21 +1576,9 @@ class MomentumSniperStrategy:
                     available_tokens += level.size
                 else:
                     break  # asks sorted ascending, no more levels in range
-            if available_tokens > 0:
-                depth_capped = min(num_tokens, available_tokens)
-                # Floor at 1 token, but Polymarket minimum is 5 tokens
-                if depth_capped < 2.0:
-                    self.log(
-                        f"[DEPTH] {state.coin} {side.upper()} only {available_tokens:.0f} "
-                        f"tokens in book <= ${buy_price:.2f} (need 2). Skipping.",
-                        "warning"
-                    )
-                    return False
-                if depth_capped < num_tokens:
-                    # Round down to whole tokens
-                    depth_capped = float(int(depth_capped))
-                    if depth_capped < 2.0:
-                        depth_capped = 2.0
+            if available_tokens > 0 and available_tokens < num_tokens:
+                depth_capped = float(int(min(num_tokens, available_tokens)))
+                if depth_capped >= 1.0:
                     self.log(
                         f"[DEPTH] {state.coin} {side.upper()} depth={available_tokens:.0f} "
                         f"<= ${buy_price:.2f}, sizing {num_tokens:.0f} -> {depth_capped:.0f}",
