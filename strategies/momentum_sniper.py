@@ -286,7 +286,11 @@ class SniperConfig:
     # Edge is still calculated against the original ask — tolerance just means
     # we're willing to pay slightly more to ensure the fill.
     # 0.0 = disabled (submit at exact ask). 0.01 = 1 cent tolerance (default).
-    fok_tolerance: float = 0.02
+    fok_tolerance: float = 0.04
+
+    # Number of FOK retry steps after initial rejection. Each step adds +1c.
+    # With tolerance=0.04 and retries=3: tries at +4c, +5c, +6c, +7c.
+    fok_retry_steps: int = 3
 
     # Enhanced circuit breaker: rolling window of last 10 trade outcomes.
     # - 3 consecutive losses -> pause trading for 1 hour
@@ -1573,18 +1577,18 @@ class MomentumSniperStrategy:
             if available_tokens > 0:
                 depth_capped = min(num_tokens, available_tokens)
                 # Floor at 1 token, but Polymarket minimum is 5 tokens
-                if depth_capped < 4.0:
+                if depth_capped < 2.0:
                     self.log(
                         f"[DEPTH] {state.coin} {side.upper()} only {available_tokens:.0f} "
-                        f"tokens in book <= ${buy_price:.2f} (need 4). Skipping.",
+                        f"tokens in book <= ${buy_price:.2f} (need 2). Skipping.",
                         "warning"
                     )
                     return False
                 if depth_capped < num_tokens:
                     # Round down to whole tokens
                     depth_capped = float(int(depth_capped))
-                    if depth_capped < 4.0:
-                        depth_capped = 4.0
+                    if depth_capped < 2.0:
+                        depth_capped = 2.0
                     self.log(
                         f"[DEPTH] {state.coin} {side.upper()} depth={available_tokens:.0f} "
                         f"<= ${buy_price:.2f}, sizing {num_tokens:.0f} -> {depth_capped:.0f}",
@@ -1603,12 +1607,15 @@ class MomentumSniperStrategy:
             order_type="FOK",
         )
 
-        # Retry with additional tolerance if FOK rejected (+1c beyond initial tolerance)
+        # Retry ladder: step up +1c per attempt to catch liquidity at higher levels.
+        # Each retry costs 1 cent more but missed signals cost ~$1.53 in EV.
         if not result.success and tolerance > 0:
-            retry_price = round(buy_price + 0.01, 2)
-            if retry_price <= self.config.max_entry_price:
+            for step in range(1, self.config.fok_retry_steps + 1):
+                retry_price = round(buy_price + 0.01 * step, 2)
+                if retry_price > self.config.max_entry_price:
+                    break
                 self.log(
-                    f"FOK retry +1c @ ${retry_price:.2f} (total +{retry_price - original_ask:.2f}c)",
+                    f"FOK retry +{step}c @ ${retry_price:.2f} (total +${retry_price - original_ask:.2f})",
                     "warning"
                 )
                 result = await self.bot.place_order(
@@ -1619,7 +1626,8 @@ class MomentumSniperStrategy:
                     order_type="FOK",
                 )
                 if result.success:
-                    buy_price = retry_price  # Update to actual fill price
+                    buy_price = retry_price
+                    break
 
         # FOK fallback: if Kelly-sized order fails on thin orderbook,
         # retry with minimum 5 tokens (paper-validated fill size).
@@ -1636,6 +1644,46 @@ class MomentumSniperStrategy:
                 side="BUY",
                 order_type="FOK",
             )
+
+        # GTC fallback: if all FOK attempts failed, place a GTC order and wait.
+        # This sits in the book and can get filled by sellers coming to us.
+        # Cancel after 5 seconds if not filled.
+        if not result.success:
+            # Use the highest price we were willing to pay
+            gtc_price = min(
+                round(original_ask + tolerance + 0.01 * self.config.fok_retry_steps, 2),
+                self.config.max_entry_price,
+            )
+            self.log(
+                f"GTC fallback @ ${gtc_price:.2f} for {num_tokens:.0f} tokens (5s timeout)",
+                "warning"
+            )
+            gtc_result = await self.bot.place_order(
+                token_id=token_id,
+                price=gtc_price,
+                size=num_tokens,
+                side="BUY",
+                order_type="GTC",
+            )
+            if gtc_result.success and gtc_result.order_id:
+                # Wait up to 5 seconds for fill
+                import asyncio
+                await asyncio.sleep(5)
+                # Check if it filled by looking at balance change
+                bal_after = self.bot.get_usdc_balance()
+                expected_cost = gtc_price * num_tokens
+                # If balance dropped, order filled
+                if bal_after < (self._balance - expected_cost * 0.5):
+                    self.log(f"GTC filled! Balance dropped to ${bal_after:.2f}", "info")
+                    result = gtc_result
+                    buy_price = gtc_price
+                else:
+                    # Cancel unfilled GTC order
+                    try:
+                        await self.bot.cancel_order(gtc_result.order_id)
+                        self.log(f"GTC cancelled after 5s (no fill)", "info")
+                    except Exception as e:
+                        self.log(f"GTC cancel error: {e}", "warning")
 
         order_end = time.time()
         order_latency_ms = (order_end - order_start) * 1000
