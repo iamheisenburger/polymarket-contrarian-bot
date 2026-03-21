@@ -1599,6 +1599,17 @@ class MomentumSniperStrategy:
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
 
+        # Log orderbook state before attempting fill (rejection diagnostics)
+        ob_snapshot = ""
+        if ob and ob.asks:
+            top_levels = [(a.price, a.size) for a in ob.asks[:5]]
+            ob_snapshot = " | ".join(f"${p:.2f}x{s:.0f}" for p, s in top_levels)
+            self.log(
+                f"[FILL] {state.coin} {side.upper()} submitting FOK @ ${buy_price:.2f} "
+                f"(ask=${original_ask:.2f} +{tolerance:.2f}tol) book=[{ob_snapshot}]",
+                "info"
+            )
+
         result = await self.bot.place_order(
             token_id=token_id,
             price=buy_price,
@@ -1688,6 +1699,29 @@ class MomentumSniperStrategy:
         order_end = time.time()
         order_latency_ms = (order_end - order_start) * 1000
         total_latency_ms = (order_end - signal_time) * 1000 if signal_time else 0
+
+        # Log rejection diagnostics — understand WHY fills fail
+        if not result.success:
+            # Check current orderbook state post-rejection
+            ob_now = state.manager.get_orderbook(side)
+            if ob_now and ob_now.asks:
+                current_best = ob_now.asks[0].price
+                current_depth = sum(a.size for a in ob_now.asks[:3])
+                max_price_tried = round(original_ask + tolerance + 0.01 * self.config.fok_retry_steps, 2)
+                if current_best > max_price_tried:
+                    reason = f"PRICE_MOVED (best now ${current_best:.2f}, max tried ${max_price_tried:.2f})"
+                elif current_depth < 2:
+                    reason = f"NO_DEPTH (only {current_depth:.0f} tokens in top 3 levels)"
+                else:
+                    reason = f"SCOOPED (book has ${current_best:.2f}x{current_depth:.0f} but fill failed — someone faster)"
+            else:
+                reason = "NO_BOOK (orderbook empty)"
+            self.log(
+                f"[REJECT] {state.coin} {side.upper()} ALL attempts failed: {reason} "
+                f"(tried ${original_ask:.2f} to ${min(max_price_tried, self.config.max_entry_price):.2f}, "
+                f"{order_latency_ms:.0f}ms total)",
+                "warning"
+            )
 
         # Only track position if order was accepted AND filled
         order_status = (result.status or "").upper()
