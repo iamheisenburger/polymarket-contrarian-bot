@@ -468,65 +468,41 @@ class TradingBot:
 
             success = response.get("success", False)
             order_id = response.get("orderID", "")
+            resp_status = response.get("status", "")
 
             logger.info(
                 f"Order placed: {side} {size}@{price} "
-                f"(token: {token_id[:16]}...) -> {order_id[:20]}..."
+                f"(token: {token_id[:16]}...) -> {order_id[:20]}... "
+                f"success={success} status={resp_status} type={order_type}"
             )
 
-            # FOK verification: confirm fill via balance diff + CLOB lookup.
-            # IMPORTANT: Default to FILLED. Only report NOT_FILLED if we have
-            # strong positive evidence (CLOB says CANCELLED/DEAD). A false
-            # negative (thinking filled when not) wastes a position slot.
-            # A false "not filled" (the old bug) causes untracked spending
-            # and duplicate orders — far worse.
+            # FOK verification: quick CLOB lookup only.
+            # ONLY reject if CLOB explicitly says CANCELLED/DEAD.
+            # The old balance-diff approach took 9-12 seconds and was unreliable
+            # (balance API lags), causing real fills to be reported as failures.
+            # A missed fill (false negative) causes untracked spending and
+            # duplicate orders — far worse than a phantom position (false positive).
             if success and order_id and order_type.upper() == "FOK":
                 import time
-                expected_cost = round(price * size, 2)
-                filled = False
-
-                # Try balance diff with retries (balance API can lag)
-                for attempt in range(3):
-                    time.sleep(3 if attempt == 0 else 4)
-                    bal_after = self.get_usdc_balance()
-                    if bal_after is not None and bal_before is not None:
-                        spent = round(bal_before - bal_after, 2)
-                        if spent >= expected_cost * 0.5:
-                            logger.info(
-                                f"FOK FILLED (balance, attempt {attempt+1}): {order_id[:20]}... "
-                                f"spent=${spent:.2f} (expected ${expected_cost:.2f})"
-                            )
-                            filled = True
-                            break
-
-                # If balance check inconclusive, try CLOB order lookup
-                if not filled:
-                    try:
-                        order_data = await self._run_in_thread(
-                            self._official_client.get_order, order_id,
-                        )
-                        status = (order_data or {}).get("status", "")
-                        if status == "MATCHED":
-                            logger.info(f"FOK FILLED (CLOB lookup): {order_id[:20]}...")
-                            filled = True
-                        elif status in ("CANCELLED", "DEAD"):
-                            logger.warning(f"FOK NOT FILLED (CLOB={status}): {order_id[:20]}...")
-                            return OrderResult(
-                                success=False,
-                                order_id=order_id,
-                                status="NOT_FILLED",
-                                message=f"FOK not filled: CLOB status={status}",
-                            )
-                    except Exception:
-                        pass
-
-                # Default: treat as FILLED. It's safer to track a position
-                # we might not have than to miss one we DO have.
-                if not filled:
-                    logger.warning(
-                        f"FOK verification inconclusive: {order_id[:20]}... "
-                        f"ASSUMING FILLED (safe default)"
+                time.sleep(1)  # Brief pause for CLOB to update
+                try:
+                    order_data = await self._run_in_thread(
+                        self._official_client.get_order, order_id,
                     )
+                    clob_status = (order_data or {}).get("status", "")
+                    logger.info(f"FOK verify: {order_id[:20]}... CLOB status={clob_status}")
+                    if clob_status in ("CANCELLED", "DEAD"):
+                        logger.warning(f"FOK NOT FILLED (CLOB={clob_status}): {order_id[:20]}...")
+                        return OrderResult(
+                            success=False,
+                            order_id=order_id,
+                            status="NOT_FILLED",
+                            message=f"FOK not filled: CLOB status={clob_status}",
+                        )
+                    # MATCHED, LIVE, or anything else = treat as filled
+                    logger.info(f"FOK FILLED (CLOB={clob_status}): {order_id[:20]}...")
+                except Exception as e:
+                    logger.warning(f"FOK verify failed ({e}), ASSUMING FILLED: {order_id[:20]}...")
 
             return OrderResult(
                 success=success,

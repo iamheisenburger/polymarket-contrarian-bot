@@ -1607,6 +1607,11 @@ class MomentumSniperStrategy:
             side="BUY",
             order_type="FOK",
         )
+        self.log(
+            f"[ORDER] {state.coin} {side.upper()} FOK @ ${buy_price:.2f}: "
+            f"success={result.success} status={result.status} id={result.order_id[:20] if result.order_id else 'none'}",
+            "info"
+        )
 
         # Retry ladder: step up +1c per attempt to catch liquidity at higher levels.
         # Each retry costs 1 cent more but missed signals cost ~$1.53 in EV.
