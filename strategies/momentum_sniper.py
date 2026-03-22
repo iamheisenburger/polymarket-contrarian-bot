@@ -1677,6 +1677,7 @@ class MomentumSniperStrategy:
                 if bal_after < (self._balance - expected_cost * 0.5):
                     self.log(f"GTC filled! Balance dropped to ${bal_after:.2f}", "info")
                     result = gtc_result
+                    result._gtc_confirmed = True
                     buy_price = gtc_price
                 else:
                     # Cancel unfilled GTC order
@@ -1713,9 +1714,36 @@ class MomentumSniperStrategy:
                 "warning"
             )
 
-        # Only track position if order was accepted AND filled
+        # Track position if order was accepted AND filled.
+        # Some fills return status "LIVE"/"OPEN" even when matched — the status
+        # field is unreliable. Use balance change as ground truth for ambiguous cases.
         order_status = (result.status or "").upper()
-        if result.success and order_status not in ("LIVE", "OPEN"):
+        is_confirmed_fill = False
+        if result.success:
+            if order_status not in ("LIVE", "OPEN"):
+                is_confirmed_fill = True
+            elif hasattr(result, '_gtc_confirmed') and result._gtc_confirmed:
+                is_confirmed_fill = True
+            else:
+                # Ambiguous status — check balance to confirm
+                import time as _time
+                _time.sleep(2)
+                bal_check = self.bot.get_usdc_balance()
+                expected_cost = buy_price * num_tokens
+                if bal_check is not None and bal_check < (self._balance - expected_cost * 0.3):
+                    self.log(
+                        f"[FILL RESCUE] {state.coin} {side.upper()} status={order_status} "
+                        f"but balance dropped ${self._balance:.2f} -> ${bal_check:.2f} — FILLED",
+                        "warning"
+                    )
+                    is_confirmed_fill = True
+                else:
+                    self.log(
+                        f"[FILL CHECK] {state.coin} {side.upper()} status={order_status} "
+                        f"balance unchanged (${bal_check:.2f}) — NOT filled",
+                        "info"
+                    )
+        if is_confirmed_fill:
             fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
             actual_cost = (buy_price + fee_per_token) * num_tokens
 
@@ -1793,14 +1821,13 @@ class MomentumSniperStrategy:
                 "success"
             )
             return True
-        elif result.success and order_status in ("LIVE", "OPEN"):
-            # Order was accepted but NOT filled (sat on book) — do NOT track position
-            # Shadow log: FOK-like rejection (order sat on book, not filled)
+        elif result.success and not is_confirmed_fill:
+            # Order was accepted but balance check confirms NOT filled
             if self.shadow_logger:
                 self.shadow_logger.log_fok_reject(state.current_slug, state.coin, side)
             self.log(
                 f"Order NOT FILLED ({state.coin} {side} @ {buy_price:.2f}) "
-                f"status={result.status} — skipping phantom position",
+                f"status={result.status} — balance confirmed no fill",
                 "warning"
             )
             state.last_fail_time[side] = time.time()
