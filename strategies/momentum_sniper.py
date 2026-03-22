@@ -1672,25 +1672,52 @@ class MomentumSniperStrategy:
                 order_type="GTC",
             )
             if gtc_result.success and gtc_result.order_id:
+                # Snapshot real balance BEFORE waiting
+                bal_before_gtc = self.bot.get_usdc_balance()
+                self.log(
+                    f"GTC placed: {gtc_result.order_id[:20]}... bal_before=${bal_before_gtc:.2f}",
+                    "info"
+                )
                 # Wait up to 5 seconds for fill
                 import asyncio
                 await asyncio.sleep(5)
-                # Check if it filled by looking at balance change
-                bal_after = self.bot.get_usdc_balance()
+                # Check if it filled by comparing real balance before vs after
+                bal_after_gtc = self.bot.get_usdc_balance()
                 expected_cost = gtc_price * num_tokens
-                # If balance dropped, order filled
-                if bal_after < (self._balance - expected_cost * 0.5):
-                    self.log(f"GTC filled! Balance dropped to ${bal_after:.2f}", "info")
+                bal_drop = (bal_before_gtc or 0) - (bal_after_gtc or 0)
+                self.log(
+                    f"GTC check: bal ${bal_before_gtc:.2f} -> ${bal_after_gtc:.2f} "
+                    f"(drop=${bal_drop:.2f}, expected=${expected_cost:.2f})",
+                    "info"
+                )
+                if bal_drop >= expected_cost * 0.3:
+                    self.log(f"GTC FILLED! Balance dropped ${bal_drop:.2f}", "info")
                     result = gtc_result
                     result._gtc_confirmed = True
                     buy_price = gtc_price
                 else:
-                    # Cancel unfilled GTC order
+                    # Also do CLOB lookup as backup
                     try:
-                        await self.bot.cancel_order(gtc_result.order_id)
-                        self.log(f"GTC cancelled after 5s (no fill)", "info")
+                        order_data = await asyncio.to_thread(
+                            self.bot._official_client.get_order, gtc_result.order_id
+                        )
+                        clob_status = (order_data or {}).get("status", "")
+                        if clob_status == "MATCHED":
+                            self.log(f"GTC FILLED (CLOB={clob_status})!", "info")
+                            result = gtc_result
+                            result._gtc_confirmed = True
+                            buy_price = gtc_price
+                        else:
+                            # Cancel unfilled GTC order
+                            await self.bot.cancel_order(gtc_result.order_id)
+                            self.log(f"GTC cancelled (CLOB={clob_status}, no fill)", "info")
                     except Exception as e:
-                        self.log(f"GTC cancel error: {e}", "warning")
+                        # Cancel attempt — order might have filled anyway
+                        try:
+                            await self.bot.cancel_order(gtc_result.order_id)
+                        except Exception:
+                            pass
+                        self.log(f"GTC verify failed ({e}), cancelled", "warning")
 
         order_end = time.time()
         order_latency_ms = (order_end - order_start) * 1000
