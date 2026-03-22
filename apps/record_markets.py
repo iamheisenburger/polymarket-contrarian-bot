@@ -73,6 +73,10 @@ SNAPSHOT_HEADERS = [
     "momentum", "fair_value_up", "fair_value_down",
     "ema_fast", "ema_slow", "ema_trend",
     "spread_up", "spread_down",
+    # Signal simulation: which side (if any) would trigger, and filter pass/fail
+    "signal_side", "signal_entry_price", "signal_edge",
+    "passed_momentum", "passed_entry_price", "passed_fv",
+    "passed_edge", "passed_tte", "passed_trend", "passed_all",
 ]
 
 OUTCOME_HEADERS = [
@@ -485,6 +489,61 @@ class MarketDataRecorder:
         ema_slow = self.ema_tracker.get_slow(state.coin)
         ema_trend = self.ema_tracker.trend(state.coin)
 
+        # Signal simulation: evaluate both sides and pick the one with edge
+        signal_side = ""
+        signal_entry = 0.0
+        signal_edge = 0.0
+        p_momentum = False
+        p_entry_price = False
+        p_fv = False
+        p_edge = False
+        p_tte = False
+        p_trend = False
+        p_all = False
+
+        # Displacement from strike (momentum proxy using spot vs strike)
+        displacement = (spot - strike) / strike if strike > 0 else 0
+
+        for side in ["up", "down"]:
+            fv_side = fv_up if side == "up" else fv_down
+            ask_side = best_ask_up if side == "up" else best_ask_down
+            edge_side = fv_side - ask_side
+
+            # Only consider the side with positive edge
+            if edge_side <= 0 or ask_side <= 0 or ask_side >= 1.0:
+                continue
+
+            # Check momentum direction matches side
+            if side == "up" and displacement <= 0:
+                continue
+            if side == "down" and displacement >= 0:
+                continue
+
+            abs_mom = abs(displacement)
+
+            # Evaluate each filter independently
+            _p_mom = abs_mom >= 0.0005
+            _p_entry = 0.40 <= ask_side <= 0.70
+            _p_fv = fv_side >= 0.75
+            _p_edge = edge_side >= 0.15
+            _p_tte = 120 <= tte <= 180
+            _p_trend = (side == "up" and ema_trend == "bullish") or \
+                       (side == "down" and ema_trend == "bearish")
+            _p_all = _p_mom and _p_entry and _p_fv and _p_edge and _p_tte and _p_trend
+
+            # Take the side with better edge (or first valid)
+            if edge_side > signal_edge:
+                signal_side = side
+                signal_entry = ask_side
+                signal_edge = edge_side
+                p_momentum = _p_mom
+                p_entry_price = _p_entry
+                p_fv = _p_fv
+                p_edge = _p_edge
+                p_tte = _p_tte
+                p_trend = _p_trend
+                p_all = _p_all
+
         now_str = datetime.now(timezone.utc).isoformat()
         self._append_snapshot({
             "timestamp": now_str,
@@ -507,6 +566,16 @@ class MarketDataRecorder:
             "ema_trend": ema_trend,
             "spread_up": round(spread_up, 4),
             "spread_down": round(spread_down, 4),
+            "signal_side": signal_side,
+            "signal_entry_price": round(signal_entry, 4) if signal_entry else "",
+            "signal_edge": round(signal_edge, 4) if signal_edge else "",
+            "passed_momentum": int(p_momentum),
+            "passed_entry_price": int(p_entry_price),
+            "passed_fv": int(p_fv),
+            "passed_edge": int(p_edge),
+            "passed_tte": int(p_tte),
+            "passed_trend": int(p_trend),
+            "passed_all": int(p_all),
         })
 
     async def run(self):
