@@ -1636,38 +1636,90 @@ class MomentumSniperStrategy:
                 "info"
             )
 
-        # FAK (Fill-And-Kill): fills whatever tokens are available, kills rest.
-        # On thin books, captures 2 tokens instead of 0 (FOK rejects entirely).
-        # Partial fills tracked via result.fill_amount.
-        result = await self.bot.place_order(
-            token_id=token_id,
-            price=buy_price,
-            size=num_tokens,
-            side="BUY",
-            order_type="FAK",
-        )
-        # Track actual fill amount (FAK may partially fill)
-        actual_fill = result.fill_amount if result.fill_amount else num_tokens
+        # MAKER-FIRST EXECUTION: GTC at ask (zero fees) → FAK fallback (taker).
+        # Backtest shows V5.2 at mom 0.0005-0.001 = +5pp edge, $0.23/trade.
+        # GTC at ask rests as maker. If it fills: zero fees + rebates.
+        # If it doesn't fill in 5s: FAK taker catches it.
+        actual_fill = num_tokens  # default, updated on partial fills
+
+        # Step 1: GTC at best ask (maker order, zero fees)
+        gtc_price = min(round(original_ask + tolerance, 2), self.config.max_entry_price)
         self.log(
-            f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
-            f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f} "
-            f"status={result.status} id={result.order_id[:20] if result.order_id else 'none'}",
+            f"[MAKER] {state.coin} {side.upper()} GTC @ ${original_ask:.2f} "
+            f"(ask=${original_ask:.2f}) book=[{ob_snapshot}]",
             "info"
         )
+        result = await self.bot.place_order(
+            token_id=token_id,
+            price=original_ask,
+            size=num_tokens,
+            side="BUY",
+            order_type="GTC",
+        )
 
-        # Skip retry ladder — data shows retries saved 1/31 fills while
-        # costing 900ms per cycle. GTC fallback is 4x more effective (4/31).
-        # Go straight to GTC which benefits from price improvement on
-        # Polymarket (we submit at max price but often pay maker's ask).
+        if result.success and result.order_id:
+            # Wait up to 5 seconds for maker fill
+            import asyncio as _aio
+            bal_before_gtc = self.bot.get_usdc_balance()
+            self.log(f"GTC resting: {result.order_id[:20]}... bal=${bal_before_gtc:.2f}", "info")
+            await _aio.sleep(5)
+            # Check fill via CLOB size_matched
+            try:
+                order_data = await _aio.to_thread(
+                    self.bot._official_client.get_order, result.order_id
+                )
+                clob_status = (order_data or {}).get("status", "")
+                gtc_matched = float((order_data or {}).get("size_matched", 0))
+                if gtc_matched > 0 or clob_status == "MATCHED":
+                    actual_fill = gtc_matched if gtc_matched > 0 else num_tokens
+                    self.log(
+                        f"[MAKER FILL] {state.coin} {side.upper()} "
+                        f"{actual_fill:.0f} tokens @ ${original_ask:.2f} (zero fees)",
+                        "success"
+                    )
+                    buy_price = original_ask
+                    result.fill_amount = actual_fill if gtc_matched > 0 else None
+                else:
+                    # Not filled — cancel and fall through to FAK
+                    try:
+                        await self.bot.cancel_order(result.order_id)
+                    except Exception:
+                        pass
+                    await _aio.sleep(3)
+                    # Post-cancel fill check
+                    post_data = await _aio.to_thread(
+                        self.bot._official_client.get_order, result.order_id
+                    )
+                    post_matched = float((post_data or {}).get("size_matched", 0))
+                    bal_final = self.bot.get_usdc_balance()
+                    bal_drop = (bal_before_gtc or 0) - (bal_final or 0)
+                    if post_matched > 0 or bal_drop >= (original_ask * num_tokens * 0.3):
+                        actual_fill = post_matched if post_matched > 0 else num_tokens
+                        self.log(
+                            f"[MAKER FILL] GTC filled after cancel! "
+                            f"{actual_fill:.0f} tokens @ ${original_ask:.2f}",
+                            "warning"
+                        )
+                        buy_price = original_ask
+                        result.fill_amount = actual_fill if post_matched > 0 else None
+                    else:
+                        self.log(f"GTC no fill (bal=${bal_final:.2f}). Trying FAK...", "info")
+                        result.success = False  # Fall through to FAK
+            except Exception as e:
+                self.log(f"GTC check failed ({e}), trying FAK...", "warning")
+                try:
+                    await self.bot.cancel_order(result.order_id)
+                except Exception:
+                    pass
+                result.success = False
 
-        # Size fallback: if FAK partially filled 0 tokens on large order,
-        # retry with minimum 5 tokens.
-        if not result.success and num_tokens > 5:
+        # Step 2: FAK taker fallback (if GTC didn't fill)
+        if not result.success:
             self.log(
-                f"FAK failed at {num_tokens:.0f} tokens, retrying min-size (5)",
-                "warning"
+                f"[FILL] {state.coin} {side.upper()} FAK @ ${buy_price:.2f} "
+                f"(ask=${original_ask:.2f} +{tolerance:.2f}tol)",
+                "info"
             )
-            num_tokens = 5.0
             result = await self.bot.place_order(
                 token_id=token_id,
                 price=buy_price,
@@ -1675,16 +1727,15 @@ class MomentumSniperStrategy:
                 side="BUY",
                 order_type="FAK",
             )
-            if result.fill_amount:
-                actual_fill = result.fill_amount
+            actual_fill = result.fill_amount if result.fill_amount else num_tokens
+            self.log(
+                f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
+                f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f}",
+                "info"
+            )
 
-        # GTC fallback: if all FOK attempts failed, place a GTC order and wait.
-        # This sits in the book and can get filled by sellers coming to us.
-        # Cancel after 5 seconds if not filled.
+        # Step 3: GTC fallback at higher price (last resort)
         if not result.success:
-            # GTC rests at tolerance + 3c above ask. Polymarket gives price
-            # improvement so we often pay the maker's ask, not our submitted
-            # price. Higher ceiling = wider net without higher cost.
             gtc_price = min(
                 round(original_ask + tolerance + 0.03, 2),
                 self.config.max_entry_price,
