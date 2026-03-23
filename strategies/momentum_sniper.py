@@ -1299,12 +1299,11 @@ class MomentumSniperStrategy:
                 if best_ask <= 0 or best_ask >= 1.0:
                     continue
 
-                # Calculate edge at WORST-CASE fill price (ask + FOK tolerance).
-                # The bot will pay up to ask+tolerance to get filled, so the edge
-                # check must use that price — otherwise we enter trades that are
-                # below min_edge after slippage.
+                # Calculate edge at WORST-CASE fill price (ask + tolerance + GTC bump).
+                # GTC fallback adds +$0.03 beyond tolerance. The HYPE -$3.07 loss
+                # filled at ask+$0.07 when edge was only checked at ask+$0.04.
                 buy_price = round(best_ask, 2)
-                worst_fill = round(buy_price + self.config.fok_tolerance, 2)
+                worst_fill = round(buy_price + self.config.fok_tolerance + 0.03, 2)
                 if worst_fill > self.config.max_entry_price:
                     worst_fill = self.config.max_entry_price
 
@@ -2540,15 +2539,20 @@ class MomentumSniperStrategy:
                 if best_ask < self.config.min_entry_price:
                     continue
 
-                # Edge at ask (no tolerance — maker fills at ask)
+                # Edge at ask (no tolerance — maker fills at ask, zero fees)
                 fee = taker_fee_per_token(best_ask, self.config.timeframe)
                 edge = fair_prob - best_ask - fee
 
-                # Use FULL signal thresholds for edge and FV
-                # (we're just placing earlier on momentum, not lowering quality)
-                if edge < self.config.min_edge:
+                # Lower thresholds for speculative orders: we're placing EARLY
+                # when momentum is building. If it fills and momentum continues,
+                # the full signal would have confirmed anyway. If momentum
+                # reverses, we cancel before fill. The cancel-on-reversal is
+                # the risk control, not the entry threshold.
+                spec_min_edge = 0.08
+                spec_min_fv = 0.58
+                if edge < spec_min_edge:
                     continue
-                if fair_prob < self.config.min_fair_value:
+                if fair_prob < spec_min_fv:
                     continue
 
                 if edge > best_edge:
