@@ -415,7 +415,8 @@ class TradingBot:
         size: float,
         side: str,
         order_type: str = "GTC",
-        fee_rate_bps: int = 0
+        fee_rate_bps: int = 0,
+        expiration: int = 0,
     ) -> OrderResult:
         """
         Place a limit order using the official py-clob-client.
@@ -454,14 +455,17 @@ class TradingBot:
             bal_before = self.get_usdc_balance() if order_type.upper() in ("FOK", "FAK") else None
 
             # Step 1: Create and sign the order
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=clob_side,
+            )
+            if expiration > 0:
+                order_args.expiration = expiration
             order = await self._run_in_thread(
                 self._official_client.create_order,
-                OrderArgs(
-                    token_id=token_id,
-                    price=price,
-                    size=size,
-                    side=clob_side,
-                ),
+                order_args,
                 PartialCreateOrderOptions(tick_size="0.01", neg_risk=False),
             )
 

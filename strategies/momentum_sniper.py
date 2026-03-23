@@ -1642,11 +1642,15 @@ class MomentumSniperStrategy:
         # If it doesn't fill in 5s: FAK taker catches it.
         actual_fill = num_tokens  # default, updated on partial fills
 
-        # Step 1: GTC at best ask (maker order, zero fees)
-        gtc_price = min(round(original_ask + tolerance, 2), self.config.max_entry_price)
+        # Step 1: GTD at best ask (maker order, zero fees, auto-expires in 3s).
+        # GTD auto-expires — NO manual cancel needed, NO ghost fills possible.
+        # GTC + cancel caused ghost fills at every timing: 300ms, 1.5s, 5s.
+        # GTD eliminates the race condition entirely.
+        import asyncio as _aio
+        gtd_expiry = int(time.time()) + 3  # Expires in 3 seconds
         self.log(
-            f"[MAKER] {state.coin} {side.upper()} GTC @ ${original_ask:.2f} "
-            f"(ask=${original_ask:.2f}) book=[{ob_snapshot}]",
+            f"[MAKER] {state.coin} {side.upper()} GTD @ ${original_ask:.2f} "
+            f"(ask=${original_ask:.2f}, expires 3s) book=[{ob_snapshot}]",
             "info"
         )
         result = await self.bot.place_order(
@@ -1654,72 +1658,36 @@ class MomentumSniperStrategy:
             price=original_ask,
             size=num_tokens,
             side="BUY",
-            order_type="GTC",
+            order_type="GTD",
+            expiration=gtd_expiry,
         )
 
         if result.success and result.order_id:
-            # Maker GTC check: 1.5s wait for CLOB to reflect fill, then verify.
-            # 300ms was too fast (ghost fills). 5s was too slow (kills frequency).
-            # 1.5s is the sweet spot: CLOB updates in ~500ms-1s typically.
-            import asyncio as _aio
             maker_order_id = result.order_id
-            self.log(f"[MAKER] GTC resting: {maker_order_id[:20]}...", "info")
-            await _aio.sleep(1.5)
+            # Wait for GTD to either fill or auto-expire (3s)
+            await _aio.sleep(3.5)  # 3s expiry + 0.5s buffer
             try:
                 order_data = await _aio.to_thread(
                     self.bot._official_client.get_order, maker_order_id
                 )
                 clob_status = (order_data or {}).get("status", "")
-                gtc_matched = float((order_data or {}).get("size_matched", 0))
-
-                if gtc_matched > 0 or clob_status == "MATCHED":
-                    # FILLED as maker — zero fees
-                    actual_fill = gtc_matched if gtc_matched > 0 else num_tokens
+                gtd_matched = float((order_data or {}).get("size_matched", 0))
+                if gtd_matched > 0 or clob_status == "MATCHED":
+                    actual_fill = gtd_matched if gtd_matched > 0 else num_tokens
                     self.log(
                         f"[MAKER FILL] {state.coin} {side.upper()} "
                         f"{actual_fill:.0f} tokens @ ${original_ask:.2f} (zero fees)",
                         "success"
                     )
                     buy_price = original_ask
-                    result.fill_amount = actual_fill if gtc_matched > 0 else None
-                elif clob_status in ("LIVE", "OPEN"):
-                    # Still resting, not matched — safe to cancel
-                    try:
-                        await self.bot.cancel_order(maker_order_id)
-                    except Exception:
-                        pass
-                    # Post-cancel recheck: catch fills between check and cancel
-                    await _aio.sleep(1.5)
-                    try:
-                        post_data = await _aio.to_thread(
-                            self.bot._official_client.get_order, maker_order_id
-                        )
-                        post_matched = float((post_data or {}).get("size_matched", 0))
-                        post_status = (post_data or {}).get("status", "")
-                        if post_matched > 0 or post_status == "MATCHED":
-                            actual_fill = post_matched if post_matched > 0 else num_tokens
-                            self.log(
-                                f"[MAKER FILL] GTC filled during cancel! "
-                                f"{actual_fill:.0f} tokens @ ${original_ask:.2f}",
-                                "warning"
-                            )
-                            buy_price = original_ask
-                            result.fill_amount = actual_fill if post_matched > 0 else None
-                        else:
-                            self.log(f"GTC confirmed no fill (status={post_status}). FAK next.", "info")
-                            result.success = False
-                    except Exception:
-                        result.success = False
+                    result.fill_amount = actual_fill if gtd_matched > 0 else None
                 else:
-                    # CANCELLED/DEAD/unknown — don't cancel again, just move to FAK
+                    # GTD expired without fill — safe to proceed to FAK
+                    # No cancel needed, no ghost fill possible
+                    self.log(f"GTD expired (status={clob_status}). FAK next.", "info")
                     result.success = False
             except Exception as e:
-                self.log(f"GTC check failed ({e}), cancelling and trying FAK...", "warning")
-                try:
-                    await self.bot.cancel_order(maker_order_id)
-                except Exception:
-                    pass
-                await _aio.sleep(1.5)
+                self.log(f"GTD check failed ({e}), trying FAK...", "warning")
                 result.success = False
 
         # Step 2: FAK taker fallback (if GTC didn't fill)
