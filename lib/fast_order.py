@@ -182,22 +182,22 @@ class FastOrderClient:
 
         t_sign = time.monotonic()
 
-        # 3. Build body (~0.01ms) — convert all Uint/int types to str for JSON
-        o = signed.order
+        # 3. Build body (~0.01ms) — use .values dict for clean Python types
+        v = signed.order.values
         body = {
             "order": {
-                "salt": str(o.salt),
-                "maker": str(o.maker),
-                "signer": str(o.signer),
-                "taker": str(o.taker),
-                "tokenId": str(o.tokenId),
-                "makerAmount": str(o.makerAmount),
-                "takerAmount": str(o.takerAmount),
-                "expiration": str(o.expiration),
-                "nonce": str(o.nonce),
-                "feeRateBps": str(o.feeRateBps),
-                "side": int(str(o.side)),
-                "signatureType": int(str(o.signatureType)),
+                "salt": str(v["salt"]),
+                "maker": str(v["maker"]),
+                "signer": str(v["signer"]),
+                "taker": str(v["taker"]),
+                "tokenId": str(v["tokenId"]),
+                "makerAmount": str(v["makerAmount"]),
+                "takerAmount": str(v["takerAmount"]),
+                "expiration": str(v["expiration"]),
+                "nonce": str(v["nonce"]),
+                "feeRateBps": str(v["feeRateBps"]),
+                "side": v["side"],
+                "signatureType": v["signatureType"],
                 "signature": signed.signature,
             },
             "owner": self._api_key,
@@ -304,22 +304,22 @@ class FastOrderClient:
             signed = self._sign_order(token_id, maker_amount, taker_amount, side)
             t_sign = time.monotonic()
 
-        # Build body — convert Uint types to str/int for JSON
-        o = signed.order
+        # Build body — use .values dict for clean Python types
+        v = signed.order.values
         body = {
             "order": {
-                "salt": str(o.salt),
-                "maker": str(o.maker),
-                "signer": str(o.signer),
-                "taker": str(o.taker),
-                "tokenId": str(o.tokenId),
-                "makerAmount": str(o.makerAmount),
-                "takerAmount": str(o.takerAmount),
-                "expiration": str(o.expiration),
-                "nonce": str(o.nonce),
-                "feeRateBps": str(o.feeRateBps),
-                "side": int(str(o.side)),
-                "signatureType": int(str(o.signatureType)),
+                "salt": str(v["salt"]),
+                "maker": str(v["maker"]),
+                "signer": str(v["signer"]),
+                "taker": str(v["taker"]),
+                "tokenId": str(v["tokenId"]),
+                "makerAmount": str(v["makerAmount"]),
+                "takerAmount": str(v["takerAmount"]),
+                "expiration": str(v["expiration"]),
+                "nonce": str(v["nonce"]),
+                "feeRateBps": str(v["feeRateBps"]),
+                "side": v["side"],
+                "signatureType": v["signatureType"],
                 "signature": signed.signature,
             },
             "owner": self._api_key,
