@@ -184,6 +184,13 @@ class SniperConfig:
     # over the lookback period. 0.0005 = 0.05%. Set to 0.0 to disable.
     min_momentum: float = 0.0005
 
+    # Pre-signal speculative GTC: place maker orders before signal fully confirms.
+    # When momentum crosses speculative_momentum (lower than min_momentum), a GTC
+    # rests on the book. If signal confirms, we're already in (zero fees, no race).
+    # If momentum reverses, the GTC is cancelled.
+    speculative_enabled: bool = False
+    speculative_momentum: float = 0.0003  # Pre-signal momentum threshold
+
     # Momentum lookback period in seconds
     momentum_lookback: float = 30.0
 
@@ -496,6 +503,21 @@ class EMATracker:
 
 
 @dataclass
+class SpeculativeOrder:
+    """A pre-signal GTC resting on the book as maker."""
+    coin: str
+    side: str
+    order_id: str
+    token_id: str
+    price: float
+    size: float
+    market_slug: str
+    placed_at: float
+    fair_value: float
+    displacement: float
+
+
+@dataclass
 class PendingSignal:
     """A signal waiting for confirmation before execution."""
     coin: str
@@ -716,6 +738,10 @@ class MomentumSniperStrategy:
 
         # Pending signals awaiting confirmation
         self._pending_signals: Dict[str, PendingSignal] = {}
+
+        # Pre-signal speculative GTC order (only one at a time)
+        self._speculative_order: Optional[SpeculativeOrder] = None
+        self._spec_cooldown: Dict[str, float] = {}  # coin:side -> time of last cancel
 
         # Circuit breaker: consecutive losing WINDOWS (not individual trades)
         # 3 coins losing in the same 5m window = 1 losing window, not 3 losses
@@ -2304,6 +2330,255 @@ class MomentumSniperStrategy:
         for key in expired_keys:
             self._pending_signals.pop(key, None)
 
+    async def _cancel_speculative(self, reason: str = ""):
+        """Cancel the current speculative order."""
+        if not self._speculative_order:
+            return
+        spec = self._speculative_order
+        try:
+            await self.bot.cancel_order(spec.order_id)
+        except Exception:
+            pass
+        # Post-cancel fill check (same pattern as GTC fallback)
+        import asyncio as _aio
+        await _aio.sleep(1)
+        try:
+            order_data = await _aio.to_thread(
+                self.bot._official_client.get_order, spec.order_id
+            )
+            matched = float((order_data or {}).get("size_matched", 0))
+            if matched > 0:
+                self.log(
+                    f"[SPEC] {spec.coin} {spec.side.upper()} FILLED {matched} "
+                    f"tokens during cancel! Recording position.",
+                    "warning"
+                )
+                await self._record_speculative_fill(spec, matched)
+                self._speculative_order = None
+                return
+        except Exception:
+            pass
+        self.log(
+            f"[SPEC] Cancelled {spec.coin} {spec.side.upper()} @ ${spec.price:.2f}"
+            f"{' — ' + reason if reason else ''}",
+            "info"
+        )
+        key = f"{spec.coin}:{spec.side}"
+        self._spec_cooldown[key] = time.time()
+        self._speculative_order = None
+
+    async def _record_speculative_fill(self, spec: SpeculativeOrder, filled_tokens: float):
+        """Record a speculative order fill as a position."""
+        state = self.coin_states.get(spec.coin)
+        if not state:
+            return
+        # Maker = zero taker fees
+        actual_cost = spec.price * filled_tokens
+        if spec.side == "up":
+            state.up_tokens += filled_tokens
+            state.up_cost += actual_cost
+        else:
+            state.down_tokens += filled_tokens
+            state.down_cost += actual_cost
+        self._balance -= actual_cost
+        state.last_trade_time = time.time()
+        self.stats.trades += 1
+        self.stats.pending += 1
+        self.stats.total_wagered += actual_cost
+        self.stats.opportunities_found += 1
+        # Log trade
+        spot = self.binance.get_price(spec.coin)
+        vol, vol_src = self._get_volatility(spec.coin)
+        other_price = state.manager.get_mid_price("down" if spec.side == "up" else "up")
+        real_balance = self.bot.get_usdc_balance() or self._balance
+        strike_src = getattr(state, '_strike_source', 'unknown')
+        mom = (spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
+        self.trade_logger.log_trade(
+            market_slug=state.current_slug, coin=spec.coin,
+            timeframe=self.config.timeframe, side=spec.side,
+            entry_price=spec.price, bet_size_usdc=actual_cost,
+            num_tokens=filled_tokens, bankroll=self._balance,
+            usdc_balance=real_balance, btc_price=spot,
+            other_side_price=other_price, volatility_std=vol,
+            fair_value_at_entry=spec.fair_value,
+            time_to_expiry_at_entry=state.seconds_to_expiry(),
+            momentum_at_entry=mom, volatility_at_entry=vol,
+            signal_to_order_ms=0, order_latency_ms=0, total_latency_ms=0,
+            vol_source=vol_src, strike_source=strike_src,
+        )
+        self.log(
+            f"SNIPE {spec.coin} {spec.side.upper()} @ {spec.price:.2f} "
+            f"x{filled_tokens:.0f} (${actual_cost:.2f}) MAKER (zero fees) "
+            f"FV={spec.fair_value:.2f}",
+            "success"
+        )
+
+    async def _manage_speculative_order(self):
+        """Place/monitor/cancel pre-signal GTC maker orders."""
+        if self.config.observe_only or not self.config.speculative_enabled:
+            return
+        import asyncio as _aio
+
+        # --- Check existing speculative order ---
+        if self._speculative_order:
+            spec = self._speculative_order
+            state = self.coin_states.get(spec.coin)
+
+            # Market changed — cancel
+            if not state or state.current_slug != spec.market_slug:
+                await self._cancel_speculative("market changed")
+                return
+
+            # Check CLOB for fill
+            try:
+                order_data = await _aio.to_thread(
+                    self.bot._official_client.get_order, spec.order_id
+                )
+                matched = float((order_data or {}).get("size_matched", 0))
+                clob_status = (order_data or {}).get("status", "")
+                if matched > 0:
+                    self.log(
+                        f"[SPEC FILL] {spec.coin} {spec.side.upper()} "
+                        f"{matched} tokens @ ${spec.price:.2f} (maker, zero fees)",
+                        "success"
+                    )
+                    await self._record_speculative_fill(spec, matched)
+                    self._speculative_order = None
+                    return
+                if clob_status in ("CANCELLED", "DEAD", "EXPIRED"):
+                    self._speculative_order = None
+                    return
+            except Exception as e:
+                self.log(f"[SPEC] CLOB check failed: {e}", "warning")
+
+            # Momentum reversal — cancel
+            spot = self.binance.get_price(spec.coin)
+            if state.strike_price > 0:
+                disp = (spot - state.strike_price) / state.strike_price
+                if spec.side == "up" and disp < 0.0001:
+                    await self._cancel_speculative("momentum reversed")
+                    return
+                if spec.side == "down" and disp > -0.0001:
+                    await self._cancel_speculative("momentum reversed")
+                    return
+
+            # Timeout — cancel after 20s
+            if time.time() - spec.placed_at > 20:
+                await self._cancel_speculative("timeout")
+                return
+
+            return  # Speculative order still active, don't place another
+
+        # --- Place new speculative order ---
+        # Don't place if we have an active position
+        active = sum(
+            1 for s in self.coin_states.values()
+            if s.has_up_position or s.has_down_position
+        )
+        if active >= self.config.max_concurrent_positions:
+            return
+
+        best_edge = 0.0
+        best_candidate = None
+
+        for coin, state in self.coin_states.items():
+            if not state.current_slug or state.current_slug == state.startup_slug:
+                continue
+            if not state.strike_price or state.strike_price <= 0:
+                continue
+
+            # TTE check
+            tte = state.seconds_to_expiry()
+            duration = 300 if self.config.timeframe == "5m" else 900
+            if self.config.min_window_elapsed > 0:
+                if tte > (duration - self.config.min_window_elapsed):
+                    continue
+            if self.config.max_window_elapsed > 0:
+                if tte < (duration - self.config.max_window_elapsed):
+                    continue
+
+            fv = self._calculate_fair_value(state)
+            if not fv:
+                continue
+
+            spot = self.binance.get_price(coin)
+            disp = (spot - state.strike_price) / state.strike_price
+
+            for side in ["up", "down"]:
+                # Existing position check
+                if side == "up" and (state.has_up_position or state.has_down_position):
+                    continue
+                if side == "down" and (state.has_down_position or state.has_up_position):
+                    continue
+
+                # Pre-signal momentum (lower threshold)
+                spec_mom = self.config.speculative_momentum
+                if side == "up" and disp < spec_mom:
+                    continue
+                if side == "down" and disp > -spec_mom:
+                    continue
+
+                # Cooldown check (10s after cancel)
+                key = f"{coin}:{side}"
+                cooldown_until = self._spec_cooldown.get(key, 0)
+                if time.time() - cooldown_until < 10:
+                    continue
+
+                fair_prob = fv.fair_up if side == "up" else fv.fair_down
+                best_ask = state.manager.get_best_ask(side)
+                if best_ask <= 0 or best_ask >= 1.0:
+                    continue
+                if best_ask > self.config.max_entry_price:
+                    continue
+                if best_ask < self.config.min_entry_price:
+                    continue
+
+                # Edge at ask (no tolerance — maker fills at ask)
+                fee = taker_fee_per_token(best_ask, self.config.timeframe)
+                edge = fair_prob - best_ask - fee
+
+                # Use FULL signal thresholds for edge and FV
+                # (we're just placing earlier on momentum, not lowering quality)
+                if edge < self.config.min_edge:
+                    continue
+                if fair_prob < self.config.min_fair_value:
+                    continue
+
+                if edge > best_edge:
+                    best_edge = edge
+                    best_candidate = (state, side, best_ask, edge, fv, fair_prob, disp)
+
+        if not best_candidate:
+            return
+
+        state, side, ask, edge, fv, fair_prob, disp = best_candidate
+        token_id = state.manager.token_ids.get(side)
+        if not token_id:
+            return
+
+        num_tokens = 5.0  # min-size
+        buy_price = round(ask, 2)
+
+        result = await self.bot.place_order(
+            token_id=token_id,
+            price=buy_price,
+            size=num_tokens,
+            side="BUY",
+            order_type="GTC",
+        )
+        if result.success and result.order_id:
+            self._speculative_order = SpeculativeOrder(
+                coin=state.coin, side=side, order_id=result.order_id,
+                token_id=token_id, price=buy_price, size=num_tokens,
+                market_slug=state.current_slug, placed_at=time.time(),
+                fair_value=fair_prob, displacement=disp,
+            )
+            self.log(
+                f"[SPEC] Placed GTC {state.coin} {side.upper()} @ ${buy_price:.2f} "
+                f"x{num_tokens:.0f} edge={edge:.2f} mom={disp:.4f} (maker)",
+                "info"
+            )
+
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
         # Periodic settlement of pending trades via Gamma API
@@ -2319,6 +2594,10 @@ class MomentumSniperStrategy:
         # Process pending confirmation signals
         if self.config.confirm_gap > 0:
             await self._process_pending_signals()
+
+        # Pre-signal speculative GTC management (maker orders)
+        if self.config.speculative_enabled:
+            await self._manage_speculative_order()
 
         # Update last known prices for all coins
         for coin, state in self.coin_states.items():
@@ -2343,8 +2622,19 @@ class MomentumSniperStrategy:
             1 for s in self.coin_states.values()
             if s.has_up_position or s.has_down_position
         )
+        # Count speculative order as a pending position
+        if self._speculative_order:
+            spec_state = self.coin_states.get(self._speculative_order.coin)
+            if spec_state and not (spec_state.has_up_position or spec_state.has_down_position):
+                active_positions += 1
 
         for state, side, price, edge, fv in opportunities:
+            # Skip if speculative order already covers this coin/side
+            if (self._speculative_order
+                    and self._speculative_order.coin == state.coin
+                    and self._speculative_order.side == side
+                    and self._speculative_order.market_slug == state.current_slug):
+                continue
             # Re-check position — previous execution in this loop may have filled
             if side == "up" and state.has_up_position:
                 continue

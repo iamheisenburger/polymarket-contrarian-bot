@@ -115,6 +115,14 @@ def main():
         help="Max positions open simultaneously across all coins (default: 1). Prevents deploying entire bankroll at once."
     )
     parser.add_argument(
+        "--speculative", action="store_true",
+        help="Enable pre-signal GTC maker orders. Places resting orders when momentum is building (before full signal), zero fees."
+    )
+    parser.add_argument(
+        "--spec-momentum", type=float, default=0.0003,
+        help="Momentum threshold for speculative GTC placement (default: 0.0003, lower than full signal 0.0005)"
+    )
+    parser.add_argument(
         "--observe", action="store_true",
         help="Observe-only mode — show signals but don't trade"
     )
@@ -348,6 +356,8 @@ def main():
         max_entry_price=args.max_entry_price,
         min_entry_price=args.min_entry_price,
         max_concurrent_positions=args.max_concurrent_positions,
+        speculative_enabled=args.speculative,
+        speculative_momentum=args.spec_momentum,
         min_size_mode=args.min_size,
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
