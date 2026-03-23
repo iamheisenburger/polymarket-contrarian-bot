@@ -726,13 +726,17 @@ class MomentumSniperStrategy:
         try:
             from lib.fast_order import FastOrderClient
             import os
-            pk = os.environ.get("PRIVATE_KEY", "")
-            safe = os.environ.get("POLYMARKET_SAFE_ADDRESS", "")
-            ak = os.environ.get("CLOB_API_KEY", "")
-            ask_key = os.environ.get("CLOB_SECRET", "")
-            ap = os.environ.get("CLOB_API_PASSPHRASE", "")
+            # Try multiple env var naming conventions
+            pk = os.environ.get("POLY_PRIVATE_KEY", "") or os.environ.get("PRIVATE_KEY", "")
+            safe = os.environ.get("POLY_SAFE_ADDRESS", "") or os.environ.get("POLYMARKET_SAFE_ADDRESS", "")
+            ak = os.environ.get("POLY_BUILDER_API_KEY", "") or os.environ.get("CLOB_API_KEY", "")
+            ask_key = os.environ.get("POLY_BUILDER_API_SECRET", "") or os.environ.get("CLOB_SECRET", "")
+            ap = os.environ.get("POLY_BUILDER_API_PASSPHRASE", "") or os.environ.get("CLOB_API_PASSPHRASE", "")
             if all([pk, safe, ak, ask_key, ap]):
                 self._fast_order = FastOrderClient(pk, safe, ak, ask_key, ap)
+                logger.info("FastOrderClient initialized — SDK bypass active")
+            else:
+                logger.warning(f"FastOrderClient: missing env vars (pk={bool(pk)} safe={bool(safe)} ak={bool(ak)} secret={bool(ask_key)} pass={bool(ap)})")
         except Exception as e:
             logger.warning(f"FastOrderClient not available: {e}")
 
