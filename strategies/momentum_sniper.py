@@ -1854,12 +1854,11 @@ class MomentumSniperStrategy:
 
         # Log rejection diagnostics — understand WHY fills fail
         if not result.success:
-            # Check current orderbook state post-rejection
+            max_price_tried = round(original_ask + tolerance + 0.03, 2)  # GTC max
             ob_now = state.manager.get_orderbook(side)
             if ob_now and ob_now.asks:
                 current_best = ob_now.asks[0].price
                 current_depth = sum(a.size for a in ob_now.asks[:3])
-                max_price_tried = round(original_ask + tolerance + 0.01 * self.config.fok_retry_steps, 2)
                 if current_best > max_price_tried:
                     reason = f"PRICE_MOVED (best now ${current_best:.2f}, max tried ${max_price_tried:.2f})"
                 elif current_depth < 2:
