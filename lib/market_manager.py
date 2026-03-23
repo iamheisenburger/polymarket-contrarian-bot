@@ -181,6 +181,7 @@ class MarketManager:
 
         # Callbacks
         self._on_book_callbacks: List[BookCallback] = []
+        self._on_trade_callbacks: List = []  # TradeCallback (LastTradePrice -> None)
         self._on_market_change_callbacks: List[MarketChangeCallback] = []
         self._on_connect_callbacks: List[ConnectionCallback] = []
         self._on_disconnect_callbacks: List[ConnectionCallback] = []
@@ -262,6 +263,11 @@ class MarketManager:
         self._on_disconnect_callbacks.append(callback)
         return callback
 
+    def on_trade_event(self, callback) -> None:
+        """Register trade event callback (receives LastTradePrice)."""
+        self._on_trade_callbacks.append(callback)
+        return callback
+
     def _update_current_market(self, market: MarketInfo) -> None:
         """Update current market state."""
         self._previous_slug = market.slug
@@ -334,6 +340,16 @@ class MarketManager:
             for callback in self._on_book_callbacks:
                 try:
                     result = callback(snapshot)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    pass
+
+        @self.ws.on_trade
+        async def handle_trade(trade):  # pyright: ignore[reportUnusedFunction]
+            for callback in self._on_trade_callbacks:
+                try:
+                    result = callback(trade)
                     if asyncio.iscoroutine(result):
                         await result
                 except Exception:

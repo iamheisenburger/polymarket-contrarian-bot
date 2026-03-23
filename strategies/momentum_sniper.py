@@ -709,6 +709,18 @@ class MomentumSniperStrategy:
         if config.shadow_log:
             self.shadow_logger = ShadowLogger(config.shadow_log)
 
+        # VPIN tracker — data collection mode (logs VPIN alongside signals, no filtering)
+        self._vpin_tracker = None
+        try:
+            from lib.vpin import VPINTracker, VPINConfig
+            self._vpin_tracker = VPINTracker(VPINConfig(
+                bucket_volume=30.0,  # Small buckets for 5m market volume
+                n_buckets=15,
+                min_buckets=3,
+            ))
+        except Exception:
+            pass
+
         # Session stats
         self.stats = SniperStats()
 
@@ -915,6 +927,19 @@ class MomentumSniperStrategy:
         @manager.on_market_change
         def on_change(old_slug: str, new_slug: str, _coin=coin):
             self._handle_market_change(_coin, old_slug, new_slug)
+
+        # VPIN: feed trade events to the tracker
+        if self._vpin_tracker:
+            @manager.on_trade_event
+            def on_trade(trade, _coin=coin):
+                try:
+                    self._vpin_tracker.on_trade(
+                        token_id=trade.asset_id,
+                        size=float(trade.size),
+                        side=trade.side,
+                    )
+                except Exception:
+                    pass
 
     def _set_strike(self, state: CoinMarketState):
         """Determine strike price for the current market.
@@ -1447,8 +1472,16 @@ class MomentumSniperStrategy:
                         if side == "down" and displacement > -coin_min_mom:
                             continue  # Price above strike — don't buy Down
 
+                    # VPIN data collection (log alongside signal, no filtering)
+                    _vpin_val = None
+                    _vpin_flow = None
+                    if self._vpin_tracker:
+                        _vpin_val = self._vpin_tracker.get_vpin_by_coin_side(state.coin, side)
+                        _vpin_flow = self._vpin_tracker.get_flow_by_coin_side(state.coin, side)
+
                     # Shadow log: record paper entry for every qualifying signal
-                    self.log(f"[SHADOW] Signal passed all filters: {state.coin} {side} @ ${best_ask:.4f} edge={edge:.4f} shadow={'ON' if self.shadow_logger else 'OFF'}", "info")
+                    _vpin_str = f" vpin={_vpin_val:.2f}({'+' if _vpin_flow and _vpin_flow>0 else '-'}{abs(_vpin_flow or 0):.2f})" if _vpin_val is not None else ""
+                    self.log(f"[SHADOW] Signal passed all filters: {state.coin} {side} @ ${best_ask:.4f} edge={edge:.4f}{_vpin_str} shadow={'ON' if self.shadow_logger else 'OFF'}", "info")
                     if self.shadow_logger:
                         _spot = self.binance.get_price(state.coin)
                         _mom = (_spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0.0
@@ -2181,6 +2214,14 @@ class MomentumSniperStrategy:
         stale_keys = [k for k in self._pending_signals if k.startswith(f"{coin}:")]
         for k in stale_keys:
             self._pending_signals.pop(k, None)
+
+        # Register new token IDs with VPIN tracker
+        if self._vpin_tracker and state.manager.current_market:
+            self._vpin_tracker.reset_coin(coin)
+            token_ids = state.manager.token_ids
+            for side_name, tid in token_ids.items():
+                if tid:
+                    self._vpin_tracker.register_token(tid, coin, side_name)
 
         # Clear signal logger dedup for old market
         if self.signal_logger and old_slug:
