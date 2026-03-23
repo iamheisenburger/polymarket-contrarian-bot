@@ -1273,12 +1273,18 @@ class MomentumSniperStrategy:
                 if best_ask <= 0 or best_ask >= 1.0:
                     continue
 
-                # Calculate edge at exact ask price (FOK handles stale prices)
+                # Calculate edge at WORST-CASE fill price (ask + FOK tolerance).
+                # The bot will pay up to ask+tolerance to get filled, so the edge
+                # check must use that price — otherwise we enter trades that are
+                # below min_edge after slippage.
                 buy_price = round(best_ask, 2)
+                worst_fill = round(buy_price + self.config.fok_tolerance, 2)
+                if worst_fill > self.config.max_entry_price:
+                    worst_fill = self.config.max_entry_price
 
-                # Net edge = fair value - buy price - taker fee
-                fee = taker_fee_per_token(buy_price, self.config.timeframe)
-                edge = fair_prob - buy_price - fee
+                # Net edge = fair value - worst fill price - taker fee
+                fee = taker_fee_per_token(worst_fill, self.config.timeframe)
+                edge = fair_prob - worst_fill - fee
 
                 # --- Signal logging: evaluate all filters and log before filtering ---
                 if self.signal_logger:
