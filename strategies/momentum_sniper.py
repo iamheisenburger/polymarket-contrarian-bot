@@ -2874,7 +2874,7 @@ class MomentumSniperStrategy:
             while self.running:
                 await self._tick()
                 self._render_status()
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)  # 100ms scan interval (was 500ms — 400ms faster detection)
 
         except KeyboardInterrupt:
             self.log("Stopped by user")
