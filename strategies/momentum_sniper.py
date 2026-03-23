@@ -2532,6 +2532,26 @@ class MomentumSniperStrategy:
         if self._balance < self.config.min_bet_usdc and not self.config.observe_only:
             return
 
+        # Log VPIN snapshot every 60s for ALL coins (data collection for backtesting)
+        if self._vpin_tracker and not hasattr(self, '_last_vpin_log'):
+            self._last_vpin_log = 0
+        if self._vpin_tracker and time.time() - getattr(self, '_last_vpin_log', 0) > 60:
+            self._last_vpin_log = time.time()
+            for coin, state in self.coin_states.items():
+                if not state.current_slug:
+                    continue
+                for side in ["up", "down"]:
+                    vpin = self._vpin_tracker.get_vpin_by_coin_side(coin, side)
+                    flow = self._vpin_tracker.get_flow_by_coin_side(coin, side)
+                    if vpin is not None:
+                        spot = self.binance.get_price(coin)
+                        disp = (spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
+                        self._event_logger.info(
+                            f"[VPIN] {coin} {side} vpin={vpin:.2f} flow={flow:+.2f} "
+                            f"disp={disp:+.5f} tte={state.seconds_to_expiry():.0f}s "
+                            f"slug={state.current_slug}"
+                        )
+
         # Find opportunities across all coins
         opportunities = self._find_opportunities()
         signal_time = time.time()
