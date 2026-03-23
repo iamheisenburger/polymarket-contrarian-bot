@@ -105,6 +105,11 @@ class BinancePriceFeed:
         self._ws = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._price_callbacks: list = []  # Called on every price update for instant signal detection
+
+    def on_price(self, callback) -> None:
+        """Register a callback for every price update. callback(coin: str, price: float)."""
+        self._price_callbacks.append(callback)
 
     @property
     def connected(self) -> bool:
@@ -302,6 +307,13 @@ class BinancePriceFeed:
                     if ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
                         state.history.append(PricePoint(price=price, timestamp=ts))
                         self._last_sample[coin] = ts
+
+                    # Fire price callbacks (for instant signal detection)
+                    for cb in self._price_callbacks:
+                        try:
+                            cb(coin, price)
+                        except Exception:
+                            pass
                     break
 
         except (json.JSONDecodeError, KeyError, ValueError):

@@ -104,6 +104,11 @@ class CoinbasePriceFeed:
         self._ws = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._price_callbacks: list = []
+
+    def on_price(self, callback) -> None:
+        """Register a callback for every price update."""
+        self._price_callbacks.append(callback)
 
     @property
     def connected(self) -> bool:
@@ -304,6 +309,13 @@ class CoinbasePriceFeed:
                 if ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
                     state.history.append(PricePoint(price=price, timestamp=ts))
                     self._last_sample[coin] = ts
+
+                # Fire price callbacks for instant signal detection
+                for cb in self._price_callbacks:
+                    try:
+                        cb(coin, price)
+                    except Exception:
+                        pass
 
         except (json.JSONDecodeError, KeyError, ValueError):
             pass

@@ -882,6 +882,32 @@ class MomentumSniperStrategy:
             source = "Coinbase" if coin in COINBASE_COINS else "Binance"
             self.log(f"{source} {coin}: ${price:,.2f}", "success")
 
+        # Register instant signal detection on price updates
+        # Instead of waiting for next tick (100ms), evaluate signal immediately when price moves
+        def _on_price_update(coin: str, price: float):
+            """Called on EVERY Binance/Coinbase price tick — instant signal detection."""
+            if not self.running or self.config.observe_only:
+                return
+            state = self.coin_states.get(coin)
+            if not state or not state.strike_price or state.strike_price <= 0:
+                return
+            disp = (price - state.strike_price) / state.strike_price
+            # Quick momentum check before expensive evaluation
+            if abs(disp) < self.config.min_momentum:
+                return
+            # Flag that this coin needs immediate evaluation on next tick
+            if not hasattr(self, '_urgent_coins'):
+                self._urgent_coins = set()
+            self._urgent_coins.add(coin)
+
+        if hasattr(self.binance, 'on_price'):
+            self.binance.on_price(_on_price_update)
+        # For MultiPriceFeed, try to register on sub-feeds
+        if hasattr(self.binance, '_primary') and hasattr(self.binance._primary, 'on_price'):
+            self.binance._primary.on_price(_on_price_update)
+        if hasattr(self.binance, '_secondary') and hasattr(self.binance._secondary, 'on_price'):
+            self.binance._secondary.on_price(_on_price_update)
+
         # Initialize EMA trend tracker from historical Binance klines
         if self._ema_tracker:
             for coin in self.config.coins:
@@ -2874,7 +2900,12 @@ class MomentumSniperStrategy:
             while self.running:
                 await self._tick()
                 self._render_status()
-                await asyncio.sleep(0.1)  # 100ms scan interval (was 500ms — 400ms faster detection)
+                # If a price update flagged an urgent coin, skip the sleep — evaluate NOW
+                if hasattr(self, '_urgent_coins') and self._urgent_coins:
+                    self._urgent_coins.clear()
+                    await asyncio.sleep(0.01)  # 10ms yield (let event loop process)
+                else:
+                    await asyncio.sleep(0.1)  # 100ms normal scan
 
         except KeyboardInterrupt:
             self.log("Stopped by user")
