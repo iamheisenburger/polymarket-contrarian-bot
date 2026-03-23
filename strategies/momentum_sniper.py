@@ -206,6 +206,11 @@ class SniperConfig:
     max_entry_price: float = 0.85    # Above this the payout ratio is too low for edge to matter
     min_entry_price: float = 0.02    # Below Polymarket minimum tick
 
+    # Position limits: prevent deploying entire bankroll simultaneously.
+    # max_concurrent_positions=1 means only 1 open trade at a time across ALL coins.
+    # This prevents the V6 failure mode where 9 trades fired in 6 minutes.
+    max_concurrent_positions: int = 1
+
     # Market settings
     market_check_interval: float = 30.0
 
@@ -2314,9 +2319,12 @@ class MomentumSniperStrategy:
         opportunities = self._find_opportunities()
         signal_time = time.time()
 
-        # Execute ALL opportunities — no artificial limit on trades per tick.
-        # Kelly sizes each bet against available balance, so later bets
-        # naturally get smaller as capital is allocated. Let volume work.
+        # Position limit: count how many coins have open positions right now.
+        active_positions = sum(
+            1 for s in self.coin_states.values()
+            if s.has_up_position or s.has_down_position
+        )
+
         for state, side, price, edge, fv in opportunities:
             # Re-check position — previous execution in this loop may have filled
             if side == "up" and state.has_up_position:
@@ -2324,8 +2332,14 @@ class MomentumSniperStrategy:
             if side == "down" and state.has_down_position:
                 continue
 
+            # Enforce max concurrent positions across ALL coins.
+            if active_positions >= self.config.max_concurrent_positions:
+                if not (state.has_up_position or state.has_down_position):
+                    # This coin doesn't have an open position — skip it.
+                    continue
+
             if not self.config.observe_only and self._available_balance() < self.config.min_bet_usdc:
-                break  # Out of capital — Kelly's job is done
+                break  # Out of capital
 
             # Signal confirmation: queue instead of immediate execution
             if self.config.confirm_gap > 0:
@@ -2347,6 +2361,9 @@ class MomentumSniperStrategy:
                     )
             else:
                 await self._execute_snipe(state, side, price, edge, fv, signal_time=signal_time)
+                # Update active position count after execution
+                if state.has_up_position or state.has_down_position:
+                    active_positions += 1
 
     def _render_status(self):
         """Render the live status display."""

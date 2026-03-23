@@ -111,6 +111,10 @@ def main():
         help="Min entry price to trade at (default: 0.02). Higher = higher model confidence required."
     )
     parser.add_argument(
+        "--max-concurrent-positions", type=int, default=1,
+        help="Max positions open simultaneously across all coins (default: 1). Prevents deploying entire bankroll at once."
+    )
+    parser.add_argument(
         "--observe", action="store_true",
         help="Observe-only mode — show signals but don't trade"
     )
@@ -343,6 +347,7 @@ def main():
         max_bet_fraction=args.max_bet_fraction,
         max_entry_price=args.max_entry_price,
         min_entry_price=args.min_entry_price,
+        max_concurrent_positions=args.max_concurrent_positions,
         min_size_mode=args.min_size,
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
