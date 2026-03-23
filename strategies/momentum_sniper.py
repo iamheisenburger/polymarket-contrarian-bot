@@ -1669,92 +1669,12 @@ class MomentumSniperStrategy:
                 "info"
             )
 
-        # MAKER-FIRST EXECUTION: GTC at ask (zero fees) → FAK fallback (taker).
-        # Backtest shows V5.2 at mom 0.0005-0.001 = +5pp edge, $0.23/trade.
-        # GTC at ask rests as maker. If it fills: zero fees + rebates.
-        # If it doesn't fill in 5s: FAK taker catches it.
+        # FAK TAKER EXECUTION — direct, fast, no resting orders.
+        # GTD maker removed: caused ghost fills, burned 3.5s per signal for zero fills.
+        # FAK fills or dies instantly. No ambiguity, no ghosts.
         actual_fill = num_tokens  # default, updated on partial fills
 
-        # Step 1: GTD at best ask (maker order, zero fees, auto-expires in 3s).
-        # GTD auto-expires — NO manual cancel needed, NO ghost fills possible.
-        # GTC + cancel caused ghost fills at every timing: 300ms, 1.5s, 5s.
-        # GTD eliminates the race condition entirely.
-        import asyncio as _aio
-        gtd_expiry = int(time.time()) + 3  # Expires in 3 seconds
-        self.log(
-            f"[MAKER] {state.coin} {side.upper()} GTD @ ${original_ask:.2f} "
-            f"(ask=${original_ask:.2f}, expires 3s) book=[{ob_snapshot}]",
-            "info"
-        )
-        result = await self.bot.place_order(
-            token_id=token_id,
-            price=original_ask,
-            size=num_tokens,
-            side="BUY",
-            order_type="GTD",
-            expiration=gtd_expiry,
-        )
-
-        # ALWAYS wait for GTD to expire, even if API returned failure.
-        # The API can return success=False but still place the order on Polymarket.
-        # Checking balance before/after is the only reliable way to detect fills.
-        bal_before = self.bot.get_usdc_balance() or self._balance
-        maker_order_id = result.order_id if result.success else None
-
-        if maker_order_id:
-            self.log(f"[MAKER] GTD resting: {maker_order_id[:20]}... bal=${bal_before:.2f}", "info")
-
-        # Wait for GTD to fully expire (3s) + buffer for CLOB propagation
-        await _aio.sleep(3.5)
-
-        # Check if GTD filled — try CLOB first, then balance fallback
-        gtd_filled = False
-        if maker_order_id:
-            try:
-                order_data = await _aio.to_thread(
-                    self.bot._official_client.get_order, maker_order_id
-                )
-                clob_status = (order_data or {}).get("status", "")
-                gtd_matched = float((order_data or {}).get("size_matched", 0))
-                if gtd_matched > 0 or clob_status == "MATCHED":
-                    actual_fill = gtd_matched if gtd_matched > 0 else num_tokens
-                    self.log(
-                        f"[MAKER FILL] {state.coin} {side.upper()} "
-                        f"{actual_fill:.0f} tokens @ ${original_ask:.2f} (zero fees)",
-                        "success"
-                    )
-                    buy_price = original_ask
-                    result.fill_amount = actual_fill if gtd_matched > 0 else None
-                    result.success = True
-                    gtd_filled = True
-                else:
-                    self.log(f"GTD expired (status={clob_status}). FAK next.", "info")
-                    result.success = False
-            except Exception as e:
-                self.log(f"GTD check failed ({e})", "warning")
-                result.success = False
-
-        # Balance fallback: catch fills even when API returned failure on placement
-        if not gtd_filled:
-            bal_after = self.bot.get_usdc_balance() or self._balance
-            expected_cost = original_ask * num_tokens
-            bal_drop = bal_before - bal_after
-            if bal_drop >= expected_cost * 0.5:  # At least half the expected cost dropped
-                actual_fill = round(bal_drop / original_ask)
-                self.log(
-                    f"[MAKER FILL] {state.coin} {side.upper()} "
-                    f"~{actual_fill:.0f} tokens @ ${original_ask:.2f} (balance drop ${bal_drop:.2f})",
-                    "success"
-                )
-                buy_price = original_ask
-                result.fill_amount = actual_fill if actual_fill > 0 else None
-                result.success = True
-                gtd_filled = True
-            else:
-                result.success = False
-
-        # Step 2: FAK taker fallback (if GTC didn't fill)
-        if not result.success:
+        if True:  # FAK is the only execution path
             self.log(
                 f"[FILL] {state.coin} {side.upper()} FAK @ ${buy_price:.2f} "
                 f"(ask=${original_ask:.2f} +{tolerance:.2f}tol)",
