@@ -87,15 +87,13 @@ class FastOrderClient:
         try:
             from py_order_utils.builders import OrderBuilder as UtilsOrderBuilder
             from py_order_utils.signer import Signer as UtilsSigner
-            from py_order_utils.config import get_contract_config
 
-            config = get_contract_config(CHAIN_ID)
             self._order_builder = UtilsOrderBuilder(
-                config.exchange, CHAIN_ID, UtilsSigner(key=private_key)
+                EXCHANGE_ADDRESS, CHAIN_ID, UtilsSigner(key=private_key)
             )
-        except Exception:
+        except Exception as e:
             self._order_builder = None
-            logger.warning("py_order_utils not available — fast_order signing disabled")
+            logger.warning(f"py_order_utils not available — fast_order signing disabled: {e}")
 
         # Cache for tick sizes
         self._tick_sizes: dict = {}
