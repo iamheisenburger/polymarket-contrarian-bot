@@ -1624,27 +1624,10 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # Retry ladder: step up +1c per attempt to catch liquidity at higher levels.
-        # Each retry costs 1 cent more but missed signals cost ~$1.53 in EV.
-        if not result.success and tolerance > 0:
-            for step in range(1, self.config.fok_retry_steps + 1):
-                retry_price = round(buy_price + 0.01 * step, 2)
-                if retry_price > self.config.max_entry_price:
-                    break
-                self.log(
-                    f"FOK retry +{step}c @ ${retry_price:.2f} (total +${retry_price - original_ask:.2f})",
-                    "warning"
-                )
-                result = await self.bot.place_order(
-                    token_id=token_id,
-                    price=retry_price,
-                    size=num_tokens,
-                    side="BUY",
-                    order_type="FOK",
-                )
-                if result.success:
-                    buy_price = retry_price
-                    break
+        # Skip retry ladder — data shows retries saved 1/31 fills while
+        # costing 900ms per cycle. GTC fallback is 4x more effective (4/31).
+        # Go straight to GTC which benefits from price improvement on
+        # Polymarket (we submit at max price but often pay maker's ask).
 
         # FOK fallback: if Kelly-sized order fails on thin orderbook,
         # retry with minimum 5 tokens (paper-validated fill size).
@@ -1666,9 +1649,11 @@ class MomentumSniperStrategy:
         # This sits in the book and can get filled by sellers coming to us.
         # Cancel after 5 seconds if not filled.
         if not result.success:
-            # Use the highest price we were willing to pay
+            # GTC rests at tolerance + 3c above ask. Polymarket gives price
+            # improvement so we often pay the maker's ask, not our submitted
+            # price. Higher ceiling = wider net without higher cost.
             gtc_price = min(
-                round(original_ask + tolerance + 0.01 * self.config.fok_retry_steps, 2),
+                round(original_ask + tolerance + 0.03, 2),
                 self.config.max_entry_price,
             )
             self.log(
@@ -1724,9 +1709,9 @@ class MomentumSniperStrategy:
                                 await self.bot.cancel_order(gtc_result.order_id)
                             except Exception:
                                 pass
-                            # Wait 3 more seconds, then do FINAL balance check
+                            # Wait 1 second, then do FINAL balance check
                             # The order may have filled right as we cancelled
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(1)
                             bal_final = self.bot.get_usdc_balance()
                             final_drop = (bal_before_gtc or 0) - (bal_final or 0)
                             self.log(
