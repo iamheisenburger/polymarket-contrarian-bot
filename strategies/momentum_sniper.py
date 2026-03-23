@@ -1706,10 +1706,15 @@ class MomentumSniperStrategy:
                             self.bot._official_client.get_order, gtc_result.order_id
                         )
                         clob_status = (order_data or {}).get("status", "")
-                        if clob_status == "MATCHED":
-                            self.log(f"GTC FILLED (CLOB={clob_status})!", "info")
+                        gtc_size_matched = float((order_data or {}).get("size_matched", 0))
+                        if clob_status == "MATCHED" or gtc_size_matched > 0:
+                            self.log(
+                                f"GTC FILLED (CLOB={clob_status}, "
+                                f"matched={gtc_size_matched})!", "info"
+                            )
                             result = gtc_result
                             result._gtc_confirmed = True
+                            result.fill_amount = gtc_size_matched if gtc_size_matched > 0 else None
                             buy_price = gtc_price
                         else:
                             # Try to cancel — but it might fill between check and cancel
@@ -1717,9 +1722,10 @@ class MomentumSniperStrategy:
                                 await self.bot.cancel_order(gtc_result.order_id)
                             except Exception:
                                 pass
-                            # Wait 1 second, then do FINAL balance check
-                            # The order may have filled right as we cancelled
-                            await asyncio.sleep(1)
+                            # Wait 3 seconds, then do FINAL balance check
+                            # The order may have filled right as we cancelled.
+                            # MUST be 3s — 1s caused ghost fills (BNB 2026-03-23)
+                            await asyncio.sleep(3)
                             bal_final = self.bot.get_usdc_balance()
                             final_drop = (bal_before_gtc or 0) - (bal_final or 0)
                             self.log(
@@ -1727,17 +1733,28 @@ class MomentumSniperStrategy:
                                 f"(total drop=${final_drop:.2f})",
                                 "info"
                             )
-                            if final_drop >= expected_cost * 0.3:
+                            # Also re-check CLOB for size_matched (cancel doesn't undo fills)
+                            post_cancel_matched = 0.0
+                            try:
+                                post_data = await asyncio.to_thread(
+                                    self.bot._official_client.get_order, gtc_result.order_id
+                                )
+                                post_cancel_matched = float((post_data or {}).get("size_matched", 0))
+                            except Exception:
+                                pass
+                            if final_drop >= expected_cost * 0.3 or post_cancel_matched > 0:
+                                fill_evidence = f"bal_drop=${final_drop:.2f}" if final_drop >= expected_cost * 0.3 else f"CLOB matched={post_cancel_matched}"
                                 self.log(
                                     f"GTC FILLED AFTER CANCEL! "
-                                    f"Balance dropped ${final_drop:.2f} — order matched before cancel",
+                                    f"{fill_evidence} — order matched before cancel",
                                     "warning"
                                 )
                                 result = gtc_result
                                 result._gtc_confirmed = True
+                                result.fill_amount = post_cancel_matched if post_cancel_matched > 0 else None
                                 buy_price = gtc_price
                             else:
-                                self.log(f"GTC confirmed no fill (bal=${bal_final:.2f})", "info")
+                                self.log(f"GTC confirmed no fill (bal=${bal_final:.2f}, matched={post_cancel_matched})", "info")
                     except Exception as e:
                         try:
                             await self.bot.cancel_order(gtc_result.order_id)
