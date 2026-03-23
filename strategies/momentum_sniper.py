@@ -734,11 +734,12 @@ class MomentumSniperStrategy:
             ap = os.environ.get("POLY_BUILDER_API_PASSPHRASE", "") or os.environ.get("CLOB_API_PASSPHRASE", "")
             if all([pk, safe, ak, ask_key, ap]):
                 self._fast_order = FastOrderClient(pk, safe, ak, ask_key, ap)
-                logger.info("FastOrderClient initialized — SDK bypass active")
             else:
-                logger.warning(f"FastOrderClient: missing env vars (pk={bool(pk)} safe={bool(safe)} ak={bool(ak)} secret={bool(ask_key)} pass={bool(ap)})")
+                import logging as _log
+                _log.getLogger(__name__).warning(f"FastOrderClient: missing env vars")
         except Exception as e:
-            logger.warning(f"FastOrderClient not available: {e}")
+            import logging as _log
+            _log.getLogger(__name__).warning(f"FastOrderClient not available: {e}")
 
         # Session stats
         self.stats = SniperStats()
