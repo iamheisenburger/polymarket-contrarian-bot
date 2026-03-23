@@ -76,27 +76,20 @@ def download_snapshots(markets, coin, target_elapsed=120):
     snapshots = {}
     t0 = time.time()
 
-    # Rate-limited: 5 concurrent, small batches
-    batch_size = 50
-    for batch_start in range(0, len(markets), batch_size):
-        batch = markets[batch_start:batch_start + batch_size]
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = [pool.submit(fetch_one, m) for m in batch]
-            for f in as_completed(futures):
-                mid, snap = f.result()
-                if snap:
-                    snapshots[mid] = snap
+    # Sequential with 0.3s delay — respects API rate limits
+    for i, m in enumerate(markets):
+        mid, snap = fetch_one(m)
+        if snap:
+            snapshots[mid] = snap
 
-        done = batch_start + len(batch)
-        elapsed = time.time() - t0
-        rate = done / elapsed if elapsed > 0 else 0
-        got = len(snapshots)
-        eta = (len(markets) - done) / rate if rate > 0 else 0
-        if done % 200 == 0 or done == len(markets):
-            print(f"  ...{done}/{len(markets)} ({got} snaps, {rate:.1f}/s, ETA {eta:.0f}s)")
+        if (i + 1) % 100 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            got = len(snapshots)
+            eta = (len(markets) - i - 1) / rate if rate > 0 else 0
+            print(f"  ...{i+1}/{len(markets)} ({got} snaps, {rate:.1f}/s, ETA {eta/60:.0f}m)", flush=True)
 
-        # Small delay between batches to avoid rate limits
-        time.sleep(0.5)
+        time.sleep(0.3)  # ~3 req/s, safe for API
 
     print(f"  Got {len(snapshots)} snapshots in {time.time()-t0:.0f}s")
     return snapshots
