@@ -1768,27 +1768,7 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # SECOND WAVE STRATEGY: wait 2s for HFT to clear, then buy repriced liquidity.
-        # At 6ms we get scooped every time (0 fills). At 350ms we filled 39 trades.
-        # The slowness IS the edge — we buy AFTER HFT, not during.
-        import asyncio as _aio
-        await _aio.sleep(2.0)  # Let HFT wave pass
-
-        # Re-check the book after waiting — get fresh repriced ask
-        fresh_ask = state.manager.get_best_ask(side)
-        if fresh_ask > 0 and fresh_ask <= self.config.max_entry_price:
-            buy_price = min(round(fresh_ask + tolerance, 2), self.config.max_entry_price)
-            self.log(f"[SECOND-WAVE] {state.coin} {side.upper()} repriced ask=${fresh_ask:.2f} (was ${original_ask:.2f})", "info")
-        else:
-            self.log(f"[SKIP] {state.coin} {side.upper()} ask repriced to ${fresh_ask:.2f} (above maxE)", "warning")
-            from src.bot import OrderResult
-            result = OrderResult(success=False, message="Repriced above maxE")
-            # Skip to rejection logging
-            order_end = time.time()
-            order_latency_ms = (order_end - order_start) * 1000
-            total_latency_ms = (order_end - signal_time) * 1000 if signal_time else 0
-            return
-
+        # FAK taker — direct, simple, fast.
         result = await self.bot.place_order(
             token_id=token_id, price=buy_price,
             size=num_tokens, side="BUY", order_type="FAK",
