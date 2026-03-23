@@ -933,16 +933,7 @@ class MomentumSniperStrategy:
             if tte < min_tte or tte > max_tte:
                 return
 
-            # SIGNAL QUALIFIES — fire order directly via async task
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self._execute_snipe(state, side, best_ask, edge, fv, signal_time=time.time()))
-            except Exception:
-                pass
-
-            # Also flag for tick loop (backup)
+            # Flag for tick loop — the 2s delay in _execute_snipe handles timing
             if not hasattr(self, '_urgent_coins'):
                 self._urgent_coins = set()
             self._urgent_coins.add(coin)
