@@ -721,6 +721,21 @@ class MomentumSniperStrategy:
         except Exception:
             pass
 
+        # Fast order client — bypasses SDK for ~100-200ms savings per order
+        self._fast_order = None
+        try:
+            from lib.fast_order import FastOrderClient
+            import os
+            pk = os.environ.get("PRIVATE_KEY", "")
+            safe = os.environ.get("POLYMARKET_SAFE_ADDRESS", "")
+            ak = os.environ.get("CLOB_API_KEY", "")
+            ask_key = os.environ.get("CLOB_SECRET", "")
+            ap = os.environ.get("CLOB_API_PASSPHRASE", "")
+            if all([pk, safe, ak, ask_key, ap]):
+                self._fast_order = FastOrderClient(pk, safe, ak, ask_key, ap)
+        except Exception as e:
+            logger.warning(f"FastOrderClient not available: {e}")
+
         # Session stats
         self.stats = SniperStats()
 
@@ -1670,29 +1685,54 @@ class MomentumSniperStrategy:
             )
 
         # FAK TAKER EXECUTION — direct, fast, no resting orders.
-        # GTD maker removed: caused ghost fills, burned 3.5s per signal for zero fills.
+        # Uses FastOrderClient to bypass SDK overhead (~100-300ms → ~10-20ms signing).
         # FAK fills or dies instantly. No ambiguity, no ghosts.
         actual_fill = num_tokens  # default, updated on partial fills
 
-        if True:  # FAK is the only execution path
-            self.log(
-                f"[FILL] {state.coin} {side.upper()} FAK @ ${buy_price:.2f} "
-                f"(ask=${original_ask:.2f} +{tolerance:.2f}tol)",
-                "info"
-            )
+        self.log(
+            f"[FILL] {state.coin} {side.upper()} FAK @ ${buy_price:.2f} "
+            f"(ask=${original_ask:.2f} +{tolerance:.2f}tol)",
+            "info"
+        )
+
+        # Try fast path first (bypasses SDK), fall back to standard if unavailable
+        if self._fast_order:
+            try:
+                fast_result = await self._fast_order.place_order(
+                    token_id=token_id,
+                    price=buy_price,
+                    size=num_tokens,
+                    side="BUY",
+                    order_type="FAK",
+                )
+                success = fast_result.get("success", False)
+                order_id = fast_result.get("orderID", "")
+                from src.bot import OrderResult
+                result = OrderResult(
+                    success=success,
+                    order_id=order_id,
+                    status=fast_result.get("status", ""),
+                    message=fast_result.get("errorMsg", "") if not success else "Fast order placed",
+                    data=fast_result,
+                )
+            except Exception as e:
+                self.log(f"FastOrder failed ({e}), falling back to SDK", "warning")
+                result = await self.bot.place_order(
+                    token_id=token_id, price=buy_price,
+                    size=num_tokens, side="BUY", order_type="FAK",
+                )
+        else:
             result = await self.bot.place_order(
-                token_id=token_id,
-                price=buy_price,
-                size=num_tokens,
-                side="BUY",
-                order_type="FAK",
+                token_id=token_id, price=buy_price,
+                size=num_tokens, side="BUY", order_type="FAK",
             )
-            actual_fill = result.fill_amount if result.fill_amount else num_tokens
-            self.log(
-                f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
-                f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f}",
-                "info"
-            )
+
+        actual_fill = result.fill_amount if result.fill_amount else num_tokens
+        self.log(
+            f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
+            f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f}",
+            "info"
+        )
 
         # GTC fallback REMOVED — caused ghost fills on every session.
         # GTC orders fill after balance/CLOB checks, creating untracked positions.
@@ -2526,7 +2566,11 @@ class MomentumSniperStrategy:
         if time.time() - self._last_keepalive > 30:
             self._last_keepalive = time.time()
             try:
-                self.bot._official_client.get_server_time()
+                if self._fast_order:
+                    import asyncio
+                    asyncio.create_task(self._fast_order.keepalive())
+                else:
+                    self.bot._official_client.get_server_time()
             except Exception:
                 pass
 
