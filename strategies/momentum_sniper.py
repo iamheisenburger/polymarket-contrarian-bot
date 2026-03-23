@@ -1857,6 +1857,13 @@ class MomentumSniperStrategy:
         if is_confirmed_fill:
             # FAK partial fills: use actual fill amount, not requested amount
             filled_tokens = actual_fill if result.fill_amount else num_tokens
+            # Guard: FAK can "match" with 0 tokens on empty books
+            if filled_tokens <= 0:
+                self.log(
+                    f"[SKIP] {state.coin} {side.upper()} FAK matched but 0 tokens filled — ignoring",
+                    "warning"
+                )
+                return False
             fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
             actual_cost = (buy_price + fee_per_token) * filled_tokens
 

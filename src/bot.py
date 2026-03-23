@@ -520,6 +520,15 @@ class TradingBot:
                             data=response,
                             fill_amount=size_matched,
                         )
+                    # MATCHED with size_matched=0: FAK on empty book, nothing actually filled
+                    if clob_status == "MATCHED" and size_matched == 0 and order_type.upper() == "FAK":
+                        logger.warning(f"FAK MATCHED but 0 tokens filled: {order_id[:20]}...")
+                        return OrderResult(
+                            success=False,
+                            order_id=order_id,
+                            status="EMPTY_FILL",
+                            message="FAK matched with 0 tokens (empty book)",
+                        )
                     # MATCHED, LIVE = treat as fully filled
                     logger.info(f"{order_type} FILLED (CLOB={clob_status}): {order_id[:20]}...")
                 except Exception as e:
