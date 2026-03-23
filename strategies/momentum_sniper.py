@@ -2143,6 +2143,16 @@ class MomentumSniperStrategy:
                 if tid:
                     self._vpin_tracker.register_token(tid, coin, side_name)
 
+        # Pre-warm SDK caches for new tokens (eliminates hidden HTTP calls during order creation)
+        if state.manager.current_market:
+            token_ids = state.manager.token_ids
+            for side_name, tid in token_ids.items():
+                if tid:
+                    try:
+                        self.bot._official_client.get_tick_size(tid)
+                    except Exception:
+                        pass
+
         # Clear signal logger dedup for old market
         if self.signal_logger and old_slug:
             self.signal_logger.clear_slug(old_slug)
@@ -2509,6 +2519,16 @@ class MomentumSniperStrategy:
         # Flush stale shadow records that were never resolved
         if self.shadow_logger:
             self.shadow_logger.flush_stale(max_age_seconds=600)
+
+        # HTTP keepalive: ping CLOB every 30s to prevent TCP+TLS cold start (~50-150ms saved)
+        if not hasattr(self, '_last_keepalive'):
+            self._last_keepalive = 0
+        if time.time() - self._last_keepalive > 30:
+            self._last_keepalive = time.time()
+            try:
+                self.bot._official_client.get_server_time()
+            except Exception:
+                pass
 
         # Process pending confirmation signals
         if self.config.confirm_gap > 0:
