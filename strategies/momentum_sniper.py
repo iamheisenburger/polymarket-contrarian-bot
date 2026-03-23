@@ -1658,17 +1658,22 @@ class MomentumSniperStrategy:
         )
 
         if result.success and result.order_id:
-            # FAST maker check: place GTC, check CLOB immediately, cancel if not filled.
-            # Must NOT block for seconds — that kills frequency.
+            # Maker GTC check: 1.5s wait for CLOB to reflect fill, then verify.
+            # 300ms was too fast (ghost fills). 5s was too slow (kills frequency).
+            # 1.5s is the sweet spot: CLOB updates in ~500ms-1s typically.
             import asyncio as _aio
-            await _aio.sleep(0.3)  # 300ms for matching engine to process
+            maker_order_id = result.order_id
+            self.log(f"[MAKER] GTC resting: {maker_order_id[:20]}...", "info")
+            await _aio.sleep(1.5)
             try:
                 order_data = await _aio.to_thread(
-                    self.bot._official_client.get_order, result.order_id
+                    self.bot._official_client.get_order, maker_order_id
                 )
                 clob_status = (order_data or {}).get("status", "")
                 gtc_matched = float((order_data or {}).get("size_matched", 0))
+
                 if gtc_matched > 0 or clob_status == "MATCHED":
+                    # FILLED as maker — zero fees
                     actual_fill = gtc_matched if gtc_matched > 0 else num_tokens
                     self.log(
                         f"[MAKER FILL] {state.coin} {side.upper()} "
@@ -1677,38 +1682,44 @@ class MomentumSniperStrategy:
                     )
                     buy_price = original_ask
                     result.fill_amount = actual_fill if gtc_matched > 0 else None
-                else:
-                    # Not filled instantly — cancel and go straight to FAK
+                elif clob_status in ("LIVE", "OPEN"):
+                    # Still resting, not matched — safe to cancel
                     try:
-                        await self.bot.cancel_order(result.order_id)
+                        await self.bot.cancel_order(maker_order_id)
                     except Exception:
                         pass
-                    # Quick post-cancel check (1s)
-                    await _aio.sleep(1)
+                    # Post-cancel recheck: catch fills between check and cancel
+                    await _aio.sleep(1.5)
                     try:
                         post_data = await _aio.to_thread(
-                            self.bot._official_client.get_order, result.order_id
+                            self.bot._official_client.get_order, maker_order_id
                         )
                         post_matched = float((post_data or {}).get("size_matched", 0))
-                        if post_matched > 0:
-                            actual_fill = post_matched
+                        post_status = (post_data or {}).get("status", "")
+                        if post_matched > 0 or post_status == "MATCHED":
+                            actual_fill = post_matched if post_matched > 0 else num_tokens
                             self.log(
                                 f"[MAKER FILL] GTC filled during cancel! "
                                 f"{actual_fill:.0f} tokens @ ${original_ask:.2f}",
                                 "warning"
                             )
                             buy_price = original_ask
-                            result.fill_amount = actual_fill
+                            result.fill_amount = actual_fill if post_matched > 0 else None
                         else:
-                            result.success = False  # Fall through to FAK
+                            self.log(f"GTC confirmed no fill (status={post_status}). FAK next.", "info")
+                            result.success = False
                     except Exception:
                         result.success = False
+                else:
+                    # CANCELLED/DEAD/unknown — don't cancel again, just move to FAK
+                    result.success = False
             except Exception as e:
-                self.log(f"GTC check failed ({e}), trying FAK...", "warning")
+                self.log(f"GTC check failed ({e}), cancelling and trying FAK...", "warning")
                 try:
-                    await self.bot.cancel_order(result.order_id)
+                    await self.bot.cancel_order(maker_order_id)
                 except Exception:
                     pass
+                await _aio.sleep(1.5)
                 result.success = False
 
         # Step 2: FAK taker fallback (if GTC didn't fill)
