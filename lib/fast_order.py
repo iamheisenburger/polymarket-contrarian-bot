@@ -63,12 +63,25 @@ class FastOrderClient:
         self._api_passphrase = api_passphrase
 
         # Persistent async HTTP client — reuses TCP+TLS connection
+        # HTTP/1.1 (not HTTP/2) to avoid ALPN negotiation overhead
+        # DNS pinned to avoid lookup latency
+        import socket
+        try:
+            clob_ip = socket.gethostbyname("clob.polymarket.com")
+        except Exception:
+            clob_ip = "172.64.153.51"  # fallback
         self._http = httpx.AsyncClient(
-            base_url=CLOB_URL,
-            http2=True,
+            base_url=f"https://{clob_ip}",
+            headers={"Host": "clob.polymarket.com"},
+            http2=False,  # HTTP/1.1 — skip ALPN negotiation
+            verify=True,
             timeout=10.0,
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
+
+        # Pre-signed order cache: {(token_id, price_cents): signed_order}
+        self._pre_signed: dict = {}
+        self._pre_sign_lock = False
 
         # Cache the order builder from py_order_utils (reuse, don't recreate)
         try:
@@ -227,6 +240,121 @@ class FastOrderClient:
         logger.info(
             f"FastOrder {side} {size}@{price} {order_type}: "
             f"total={total_ms:.0f}ms (sign={sign_ms:.0f}ms prep={prep_ms:.0f}ms net={net_ms:.0f}ms) "
+            f"success={result.get('success')} id={result.get('orderID','')[:16]}"
+        )
+
+        return result
+
+    async def pre_sign_orders(self, token_ids: dict, prices: list = None):
+        """Pre-sign orders for active tokens at likely price points.
+
+        Call every ~10s. When signal fires, grab pre-signed order for instant POST.
+
+        Args:
+            token_ids: {"up": "token_123", "down": "token_456"}
+            prices: list of price points to pre-sign (default: 0.30-0.55 in 0.01 steps)
+        """
+        if self._pre_sign_lock:
+            return
+        self._pre_sign_lock = True
+
+        if prices is None:
+            prices = [round(p/100, 2) for p in range(30, 56)]  # $0.30-$0.55
+
+        try:
+            for side_name, token_id in token_ids.items():
+                if not token_id:
+                    continue
+                for price in prices:
+                    try:
+                        maker_amount, taker_amount = self._get_amounts("BUY", 5.0, price)
+                        signed = self._sign_order(
+                            token_id, maker_amount, taker_amount, "BUY"
+                        )
+                        # Cache with price in cents as key
+                        price_key = int(price * 100)
+                        self._pre_signed[(token_id, price_key)] = signed
+                    except Exception:
+                        pass
+        finally:
+            self._pre_sign_lock = False
+
+    async def place_order_fast(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str = "BUY",
+        order_type: str = "FAK",
+    ) -> dict:
+        """Ultra-fast order — uses pre-signed order if available, skips signing."""
+        t0 = time.monotonic()
+
+        price_key = int(price * 100)
+        pre_signed = self._pre_signed.get((token_id, price_key))
+
+        if pre_signed and size == 5.0:
+            # Use pre-signed order — skip signing entirely
+            signed = pre_signed
+            t_sign = time.monotonic()
+            # Remove from cache (nonce is single-use)
+            self._pre_signed.pop((token_id, price_key), None)
+        else:
+            # Fall back to sign on the fly
+            maker_amount, taker_amount = self._get_amounts(side, size, price)
+            signed = self._sign_order(token_id, maker_amount, taker_amount, side)
+            t_sign = time.monotonic()
+
+        # Build body
+        body = {
+            "order": {
+                "salt": signed.order.salt,
+                "maker": signed.order.maker,
+                "signer": signed.order.signer,
+                "taker": signed.order.taker,
+                "tokenId": signed.order.tokenId,
+                "makerAmount": signed.order.makerAmount,
+                "takerAmount": signed.order.takerAmount,
+                "expiration": signed.order.expiration,
+                "nonce": signed.order.nonce,
+                "feeRateBps": signed.order.feeRateBps,
+                "side": signed.order.side,
+                "signatureType": signed.order.signatureType,
+                "signature": signed.signature,
+            },
+            "owner": self._api_key,
+            "orderType": order_type.upper(),
+        }
+        body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+        timestamp = int(time.time())
+        hmac_sig = self._build_hmac(timestamp, "POST", "/order", body_str)
+        headers = {
+            "POLY-ADDRESS": self._eoa_address,
+            "POLY-SIGNATURE": hmac_sig,
+            "POLY-TIMESTAMP": str(timestamp),
+            "POLY-API-KEY": self._api_key,
+            "POLY-PASSPHRASE": self._api_passphrase,
+            "Content-Type": "application/json",
+        }
+
+        t_prep = time.monotonic()
+
+        try:
+            resp = await self._http.post("/order", headers=headers, content=body_str)
+            result = resp.json()
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        t_post = time.monotonic()
+        total_ms = (t_post - t0) * 1000
+        sign_ms = (t_sign - t0) * 1000
+        net_ms = (t_post - t_prep) * 1000
+        pre = "PRE-SIGNED" if pre_signed else "LIVE-SIGNED"
+
+        logger.info(
+            f"FastOrder [{pre}] {side} {size}@{price} {order_type}: "
+            f"total={total_ms:.0f}ms (sign={sign_ms:.0f}ms net={net_ms:.0f}ms) "
             f"success={result.get('success')} id={result.get('orderID','')[:16]}"
         )
 

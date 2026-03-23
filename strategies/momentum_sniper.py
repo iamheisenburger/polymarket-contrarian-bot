@@ -1695,10 +1695,10 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # Try fast path first (bypasses SDK), fall back to standard if unavailable
+        # Try fast path first (pre-signed + bypasses SDK), fall back to standard if unavailable
         if self._fast_order:
             try:
-                fast_result = await self._fast_order.place_order(
+                fast_result = await self._fast_order.place_order_fast(
                     token_id=token_id,
                     price=buy_price,
                     size=num_tokens,
@@ -2560,11 +2560,15 @@ class MomentumSniperStrategy:
         if self.shadow_logger:
             self.shadow_logger.flush_stale(max_age_seconds=600)
 
-        # HTTP keepalive: ping CLOB every 30s to prevent TCP+TLS cold start (~50-150ms saved)
+        # HTTP keepalive + pre-sign orders every 10s
         if not hasattr(self, '_last_keepalive'):
             self._last_keepalive = 0
-        if time.time() - self._last_keepalive > 30:
-            self._last_keepalive = time.time()
+        if not hasattr(self, '_last_presign'):
+            self._last_presign = 0
+        now = time.time()
+
+        if now - self._last_keepalive > 30:
+            self._last_keepalive = now
             try:
                 if self._fast_order:
                     import asyncio
@@ -2573,6 +2577,18 @@ class MomentumSniperStrategy:
                     self.bot._official_client.get_server_time()
             except Exception:
                 pass
+
+        # Pre-sign orders for all active tokens every 10s (moves signing off critical path)
+        if self._fast_order and now - self._last_presign > 10:
+            self._last_presign = now
+            for coin, state in self.coin_states.items():
+                if state.manager.current_market:
+                    token_ids = state.manager.token_ids
+                    try:
+                        import asyncio
+                        asyncio.create_task(self._fast_order.pre_sign_orders(token_ids))
+                    except Exception:
+                        pass
 
         # Process pending confirmation signals
         if self.config.confirm_gap > 0:
