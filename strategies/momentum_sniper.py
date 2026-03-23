@@ -1741,119 +1741,9 @@ class MomentumSniperStrategy:
                 "info"
             )
 
-        # Step 3: GTC fallback at higher price (last resort)
-        if not result.success:
-            gtc_price = min(
-                round(original_ask + tolerance + 0.03, 2),
-                self.config.max_entry_price,
-            )
-            self.log(
-                f"GTC fallback @ ${gtc_price:.2f} for {num_tokens:.0f} tokens (5s timeout)",
-                "warning"
-            )
-            gtc_result = await self.bot.place_order(
-                token_id=token_id,
-                price=gtc_price,
-                size=num_tokens,
-                side="BUY",
-                order_type="GTC",
-            )
-            if gtc_result.success and gtc_result.order_id:
-                # Snapshot real balance BEFORE waiting
-                bal_before_gtc = self.bot.get_usdc_balance()
-                self.log(
-                    f"GTC placed: {gtc_result.order_id[:20]}... bal_before=${bal_before_gtc:.2f}",
-                    "info"
-                )
-                # Wait up to 5 seconds for fill
-                import asyncio
-                await asyncio.sleep(5)
-                # Check if it filled by comparing real balance before vs after
-                bal_after_gtc = self.bot.get_usdc_balance()
-                expected_cost = gtc_price * num_tokens
-                bal_drop = (bal_before_gtc or 0) - (bal_after_gtc or 0)
-                self.log(
-                    f"GTC check: bal ${bal_before_gtc:.2f} -> ${bal_after_gtc:.2f} "
-                    f"(drop=${bal_drop:.2f}, expected=${expected_cost:.2f})",
-                    "info"
-                )
-                if bal_drop >= expected_cost * 0.3:
-                    self.log(f"GTC FILLED! Balance dropped ${bal_drop:.2f}", "info")
-                    result = gtc_result
-                    result._gtc_confirmed = True
-                    buy_price = gtc_price
-                else:
-                    # Balance didn't drop yet — try CLOB lookup
-                    try:
-                        order_data = await asyncio.to_thread(
-                            self.bot._official_client.get_order, gtc_result.order_id
-                        )
-                        clob_status = (order_data or {}).get("status", "")
-                        gtc_size_matched = float((order_data or {}).get("size_matched", 0))
-                        if clob_status == "MATCHED" or gtc_size_matched > 0:
-                            self.log(
-                                f"GTC FILLED (CLOB={clob_status}, "
-                                f"matched={gtc_size_matched})!", "info"
-                            )
-                            result = gtc_result
-                            result._gtc_confirmed = True
-                            result.fill_amount = gtc_size_matched if gtc_size_matched > 0 else None
-                            buy_price = gtc_price
-                        else:
-                            # Try to cancel — but it might fill between check and cancel
-                            try:
-                                await self.bot.cancel_order(gtc_result.order_id)
-                            except Exception:
-                                pass
-                            # Wait 3 seconds, then do FINAL balance check
-                            # The order may have filled right as we cancelled.
-                            # MUST be 3s — 1s caused ghost fills (BNB 2026-03-23)
-                            await asyncio.sleep(3)
-                            bal_final = self.bot.get_usdc_balance()
-                            final_drop = (bal_before_gtc or 0) - (bal_final or 0)
-                            self.log(
-                                f"GTC post-cancel check: bal ${bal_final:.2f} "
-                                f"(total drop=${final_drop:.2f})",
-                                "info"
-                            )
-                            # Also re-check CLOB for size_matched (cancel doesn't undo fills)
-                            post_cancel_matched = 0.0
-                            try:
-                                post_data = await asyncio.to_thread(
-                                    self.bot._official_client.get_order, gtc_result.order_id
-                                )
-                                post_cancel_matched = float((post_data or {}).get("size_matched", 0))
-                            except Exception:
-                                pass
-                            if final_drop >= expected_cost * 0.3 or post_cancel_matched > 0:
-                                fill_evidence = f"bal_drop=${final_drop:.2f}" if final_drop >= expected_cost * 0.3 else f"CLOB matched={post_cancel_matched}"
-                                self.log(
-                                    f"GTC FILLED AFTER CANCEL! "
-                                    f"{fill_evidence} — order matched before cancel",
-                                    "warning"
-                                )
-                                result = gtc_result
-                                result._gtc_confirmed = True
-                                result.fill_amount = post_cancel_matched if post_cancel_matched > 0 else None
-                                buy_price = gtc_price
-                            else:
-                                self.log(f"GTC confirmed no fill (bal=${bal_final:.2f}, matched={post_cancel_matched})", "info")
-                    except Exception as e:
-                        try:
-                            await self.bot.cancel_order(gtc_result.order_id)
-                        except Exception:
-                            pass
-                        # Final balance check even on error
-                        await asyncio.sleep(3)
-                        bal_final = self.bot.get_usdc_balance()
-                        final_drop = (bal_before_gtc or 0) - (bal_final or 0)
-                        if final_drop >= expected_cost * 0.3:
-                            self.log(f"GTC FILLED (post-error check, drop=${final_drop:.2f})", "warning")
-                            result = gtc_result
-                            result._gtc_confirmed = True
-                            buy_price = gtc_price
-                        else:
-                            self.log(f"GTC verify failed ({e}), no fill confirmed", "warning")
+        # GTC fallback REMOVED — caused ghost fills on every session.
+        # GTC orders fill after balance/CLOB checks, creating untracked positions.
+        # GTD maker + FAK taker is the complete execution chain. No resting GTC.
 
         order_end = time.time()
         order_latency_ms = (order_end - order_start) * 1000
@@ -1861,7 +1751,7 @@ class MomentumSniperStrategy:
 
         # Log rejection diagnostics — understand WHY fills fail
         if not result.success:
-            max_price_tried = round(original_ask + tolerance + 0.03, 2)  # GTC max
+            max_price_tried = round(original_ask + tolerance, 2)  # FAK max (no GTC)
             ob_now = state.manager.get_orderbook(side)
             if ob_now and ob_now.asks:
                 current_best = ob_now.asks[0].price
