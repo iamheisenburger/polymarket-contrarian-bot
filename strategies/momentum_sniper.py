@@ -890,17 +890,59 @@ class MomentumSniperStrategy:
         # Register instant signal detection on price updates
         # Instead of waiting for next tick (100ms), evaluate signal immediately when price moves
         def _on_price_update(coin: str, price: float):
-            """Called on EVERY Binance/Coinbase price tick — instant signal detection."""
+            """Called on EVERY Binance/Coinbase price tick — instant signal detection.
+            Bypasses the tick loop entirely for maximum speed."""
             if not self.running or self.config.observe_only:
                 return
             state = self.coin_states.get(coin)
             if not state or not state.strike_price or state.strike_price <= 0:
                 return
             disp = (price - state.strike_price) / state.strike_price
-            # Quick momentum check before expensive evaluation
             if abs(disp) < self.config.min_momentum:
                 return
-            # Flag that this coin needs immediate evaluation on next tick
+
+            # Check if we already have a position (max concurrent)
+            active = sum(1 for s in self.coin_states.values() if s.has_up_position or s.has_down_position)
+            if active >= self.config.max_concurrent_positions:
+                return
+
+            # Quick filter: side, ask, edge
+            side = "up" if disp > 0 else "down"
+            best_ask = state.manager.get_best_ask(side)
+            if best_ask <= 0 or best_ask > self.config.max_entry_price:
+                return
+
+            fv = self._calculate_fair_value(state)
+            if not fv:
+                return
+            fair_prob = fv.fair_up if side == "up" else fv.fair_down
+            if fair_prob < self.config.min_fair_value:
+                return
+
+            worst_fill = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
+            fee = 0.005
+            edge = fair_prob - worst_fill - fee
+            if edge < self.config.min_edge:
+                return
+
+            # TTE check
+            tte = state.seconds_to_expiry()
+            duration = 300
+            min_tte = duration - self.config.max_window_elapsed
+            max_tte = duration - self.config.min_window_elapsed
+            if tte < min_tte or tte > max_tte:
+                return
+
+            # SIGNAL QUALIFIES — fire order directly via async task
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._execute_snipe(state, side, best_ask, edge, fv, signal_time=time.time()))
+            except Exception:
+                pass
+
+            # Also flag for tick loop (backup)
             if not hasattr(self, '_urgent_coins'):
                 self._urgent_coins = set()
             self._urgent_coins.add(coin)
