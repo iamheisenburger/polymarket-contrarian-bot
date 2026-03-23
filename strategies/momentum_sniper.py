@@ -1658,12 +1658,10 @@ class MomentumSniperStrategy:
         )
 
         if result.success and result.order_id:
-            # Wait up to 5 seconds for maker fill
+            # FAST maker check: place GTC, check CLOB immediately, cancel if not filled.
+            # Must NOT block for seconds — that kills frequency.
             import asyncio as _aio
-            bal_before_gtc = self.bot.get_usdc_balance()
-            self.log(f"GTC resting: {result.order_id[:20]}... bal=${bal_before_gtc:.2f}", "info")
-            await _aio.sleep(5)
-            # Check fill via CLOB size_matched
+            await _aio.sleep(0.3)  # 300ms for matching engine to process
             try:
                 order_data = await _aio.to_thread(
                     self.bot._official_client.get_order, result.order_id
@@ -1680,31 +1678,31 @@ class MomentumSniperStrategy:
                     buy_price = original_ask
                     result.fill_amount = actual_fill if gtc_matched > 0 else None
                 else:
-                    # Not filled — cancel and fall through to FAK
+                    # Not filled instantly — cancel and go straight to FAK
                     try:
                         await self.bot.cancel_order(result.order_id)
                     except Exception:
                         pass
-                    await _aio.sleep(3)
-                    # Post-cancel fill check
-                    post_data = await _aio.to_thread(
-                        self.bot._official_client.get_order, result.order_id
-                    )
-                    post_matched = float((post_data or {}).get("size_matched", 0))
-                    bal_final = self.bot.get_usdc_balance()
-                    bal_drop = (bal_before_gtc or 0) - (bal_final or 0)
-                    if post_matched > 0 or bal_drop >= (original_ask * num_tokens * 0.3):
-                        actual_fill = post_matched if post_matched > 0 else num_tokens
-                        self.log(
-                            f"[MAKER FILL] GTC filled after cancel! "
-                            f"{actual_fill:.0f} tokens @ ${original_ask:.2f}",
-                            "warning"
+                    # Quick post-cancel check (1s)
+                    await _aio.sleep(1)
+                    try:
+                        post_data = await _aio.to_thread(
+                            self.bot._official_client.get_order, result.order_id
                         )
-                        buy_price = original_ask
-                        result.fill_amount = actual_fill if post_matched > 0 else None
-                    else:
-                        self.log(f"GTC no fill (bal=${bal_final:.2f}). Trying FAK...", "info")
-                        result.success = False  # Fall through to FAK
+                        post_matched = float((post_data or {}).get("size_matched", 0))
+                        if post_matched > 0:
+                            actual_fill = post_matched
+                            self.log(
+                                f"[MAKER FILL] GTC filled during cancel! "
+                                f"{actual_fill:.0f} tokens @ ${original_ask:.2f}",
+                                "warning"
+                            )
+                            buy_price = original_ask
+                            result.fill_amount = actual_fill
+                        else:
+                            result.success = False  # Fall through to FAK
+                    except Exception:
+                        result.success = False
             except Exception as e:
                 self.log(f"GTC check failed ({e}), trying FAK...", "warning")
                 try:
