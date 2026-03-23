@@ -1606,21 +1606,27 @@ class MomentumSniperStrategy:
             top_levels = [(a.price, a.size) for a in ob.asks[:5]]
             ob_snapshot = " | ".join(f"${p:.2f}x{s:.0f}" for p, s in top_levels)
             self.log(
-                f"[FILL] {state.coin} {side.upper()} submitting FOK @ ${buy_price:.2f} "
+                f"[FILL] {state.coin} {side.upper()} submitting FAK @ ${buy_price:.2f} "
                 f"(ask=${original_ask:.2f} +{tolerance:.2f}tol) book=[{ob_snapshot}]",
                 "info"
             )
 
+        # FAK (Fill-And-Kill): fills whatever tokens are available, kills rest.
+        # On thin books, captures 2 tokens instead of 0 (FOK rejects entirely).
+        # Partial fills tracked via result.fill_amount.
         result = await self.bot.place_order(
             token_id=token_id,
             price=buy_price,
             size=num_tokens,
             side="BUY",
-            order_type="FOK",
+            order_type="FAK",
         )
+        # Track actual fill amount (FAK may partially fill)
+        actual_fill = result.fill_amount if result.fill_amount else num_tokens
         self.log(
-            f"[ORDER] {state.coin} {side.upper()} FOK @ ${buy_price:.2f}: "
-            f"success={result.success} status={result.status} id={result.order_id[:20] if result.order_id else 'none'}",
+            f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
+            f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f} "
+            f"status={result.status} id={result.order_id[:20] if result.order_id else 'none'}",
             "info"
         )
 
@@ -1629,11 +1635,11 @@ class MomentumSniperStrategy:
         # Go straight to GTC which benefits from price improvement on
         # Polymarket (we submit at max price but often pay maker's ask).
 
-        # FOK fallback: if Kelly-sized order fails on thin orderbook,
-        # retry with minimum 5 tokens (paper-validated fill size).
+        # Size fallback: if FAK partially filled 0 tokens on large order,
+        # retry with minimum 5 tokens.
         if not result.success and num_tokens > 5:
             self.log(
-                f"FOK failed at {num_tokens:.0f} tokens, retrying min-size (5)",
+                f"FAK failed at {num_tokens:.0f} tokens, retrying min-size (5)",
                 "warning"
             )
             num_tokens = 5.0
@@ -1642,8 +1648,10 @@ class MomentumSniperStrategy:
                 price=buy_price,
                 size=num_tokens,
                 side="BUY",
-                order_type="FOK",
+                order_type="FAK",
             )
+            if result.fill_amount:
+                actual_fill = result.fill_amount
 
         # GTC fallback: if all FOK attempts failed, place a GTC order and wait.
         # This sits in the book and can get filled by sellers coming to us.
@@ -1804,8 +1812,10 @@ class MomentumSniperStrategy:
                         "info"
                     )
         if is_confirmed_fill:
+            # FAK partial fills: use actual fill amount, not requested amount
+            filled_tokens = actual_fill if result.fill_amount else num_tokens
             fee_per_token = taker_fee_per_token(buy_price, self.config.timeframe)
-            actual_cost = (buy_price + fee_per_token) * num_tokens
+            actual_cost = (buy_price + fee_per_token) * filled_tokens
 
             # Immediately deduct from balance so next Kelly calculation
             # sees the correct available capital (no stale balance)
@@ -1813,10 +1823,10 @@ class MomentumSniperStrategy:
 
             # Record position
             if side == "up":
-                state.up_tokens += num_tokens
+                state.up_tokens += filled_tokens
                 state.up_cost += actual_cost
             else:
-                state.down_tokens += num_tokens
+                state.down_tokens += filled_tokens
                 state.down_cost += actual_cost
 
             state.last_trade_time = time.time()
@@ -1843,7 +1853,7 @@ class MomentumSniperStrategy:
                 side=side,
                 entry_price=buy_price,
                 bet_size_usdc=actual_cost,
-                num_tokens=num_tokens,
+                num_tokens=filled_tokens,
                 bankroll=self._balance,
                 usdc_balance=real_balance,
                 btc_price=spot,
@@ -1873,9 +1883,10 @@ class MomentumSniperStrategy:
             kelly_pct = (actual_cost / (self._available_balance() + actual_cost) * 100) if (self._available_balance() + actual_cost) > 0 else 0
             strength = "STRONG" if is_strong else "NORMAL"
 
+            partial_tag = f" PARTIAL({filled_tokens:.0f}/{num_tokens:.0f})" if filled_tokens < num_tokens else ""
             self.log(
                 f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
-                f"x{num_tokens:.0f} (${actual_cost:.2f}) "
+                f"x{filled_tokens:.0f} (${actual_cost:.2f}){partial_tag} "
                 f"edge={edge:.2f} [{strength}] kelly={kelly_pct:.0f}% "
                 f"strike={strike_src} lat={total_latency_ms:.0f}ms",
                 "success"

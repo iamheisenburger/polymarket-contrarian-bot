@@ -91,6 +91,7 @@ class OrderResult:
     status: Optional[str] = None
     message: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
+    fill_amount: Optional[float] = None  # Actual tokens filled (for FAK partial fills)
 
     @classmethod
     def from_response(cls, response: Dict[str, Any]) -> "OrderResult":
@@ -441,11 +442,16 @@ class TradingBot:
 
             # Map string order_type to py_clob_client OrderType enum
             from py_clob_client.clob_types import OrderType as ClobOrderType
-            ot_map = {"GTC": ClobOrderType.GTC, "FOK": ClobOrderType.FOK, "GTD": ClobOrderType.GTD}
+            ot_map = {
+                "GTC": ClobOrderType.GTC,
+                "FOK": ClobOrderType.FOK,
+                "FAK": ClobOrderType.FAK,
+                "GTD": ClobOrderType.GTD,
+            }
             ot = ot_map.get(order_type.upper(), ClobOrderType.GTC)
 
-            # Snapshot balance before order for FOK verification
-            bal_before = self.get_usdc_balance() if order_type.upper() == "FOK" else None
+            # Snapshot balance before order for FOK/FAK verification
+            bal_before = self.get_usdc_balance() if order_type.upper() in ("FOK", "FAK") else None
 
             # Step 1: Create and sign the order
             order = await self._run_in_thread(
@@ -476,31 +482,46 @@ class TradingBot:
                 f"success={success} status={resp_status} type={order_type}"
             )
 
-            # FOK verification: quick CLOB lookup only.
-            # ONLY reject if CLOB explicitly says CANCELLED/DEAD.
-            # The old balance-diff approach took 9-12 seconds and was unreliable
-            # (balance API lags), causing real fills to be reported as failures.
-            # A missed fill (false negative) causes untracked spending and
-            # duplicate orders — far worse than a phantom position (false positive).
-            if success and order_id and order_type.upper() == "FOK":
-                import time
-                time.sleep(1)  # Brief pause for CLOB to update
+            # FOK/FAK verification: CLOB lookup to confirm fill.
+            # FAK can partially fill — check size_matched for actual fill amount.
+            # 100ms async sleep (was 1s blocking sleep — saved 900ms per order).
+            if success and order_id and order_type.upper() in ("FOK", "FAK"):
+                import asyncio as _asyncio
+                await _asyncio.sleep(0.1)  # 100ms async (was 1s blocking)
                 try:
                     order_data = await self._run_in_thread(
                         self._official_client.get_order, order_id,
                     )
                     clob_status = (order_data or {}).get("status", "")
-                    logger.info(f"FOK verify: {order_id[:20]}... CLOB status={clob_status}")
-                    if clob_status in ("CANCELLED", "DEAD"):
-                        logger.warning(f"FOK NOT FILLED (CLOB={clob_status}): {order_id[:20]}...")
+                    size_matched = float((order_data or {}).get("size_matched", 0))
+                    logger.info(
+                        f"{order_type} verify: {order_id[:20]}... "
+                        f"CLOB status={clob_status} size_matched={size_matched}"
+                    )
+                    if clob_status in ("CANCELLED", "DEAD") and size_matched <= 0:
+                        logger.warning(f"{order_type} NOT FILLED (CLOB={clob_status}): {order_id[:20]}...")
                         return OrderResult(
                             success=False,
                             order_id=order_id,
                             status="NOT_FILLED",
-                            message=f"FOK not filled: CLOB status={clob_status}",
+                            message=f"{order_type} not filled: CLOB status={clob_status}",
                         )
-                    # MATCHED, LIVE, or anything else = treat as filled
-                    logger.info(f"FOK FILLED (CLOB={clob_status}): {order_id[:20]}...")
+                    # FAK partial fill: CANCELLED status but size_matched > 0
+                    if size_matched > 0:
+                        logger.info(
+                            f"{order_type} FILLED {size_matched} tokens "
+                            f"(CLOB={clob_status}): {order_id[:20]}..."
+                        )
+                        return OrderResult(
+                            success=True,
+                            order_id=order_id,
+                            status=clob_status,
+                            message=f"Filled {size_matched} tokens",
+                            data=response,
+                            fill_amount=size_matched,
+                        )
+                    # MATCHED, LIVE = treat as fully filled
+                    logger.info(f"{order_type} FILLED (CLOB={clob_status}): {order_id[:20]}...")
                 except Exception as e:
                     logger.warning(f"FOK verify failed ({e}), ASSUMING FILLED: {order_id[:20]}...")
 
