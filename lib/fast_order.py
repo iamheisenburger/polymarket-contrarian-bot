@@ -124,7 +124,7 @@ class FastOrderClient:
         if not self._order_builder:
             raise RuntimeError("Order builder not available")
 
-        from py_order_utils.model import OrderData
+        from py_order_utils.model import OrderData, BUY, SELL, POLY_GNOSIS_SAFE
 
         if nonce == 0:
             nonce = int(time.time())
@@ -135,12 +135,12 @@ class FastOrderClient:
             tokenId=token_id,
             makerAmount=str(maker_amount),
             takerAmount=str(taker_amount),
-            side="BUY" if side.upper() == "BUY" else "SELL",
+            side=BUY if side.upper() == "BUY" else SELL,
             feeRateBps=str(fee_rate_bps),
             nonce=str(nonce),
             signer=self._eoa_address,
             expiration=str(expiration),
-            signatureType=2,  # Gnosis Safe
+            signatureType=POLY_GNOSIS_SAFE,
         )
 
         return self._order_builder.build_signed_order(data)
