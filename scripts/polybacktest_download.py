@@ -89,7 +89,7 @@ def download_snapshots(markets, coin, target_elapsed=120):
             eta = (len(markets) - i - 1) / rate if rate > 0 else 0
             print(f"  ...{i+1}/{len(markets)} ({got} snaps, {rate:.1f}/s, ETA {eta/60:.0f}m)", flush=True)
 
-        time.sleep(0.3)  # ~3 req/s, safe for API
+        time.sleep(1.0)  # 1 req/s, respects strict rate limits
 
     print(f"  Got {len(snapshots)} snapshots in {time.time()-t0:.0f}s")
     return snapshots
