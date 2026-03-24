@@ -1768,11 +1768,33 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # FAK taker — SDK path. Proven 39 fills. Simple and reliable.
-        result = await self.bot.place_order(
-            token_id=token_id, price=buy_price,
-            size=num_tokens, side="BUY", order_type="FAK",
-        )
+        # FAK taker — FastOrderClient (52ms) with SDK fallback (371ms)
+        if self._fast_order:
+            try:
+                fast_result = await self._fast_order.place_order(
+                    token_id=token_id, price=buy_price,
+                    size=num_tokens, side="BUY", order_type="FAK",
+                )
+                success = fast_result.get("success", False)
+                order_id = fast_result.get("orderID", "")
+                from src.bot import OrderResult
+                result = OrderResult(
+                    success=success, order_id=order_id,
+                    status=fast_result.get("status", ""),
+                    message="Fast order" if success else fast_result.get("error", ""),
+                    data=fast_result,
+                )
+            except Exception as e:
+                self.log(f"FastOrder failed ({e}), SDK fallback", "warning")
+                result = await self.bot.place_order(
+                    token_id=token_id, price=buy_price,
+                    size=num_tokens, side="BUY", order_type="FAK",
+                )
+        else:
+            result = await self.bot.place_order(
+                token_id=token_id, price=buy_price,
+                size=num_tokens, side="BUY", order_type="FAK",
+            )
 
         actual_fill = result.fill_amount if result.fill_amount else num_tokens
         self.log(
