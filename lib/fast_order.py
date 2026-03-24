@@ -128,8 +128,8 @@ class FastOrderClient:
 
         from py_order_utils.model import OrderData, BUY, SELL, POLY_GNOSIS_SAFE
 
-        if nonce == 0:
-            nonce = int(time.time())
+        # Nonce must be 0 (SDK default). Nonce is for on-chain cancellation,
+        # not uniqueness — salt (auto-generated random) handles that.
 
         data = OrderData(
             maker=self._safe_address,
