@@ -954,9 +954,8 @@ class MomentumSniperStrategy:
                 if not token_id:
                     return
 
-                # Depth filter
-                ob = state.manager.get_orderbook(side)
-                if ob and ob.asks and ob.asks[0].size > 10:
+                # Balance check
+                if self._balance < 1.0:
                     return
 
                 # Check position + de-dup
@@ -1913,26 +1912,11 @@ class MomentumSniperStrategy:
                     )
                     num_tokens = depth_capped
 
-        # Skip deep books — HFT territory, 44% WR (net loser)
-        max_depth = 10  # tokens at best ask
-        if best_ask_depth > max_depth:
-            self.log(
-                f"[DEPTH-SKIP] {state.coin} {side.upper()} best_ask_depth={best_ask_depth} "
-                f"> {max_depth} — skipping (HFT territory)",
-                "info"
-            )
-            # Still log as shadow for data collection
-            if self.shadow_logger:
-                fair_prob = fv.fair_up if side == "up" else fv.fair_down
-                mom = (self.binance.get_price(state.coin) - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
-                self.shadow_logger.log_signal(
-                    market_slug=state.current_slug, coin=state.coin,
-                    side=side, ask_price=original_ask,
-                    fair_value=fair_prob, edge=edge, momentum=mom,
-                    tte=state.seconds_to_expiry(),
-                    strike_source=getattr(state, '_strike_source', 'unknown'),
-                )
-            return False
+        # Log depth for data collection (no filter — fight head-on with speed)
+        self.log(
+            f"[BOOK] {state.coin} {side.upper()} depth={best_ask_depth:.0f} @ ${original_ask:.2f}",
+            "info"
+        )
 
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0
