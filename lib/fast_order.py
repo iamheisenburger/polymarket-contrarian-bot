@@ -63,18 +63,9 @@ class FastOrderClient:
         self._api_passphrase = api_passphrase
 
         # Persistent async HTTP client — reuses TCP+TLS connection
-        # HTTP/1.1 (not HTTP/2) to avoid ALPN negotiation overhead
-        # DNS pinned to avoid lookup latency
-        import socket
-        try:
-            clob_ip = socket.gethostbyname("clob.polymarket.com")
-        except Exception:
-            clob_ip = "172.64.153.51"  # fallback
         self._http = httpx.AsyncClient(
-            base_url=f"https://{clob_ip}",
-            headers={"Host": "clob.polymarket.com"},
-            http2=False,  # HTTP/1.1 — skip ALPN negotiation
-            verify=True,
+            base_url="https://clob.polymarket.com",
+            http2=False,
             timeout=10.0,
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
