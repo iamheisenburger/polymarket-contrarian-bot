@@ -943,10 +943,18 @@ class MomentumSniperStrategy:
             if tte < min_tte or tte > max_tte:
                 return
 
-            # Flag for tick loop — the 2s delay in _execute_snipe handles timing
+            # Fire trade IMMEDIATELY — don't wait for tick loop
             if not hasattr(self, '_urgent_coins'):
                 self._urgent_coins = set()
             self._urgent_coins.add(coin)
+
+            # Direct execution: skip tick loop, fire snipe NOW
+            try:
+                asyncio.get_event_loop().create_task(
+                    self._execute_snipe(state, side, worst_fill, edge, fv, signal_time=time.time())
+                )
+            except Exception:
+                pass  # Fallback: tick loop will pick it up via _urgent_coins
 
         if hasattr(self.binance, 'on_price'):
             self.binance.on_price(_on_price_update)
@@ -1613,6 +1621,28 @@ class MomentumSniperStrategy:
         signal_time: float = 0.0,
     ) -> bool:
         """Execute a snipe trade."""
+        # Prevent double execution from callback + tick loop
+        snipe_key = f"{state.current_slug}:{side}"
+        if not hasattr(self, '_snipe_in_flight'):
+            self._snipe_in_flight = set()
+        if snipe_key in self._snipe_in_flight:
+            return False
+        self._snipe_in_flight.add(snipe_key)
+        try:
+            return await self._execute_snipe_inner(state, side, entry_price, edge, fv, signal_time)
+        finally:
+            self._snipe_in_flight.discard(snipe_key)
+
+    async def _execute_snipe_inner(
+        self,
+        state: CoinMarketState,
+        side: str,
+        entry_price: float,
+        edge: float,
+        fv: FairValue,
+        signal_time: float = 0.0,
+    ) -> bool:
+        """Inner snipe execution (guarded by _execute_snipe)."""
         if self.config.observe_only:
             # Paper trading with realistic simulation
             fair_prob = fv.fair_up if side == "up" else fv.fair_down
@@ -1821,9 +1851,18 @@ class MomentumSniperStrategy:
                 "info"
             )
 
-        # Wait for background FAK verify to populate fill_amount (200ms bg + margin)
-        if result.success and not result.fill_amount:
+        # For SDK orders: wait for background FAK verify to populate fill_amount
+        # For FastOrder: fill amount is in the response, no need to wait
+        if result.success and not result.fill_amount and not fast_success:
             await asyncio.sleep(0.4)
+        # Extract actual fill from FastOrder response (takingAmount field)
+        if fast_success and fast_result:
+            try:
+                taking = float(fast_result.get("takingAmount", 0))
+                if taking > 0:
+                    result.fill_amount = taking
+            except (ValueError, TypeError):
+                pass
         actual_fill = result.fill_amount if result.fill_amount else num_tokens
         self.log(
             f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
