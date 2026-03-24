@@ -212,23 +212,9 @@ class FastOrderClient:
         t_sign = time.monotonic()
 
         # 3. Build body (~0.01ms) — use .values dict for clean Python types
-        v = signed.order.values
+        # Use order.dict() — EXACTLY how the SDK serializes it
         body = {
-            "order": {
-                "salt": str(v["salt"]),
-                "maker": str(v["maker"]),
-                "signer": str(v["signer"]),
-                "taker": str(v["taker"]),
-                "tokenId": str(v["tokenId"]),
-                "makerAmount": str(v["makerAmount"]),
-                "takerAmount": str(v["takerAmount"]),
-                "expiration": str(v["expiration"]),
-                "nonce": str(v["nonce"]),
-                "feeRateBps": str(v["feeRateBps"]),
-                "side": v["side"],
-                "signatureType": v["signatureType"],
-                "signature": signed.signature,
-            },
+            "order": signed.dict(),
             "owner": self._l2_api_key,
             "orderType": order_type.upper(),
         }
@@ -325,23 +311,9 @@ class FastOrderClient:
             t_sign = time.monotonic()
 
         # Build body — use .values dict for clean Python types
-        v = signed.order.values
+        # Use order.dict() — EXACTLY how the SDK serializes it
         body = {
-            "order": {
-                "salt": str(v["salt"]),
-                "maker": str(v["maker"]),
-                "signer": str(v["signer"]),
-                "taker": str(v["taker"]),
-                "tokenId": str(v["tokenId"]),
-                "makerAmount": str(v["makerAmount"]),
-                "takerAmount": str(v["takerAmount"]),
-                "expiration": str(v["expiration"]),
-                "nonce": str(v["nonce"]),
-                "feeRateBps": str(v["feeRateBps"]),
-                "side": v["side"],
-                "signatureType": v["signatureType"],
-                "signature": signed.signature,
-            },
+            "order": signed.dict(),
             "owner": self._l2_api_key,
             "orderType": order_type.upper(),
         }
