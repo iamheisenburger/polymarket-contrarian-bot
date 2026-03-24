@@ -489,7 +489,8 @@ class TradingBot:
             # FAK verification: trust the API response, verify in background.
             # Saves 100-200ms from critical path (was: sleep 100ms + HTTP GET).
             # The API response already has success/status — use it immediately.
-            # Background task updates fill_amount if needed.
+            # Background task updates fill_amount on the result object.
+            result_obj = None  # Will be set after creation, referenced by bg task
             if success and order_id and order_type.upper() in ("FOK", "FAK"):
                 import asyncio as _asyncio
                 async def _bg_verify(oid=order_id, otype=order_type):
@@ -504,17 +505,21 @@ class TradingBot:
                             f"{otype} bg-verify: {oid[:20]}... "
                             f"CLOB={clob_status} matched={size_matched}"
                         )
+                        # Update fill_amount on the result object (mutable dataclass)
+                        if result_obj is not None and size_matched > 0:
+                            result_obj.fill_amount = size_matched
                     except Exception as e:
                         logger.debug(f"bg-verify failed: {e}")
                 _asyncio.create_task(_bg_verify())
 
-            return OrderResult(
+            result_obj = OrderResult(
                 success=success,
                 order_id=order_id,
                 status=response.get("status", ""),
                 message=response.get("errorMsg", "") if not success else "Order placed",
                 data=response,
             )
+            return result_obj
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")

@@ -25,18 +25,13 @@ from eth_account.messages import encode_defunct
 
 logger = logging.getLogger(__name__)
 
-# Polymarket CTF Exchange on Polygon
-EXCHANGE_ADDRESS = "0x4d97DCd97fC247f8E344d3b8e16055CBDf569897"
+# Polymarket CTF Exchange on Polygon (from py_clob_client.config)
+# Regular (neg_risk=False): 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
+# Neg-risk (neg_risk=True):  0xC5d563A36AE78145C45a50134d48A1215220f80a
+EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+NEG_RISK_EXCHANGE_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 CHAIN_ID = 137
 CLOB_URL = "https://clob.polymarket.com"
-
-# EIP-712 domain separator (static for Polygon mainnet)
-DOMAIN = {
-    "name": "Polymarket CTF Exchange",
-    "version": "1",
-    "chainId": CHAIN_ID,
-    "verifyingContract": EXCHANGE_ADDRESS,
-}
 
 # Pre-computed EIP-712 type hash for Order struct
 # keccak256("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
@@ -75,6 +70,7 @@ class FastOrderClient:
         self._pre_sign_lock = False
 
         # Cache the order builder from py_order_utils (reuse, don't recreate)
+        # Use the correct exchange address matching SDK's neg_risk=False config
         try:
             from py_order_utils.builders import OrderBuilder as UtilsOrderBuilder
             from py_order_utils.signer import Signer as UtilsSigner

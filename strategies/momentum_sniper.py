@@ -1811,10 +1811,13 @@ class MomentumSniperStrategy:
                 "info"
             )
 
+        # Wait for background FAK verify to populate fill_amount (200ms bg + margin)
+        if result.success and not result.fill_amount:
+            await asyncio.sleep(0.4)
         actual_fill = result.fill_amount if result.fill_amount else num_tokens
         self.log(
             f"[ORDER] {state.coin} {side.upper()} FAK @ ${buy_price:.2f}: "
-            f"success={result.success} filled={actual_fill:.0f}/{num_tokens:.0f}",
+            f"success={result.success} filled={actual_fill:.1f}/{num_tokens:.0f}",
             "info"
         )
 
@@ -1878,8 +1881,8 @@ class MomentumSniperStrategy:
                         "info"
                     )
         if is_confirmed_fill:
-            # FAK partial fills: use actual fill amount, not requested amount
-            filled_tokens = actual_fill if result.fill_amount else num_tokens
+            # FAK partial fills: use actual fill amount from bg verify
+            filled_tokens = actual_fill
             # Guard: FAK can "match" with 0 tokens on empty books
             if filled_tokens <= 0:
                 self.log(
