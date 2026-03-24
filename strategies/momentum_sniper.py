@@ -973,25 +973,37 @@ class MomentumSniperStrategy:
                 buy_price = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
                 signal_time = time.time()
 
+                # Capture event loop reference NOW (we're in the WS thread,
+                # but the loop was created in the main thread)
+                try:
+                    _loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    _loop = None
+
                 def _fast_fire():
                     """Runs entirely in FastOrder's dedicated thread."""
                     try:
                         result = self._fast_order._place_order_sync(
                             token_id, buy_price, 5.0, "BUY", "FAK", 1000,
                         )
-                        # Queue bookkeeping back to asyncio
-                        try:
-                            loop = asyncio.get_event_loop()
-                            loop.call_soon_threadsafe(
-                                lambda: asyncio.ensure_future(
-                                    self._handle_fast_fire_result(
-                                        state, side, buy_price, edge, fv,
-                                        result, signal_time,
-                                    )
+                        # Queue bookkeeping back to asyncio event loop
+                        if _loop and _loop.is_running():
+                            _loop.call_soon_threadsafe(
+                                _loop.create_task,
+                                self._handle_fast_fire_result(
+                                    state, side, buy_price, edge, fv,
+                                    result, signal_time,
                                 )
                             )
-                        except Exception:
-                            pass
+                        else:
+                            # Fallback: log directly if no event loop
+                            success = result.get("success", False) or result.get("orderID", "")
+                            taking = float(result.get("takingAmount", 0) or 0)
+                            lat = (time.time() - signal_time) * 1000
+                            self._event_logger.info(
+                                f"[FAST-FIRE] {coin} {side} success={bool(success)} "
+                                f"filled={taking:.1f} lat={lat:.0f}ms (no loop for bookkeeping)"
+                            )
                     except Exception as e:
                         self._event_logger.warning(f"[FAST-FIRE] {coin} {side} error: {e}")
                     finally:

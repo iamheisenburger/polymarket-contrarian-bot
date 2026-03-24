@@ -59,9 +59,13 @@ class FastOrderClient:
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
 
-        # Dedicated single-thread executor — FastOrder owns this thread
+        # Order executor — dedicated thread, NEVER blocked by keepalive
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fastorder"
+            max_workers=1, thread_name_prefix="fastorder-order"
+        )
+        # Separate keepalive executor — so keepalive never blocks orders
+        self._keepalive_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fastorder-ping"
         )
 
         # Warm up connection immediately in the dedicated thread
@@ -300,11 +304,8 @@ class FastOrderClient:
             logger.warning(f"FastOrder keepalive failed: {e}")
 
     async def keepalive(self):
-        """Ping CLOB in dedicated thread to keep connection warm."""
-        done = threading.Event()
-        self._executor.submit(lambda: (self._keepalive_sync(), done.set()))
-        while not done.wait(timeout=0.001):
-            await asyncio.sleep(0)
+        """Ping CLOB in keepalive thread (separate from order thread)."""
+        self._keepalive_executor.submit(self._keepalive_sync)
 
 
     async def pre_sign_orders(self, token_ids: dict, prices: list = None):
