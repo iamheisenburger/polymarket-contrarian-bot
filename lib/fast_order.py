@@ -89,6 +89,21 @@ class FastOrderClient:
         # Cache for tick sizes
         self._tick_sizes: dict = {}
 
+        # Derive L2 API credentials (same as SDK's create_or_derive_api_creds)
+        self._l2_api_key = ""
+        self._l2_secret = ""
+        self._l2_passphrase = ""
+        try:
+            from py_clob_client.client import ClobClient as _ClobClient
+            temp = _ClobClient("https://clob.polymarket.com", key=private_key, chain_id=CHAIN_ID)
+            l2_creds = temp.create_or_derive_api_creds()
+            self._l2_api_key = l2_creds.api_key
+            self._l2_secret = l2_creds.api_secret
+            self._l2_passphrase = l2_creds.api_passphrase
+            logger.info(f"L2 creds derived: key={self._l2_api_key[:10]}...")
+        except Exception as e:
+            logger.warning(f"Failed to derive L2 creds: {e}")
+
         logger.info(f"FastOrderClient initialized: EOA={self._eoa_address[:10]}...")
 
     def _get_amounts(self, side: str, size: float, price: float):
@@ -136,12 +151,38 @@ class FastOrderClient:
 
         return self._order_builder.build_signed_order(data)
 
-    def _build_hmac(self, timestamp: int, method: str, path: str, body_str: str) -> str:
-        """Build HMAC-SHA256 signature for L2 auth."""
-        secret_bytes = base64.urlsafe_b64decode(self._api_secret)
-        message = f"{timestamp}{method}{path}{body_str}"
+    def _build_hmac(self, secret: str, timestamp: int, method: str, path: str, body_str: str) -> str:
+        """Build HMAC-SHA256 signature."""
+        secret_bytes = base64.urlsafe_b64decode(secret)
+        message = f"{timestamp}{method}{path}"
+        if body_str:
+            message += body_str.replace("'", '"')
         h = hmac_lib.new(secret_bytes, message.encode("utf-8"), hashlib.sha256)
         return base64.urlsafe_b64encode(h.digest()).decode("utf-8")
+
+    def _build_headers(self, method: str, path: str, body_str: str) -> dict:
+        """Build BOTH L2 + Builder auth headers."""
+        timestamp = int(time.time())
+
+        # L2 headers (derived creds)
+        l2_sig = self._build_hmac(self._l2_secret, timestamp, method, path, body_str)
+        headers = {
+            "POLY-ADDRESS": self._eoa_address,
+            "POLY-SIGNATURE": l2_sig,
+            "POLY-TIMESTAMP": str(timestamp),
+            "POLY-API-KEY": self._l2_api_key,
+            "POLY-PASSPHRASE": self._l2_passphrase,
+            "Content-Type": "application/json",
+        }
+
+        # Builder headers (from env)
+        builder_sig = self._build_hmac(self._api_secret, timestamp, method, path, body_str)
+        headers["POLY_BUILDER_API_KEY"] = self._api_key
+        headers["POLY_BUILDER_PASSPHRASE"] = self._api_passphrase
+        headers["POLY_BUILDER_SIGNATURE"] = builder_sig
+        headers["POLY_BUILDER_TIMESTAMP"] = str(timestamp)
+
+        return headers
 
     async def place_order(
         self,
@@ -197,18 +238,8 @@ class FastOrderClient:
 
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
-        # 4. HMAC auth (~0.1ms)
-        timestamp = int(time.time())
-        hmac_sig = self._build_hmac(timestamp, "POST", "/order", body_str)
-
-        headers = {
-            "POLY-ADDRESS": self._eoa_address,
-            "POLY-SIGNATURE": hmac_sig,
-            "POLY-TIMESTAMP": str(timestamp),
-            "POLY-API-KEY": self._api_key,
-            "POLY-PASSPHRASE": self._api_passphrase,
-            "Content-Type": "application/json",
-        }
+        # 4. Auth headers: L2 + Builder (~0.2ms)
+        headers = self._build_headers("POST", "/order", body_str)
 
         t_prep = time.monotonic()
 
