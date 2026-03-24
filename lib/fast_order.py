@@ -124,7 +124,7 @@ class FastOrderClient:
         return maker_amount, taker_amount
 
     def _sign_order(self, token_id: str, maker_amount: int, taker_amount: int,
-                    side: str, fee_rate_bps: int = 0, expiration: int = 0,
+                    side: str, fee_rate_bps: int = 1000, expiration: int = 0,
                     nonce: int = 0):
         """Sign an order using py_order_utils (cached builder)."""
         if not self._order_builder:
@@ -191,7 +191,7 @@ class FastOrderClient:
         size: float,
         side: str = "BUY",
         order_type: str = "FAK",
-        fee_rate_bps: int = 0,
+        fee_rate_bps: int = 1000,  # 10% — must match SDK default or CLOB rejects
     ) -> dict:
         """
         Place an order with minimum latency.
