@@ -164,14 +164,14 @@ class FastOrderClient:
         """Build BOTH L2 + Builder auth headers."""
         timestamp = int(time.time())
 
-        # L2 headers (derived creds)
+        # L2 headers (derived creds) — underscores, not hyphens
         l2_sig = self._build_hmac(self._l2_secret, timestamp, method, path, body_str)
         headers = {
-            "POLY-ADDRESS": self._eoa_address,
-            "POLY-SIGNATURE": l2_sig,
-            "POLY-TIMESTAMP": str(timestamp),
-            "POLY-API-KEY": self._l2_api_key,
-            "POLY-PASSPHRASE": self._l2_passphrase,
+            "POLY_ADDRESS": self._eoa_address,
+            "POLY_SIGNATURE": l2_sig,
+            "POLY_TIMESTAMP": str(timestamp),
+            "POLY_API_KEY": self._l2_api_key,
+            "POLY_PASSPHRASE": self._l2_passphrase,
             "Content-Type": "application/json",
         }
 
