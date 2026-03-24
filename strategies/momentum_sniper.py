@@ -1763,17 +1763,18 @@ class MomentumSniperStrategy:
         if buy_price > self.config.max_entry_price:
             buy_price = self.config.max_entry_price
 
-        # Depth-aware sizing: log book state but ALWAYS attempt the order.
-        # Thin books are common on 5m markets — let the FOK fail naturally
-        # rather than pre-filtering. Every signal is worth attempting.
+        # Depth filter: only trade thin books where HFT doesn't pre-place orders.
+        # Data: <10 tokens at best ask = 70% WR, 10+ tokens = 44% WR.
         ob = state.manager.get_orderbook(side)
+        best_ask_depth = 0
         if ob and ob.asks:
+            best_ask_depth = ob.asks[0].size
             available_tokens = 0.0
             for level in ob.asks:
                 if level.price <= buy_price:
                     available_tokens += level.size
                 else:
-                    break  # asks sorted ascending, no more levels in range
+                    break
             if available_tokens > 0 and available_tokens < num_tokens:
                 depth_capped = float(int(min(num_tokens, available_tokens)))
                 if depth_capped >= 1.0:
@@ -1783,6 +1784,27 @@ class MomentumSniperStrategy:
                         "info"
                     )
                     num_tokens = depth_capped
+
+        # Skip deep books — HFT territory, 44% WR (net loser)
+        max_depth = 10  # tokens at best ask
+        if best_ask_depth > max_depth:
+            self.log(
+                f"[DEPTH-SKIP] {state.coin} {side.upper()} best_ask_depth={best_ask_depth} "
+                f"> {max_depth} — skipping (HFT territory)",
+                "info"
+            )
+            # Still log as shadow for data collection
+            if self.shadow_logger:
+                fair_prob = fv.fair_up if side == "up" else fv.fair_down
+                self.shadow_logger.log_signal(
+                    market_slug=state.current_slug, coin=state.coin,
+                    side=side, paper_entry_price=original_ask,
+                    signal_edge=edge, signal_momentum=(self.binance.get_price(state.coin) - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+                    signal_fv=fair_prob, signal_tte=state.seconds_to_expiry(),
+                    strike_source=getattr(state, '_strike_source', 'unknown'),
+                    fok_rejected=True,
+                )
+            return False
 
         order_start = time.time()
         signal_to_order_ms = (order_start - signal_time) * 1000 if signal_time else 0

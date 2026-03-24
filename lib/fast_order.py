@@ -237,14 +237,24 @@ class FastOrderClient:
         fee_rate_bps: int = 1000,
     ) -> dict:
         """
-        Place an order — dispatches to dedicated thread for zero event loop blocking.
+        Place an order — runs in dedicated thread, polls for result to avoid
+        event loop latency from run_in_executor callback delay.
         """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._place_order_sync,
-            token_id, price, size, side, order_type, fee_rate_bps,
-        )
+        result_box = [None]
+        done_event = threading.Event()
+
+        def _run():
+            result_box[0] = self._place_order_sync(
+                token_id, price, size, side, order_type, fee_rate_bps,
+            )
+            done_event.set()
+
+        self._executor.submit(_run)
+
+        # Tight poll — avoids event loop callback delay (~300ms savings)
+        while not done_event.wait(timeout=0.001):  # 1ms poll
+            await asyncio.sleep(0)  # yield to event loop
+        return result_box[0]
 
     def _keepalive_sync(self):
         """Keepalive in dedicated thread — keeps TCP+TLS warm."""
@@ -258,8 +268,11 @@ class FastOrderClient:
 
     async def keepalive(self):
         """Ping CLOB in dedicated thread to keep connection warm."""
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self._executor, self._keepalive_sync)
+        done = threading.Event()
+        self._executor.submit(lambda: (self._keepalive_sync(), done.set()))
+        while not done.wait(timeout=0.001):
+            await asyncio.sleep(0)
+
 
     async def pre_sign_orders(self, token_ids: dict, prices: list = None):
         """Pre-sign orders for active tokens at likely price points."""
