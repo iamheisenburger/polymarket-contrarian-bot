@@ -1,45 +1,39 @@
 """
 Fast order submission — bypasses py-clob-client SDK for minimum latency.
 
-The SDK's create_order makes up to 3 HTTP lookups (tick_size, neg_risk, fee_rate)
-and re-instantiates objects on every call. This module does:
-  sign → HMAC → POST in one shot, ~10-20ms total (vs ~100-300ms via SDK).
+Uses a DEDICATED THREAD with synchronous HTTP client to avoid async event
+loop contention from WebSocket feeds. Sign → HMAC → POST in ~27ms total
+(7ms sign + 20ms network on warm connection).
 
 Usage:
     fast = FastOrderClient(private_key, safe_address, api_key, api_secret, api_passphrase)
     result = await fast.place_order(token_id, price, size, side="BUY", order_type="FAK")
 """
 
+import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import hmac as hmac_lib
 import json
 import logging
-import os
 import time
+import threading
 from typing import Optional
 
 import httpx
 from eth_account import Account
-from eth_account.messages import encode_defunct
 
 logger = logging.getLogger(__name__)
 
 # Polymarket CTF Exchange on Polygon (from py_clob_client.config)
-# Regular (neg_risk=False): 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E
-# Neg-risk (neg_risk=True):  0xC5d563A36AE78145C45a50134d48A1215220f80a
 EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_EXCHANGE_ADDRESS = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 CHAIN_ID = 137
-CLOB_URL = "https://clob.polymarket.com"
-
-# Pre-computed EIP-712 type hash for Order struct
-# keccak256("Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)")
-# We use py_order_utils for the actual signing since the struct encoding is complex
 
 
 class FastOrderClient:
-    """Minimal order client that bypasses SDK overhead."""
+    """Minimal order client — dedicated thread, zero event loop contention."""
 
     def __init__(
         self,
@@ -57,20 +51,27 @@ class FastOrderClient:
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
 
-        # Persistent async HTTP client — reuses TCP+TLS connection
-        self._http = httpx.AsyncClient(
+        # SYNCHRONOUS HTTP client — runs in dedicated thread, not event loop
+        self._http = httpx.Client(
             base_url="https://clob.polymarket.com",
             http2=False,
             timeout=10.0,
             limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
         )
 
-        # Pre-signed order cache: {(token_id, price_cents): signed_order}
-        self._pre_signed: dict = {}
-        self._pre_sign_lock = False
+        # Dedicated single-thread executor — FastOrder owns this thread
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fastorder"
+        )
 
-        # Cache the order builder from py_order_utils (reuse, don't recreate)
-        # Use the correct exchange address matching SDK's neg_risk=False config
+        # Warm up connection immediately in the dedicated thread
+        self._executor.submit(self._warmup).result(timeout=5)
+
+        # Pre-signed order cache
+        self._pre_signed: dict = {}
+        self._pre_sign_lock = threading.Lock()
+
+        # Cache the order builder from py_order_utils
         try:
             from py_order_utils.builders import OrderBuilder as UtilsOrderBuilder
             from py_order_utils.signer import Signer as UtilsSigner
@@ -80,12 +81,9 @@ class FastOrderClient:
             )
         except Exception as e:
             self._order_builder = None
-            logger.warning(f"py_order_utils not available — fast_order signing disabled: {e}")
+            logger.warning(f"py_order_utils not available: {e}")
 
-        # Cache for tick sizes
-        self._tick_sizes: dict = {}
-
-        # Derive L2 API credentials (same as SDK's create_or_derive_api_creds)
+        # Derive L2 API credentials
         self._l2_api_key = ""
         self._l2_secret = ""
         self._l2_passphrase = ""
@@ -100,36 +98,37 @@ class FastOrderClient:
         except Exception as e:
             logger.warning(f"Failed to derive L2 creds: {e}")
 
-        logger.info(f"FastOrderClient initialized: EOA={self._eoa_address[:10]}...")
+        logger.info(f"FastOrderClient initialized (dedicated thread): EOA={self._eoa_address[:10]}...")
+
+    def _warmup(self):
+        """Warm up TCP+TLS connection in the dedicated thread."""
+        try:
+            self._http.get("/time")
+            logger.info("FastOrder connection warmed up")
+        except Exception as e:
+            logger.warning(f"FastOrder warmup failed: {e}")
 
     def _get_amounts(self, side: str, size: float, price: float):
-        """Calculate maker/taker amounts for a BUY order."""
-        # For BUY: maker pays USDC (makerAmount), receives tokens (takerAmount)
-        # USDC has 6 decimals, tokens have 6 decimals on Polymarket
+        """Calculate maker/taker amounts."""
         if side.upper() == "BUY":
-            raw_taker = size  # tokens we want
-            raw_maker = size * price  # USDC we pay
+            raw_taker = size
+            raw_maker = size * price
         else:
             raw_maker = size
             raw_taker = size * price
 
-        # Round to 2 decimal places for price, then convert to integer (6 decimals)
         maker_amount = int(round(raw_maker, 4) * 1_000_000)
         taker_amount = int(round(raw_taker, 4) * 1_000_000)
-
         return maker_amount, taker_amount
 
     def _sign_order(self, token_id: str, maker_amount: int, taker_amount: int,
                     side: str, fee_rate_bps: int = 1000, expiration: int = 0,
                     nonce: int = 0):
-        """Sign an order using py_order_utils (cached builder)."""
+        """Sign an order using py_order_utils."""
         if not self._order_builder:
             raise RuntimeError("Order builder not available")
 
         from py_order_utils.model import OrderData, BUY, SELL, POLY_GNOSIS_SAFE
-
-        # Nonce must be 0 (SDK default). Nonce is for on-chain cancellation,
-        # not uniqueness — salt (auto-generated random) handles that.
 
         data = OrderData(
             maker=self._safe_address,
@@ -157,12 +156,10 @@ class FastOrderClient:
         return base64.urlsafe_b64encode(h.digest()).decode("utf-8")
 
     def _build_headers(self, method: str, path: str, body_str: str) -> dict:
-        """Build BOTH L2 + Builder auth headers."""
+        """Build L2 auth headers."""
         timestamp = int(time.time())
-
-        # L2 headers (derived creds) — underscores, not hyphens
         l2_sig = self._build_hmac(self._l2_secret, timestamp, method, path, body_str)
-        headers = {
+        return {
             "POLY_ADDRESS": self._eoa_address,
             "POLY_SIGNATURE": l2_sig,
             "POLY_TIMESTAMP": str(timestamp),
@@ -171,31 +168,18 @@ class FastOrderClient:
             "Content-Type": "application/json",
         }
 
-        # Builder headers NOT needed for order submission.
-        # SDK uses L2 auth only for /order endpoint.
-        # Builder auth is only for RelayClient (redemption).
-
-        return headers
-
-    async def place_order(
-        self,
-        token_id: str,
-        price: float,
-        size: float,
-        side: str = "BUY",
-        order_type: str = "FAK",
-        fee_rate_bps: int = 1000,  # Crypto 5m markets: taker fee = 1000 bps (CLOB-verified)
+    def _place_order_sync(
+        self, token_id: str, price: float, size: float,
+        side: str, order_type: str, fee_rate_bps: int,
     ) -> dict:
         """
-        Place an order with minimum latency.
-        Returns the raw API response dict.
+        Synchronous order placement — runs in dedicated thread.
+        Zero event loop contention. ~27ms total on warm connection.
         """
         t0 = time.monotonic()
 
-        # 1. Calculate amounts (~0.01ms)
+        # 1. Sign (~7ms)
         maker_amount, taker_amount = self._get_amounts(side, size, price)
-
-        # 2. Sign order (~5-10ms)
         try:
             signed = self._sign_order(
                 token_id, maker_amount, taker_amount,
@@ -207,25 +191,21 @@ class FastOrderClient:
 
         t_sign = time.monotonic()
 
-        # 3. Build body (~0.01ms) — use .values dict for clean Python types
-        # Use order.dict() — EXACTLY how the SDK serializes it
+        # 2. Build body + headers (~0.1ms)
         body = {
             "order": signed.dict(),
             "owner": self._l2_api_key,
             "orderType": order_type.upper(),
             "postOnly": False,
         }
-
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-
-        # 4. Auth headers: L2 (~0.2ms)
         headers = self._build_headers("POST", "/order", body_str)
 
         t_prep = time.monotonic()
 
-        # 5. HTTP POST (~1-5ms on Dublin VPS)
+        # 3. HTTP POST (~20ms on warm connection)
         try:
-            resp = await self._http.post("/order", headers=headers, content=body_str)
+            resp = self._http.post("/order", headers=headers, content=body_str)
             result = resp.json()
         except Exception as e:
             logger.error(f"FastOrder POST failed: {e}")
@@ -247,21 +227,47 @@ class FastOrderClient:
 
         return result
 
-    async def pre_sign_orders(self, token_ids: dict, prices: list = None):
-        """Pre-sign orders for active tokens at likely price points.
-
-        Call every ~10s. When signal fires, grab pre-signed order for instant POST.
-
-        Args:
-            token_ids: {"up": "token_123", "down": "token_456"}
-            prices: list of price points to pre-sign (default: 0.30-0.55 in 0.01 steps)
+    async def place_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str = "BUY",
+        order_type: str = "FAK",
+        fee_rate_bps: int = 1000,
+    ) -> dict:
         """
-        if self._pre_sign_lock:
+        Place an order — dispatches to dedicated thread for zero event loop blocking.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._place_order_sync,
+            token_id, price, size, side, order_type, fee_rate_bps,
+        )
+
+    def _keepalive_sync(self):
+        """Keepalive in dedicated thread — keeps TCP+TLS warm."""
+        try:
+            t0 = time.monotonic()
+            self._http.get("/time")
+            ms = (time.monotonic() - t0) * 1000
+            logger.info(f"FastOrder keepalive: {ms:.0f}ms")
+        except Exception as e:
+            logger.warning(f"FastOrder keepalive failed: {e}")
+
+    async def keepalive(self):
+        """Ping CLOB in dedicated thread to keep connection warm."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self._executor, self._keepalive_sync)
+
+    async def pre_sign_orders(self, token_ids: dict, prices: list = None):
+        """Pre-sign orders for active tokens at likely price points."""
+        if not self._pre_sign_lock.acquire(blocking=False):
             return
-        self._pre_sign_lock = True
 
         if prices is None:
-            prices = [round(p/100, 2) for p in range(30, 56)]  # $0.30-$0.55
+            prices = [round(p/100, 2) for p in range(30, 56)]
 
         try:
             for side_name, token_id in token_ids.items():
@@ -273,92 +279,14 @@ class FastOrderClient:
                         signed = self._sign_order(
                             token_id, maker_amount, taker_amount, "BUY"
                         )
-                        # Cache with price in cents as key
                         price_key = int(price * 100)
                         self._pre_signed[(token_id, price_key)] = signed
                     except Exception:
                         pass
         finally:
-            self._pre_sign_lock = False
-
-    async def place_order_fast(
-        self,
-        token_id: str,
-        price: float,
-        size: float,
-        side: str = "BUY",
-        order_type: str = "FAK",
-    ) -> dict:
-        """Ultra-fast order — uses pre-signed order if available, skips signing."""
-        t0 = time.monotonic()
-
-        price_key = int(price * 100)
-        pre_signed = self._pre_signed.get((token_id, price_key))
-
-        if pre_signed and size == 5.0:
-            # Use pre-signed order — skip signing entirely
-            signed = pre_signed
-            t_sign = time.monotonic()
-            # Remove from cache (nonce is single-use)
-            self._pre_signed.pop((token_id, price_key), None)
-        else:
-            # Fall back to sign on the fly
-            maker_amount, taker_amount = self._get_amounts(side, size, price)
-            signed = self._sign_order(token_id, maker_amount, taker_amount, side)
-            t_sign = time.monotonic()
-
-        # Build body — use .values dict for clean Python types
-        # Use order.dict() — EXACTLY how the SDK serializes it
-        body = {
-            "order": signed.dict(),
-            "owner": self._l2_api_key,
-            "orderType": order_type.upper(),
-        }
-        body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-
-        timestamp = int(time.time())
-        hmac_sig = self._build_hmac(timestamp, "POST", "/order", body_str)
-        headers = {
-            "POLY-ADDRESS": self._eoa_address,
-            "POLY-SIGNATURE": hmac_sig,
-            "POLY-TIMESTAMP": str(timestamp),
-            "POLY-API-KEY": self._api_key,
-            "POLY-PASSPHRASE": self._api_passphrase,
-            "Content-Type": "application/json",
-        }
-
-        t_prep = time.monotonic()
-
-        try:
-            resp = await self._http.post("/order", headers=headers, content=body_str)
-            result = resp.json()
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-        t_post = time.monotonic()
-        total_ms = (t_post - t0) * 1000
-        sign_ms = (t_sign - t0) * 1000
-        net_ms = (t_post - t_prep) * 1000
-        pre = "PRE-SIGNED" if pre_signed else "LIVE-SIGNED"
-
-        logger.info(
-            f"FastOrder [{pre}] {side} {size}@{price} {order_type}: "
-            f"total={total_ms:.0f}ms (sign={sign_ms:.0f}ms net={net_ms:.0f}ms) "
-            f"success={result.get('success')} id={result.get('orderID','')[:16]}"
-        )
-
-        return result
-
-    async def keepalive(self):
-        """Ping CLOB to keep connection warm."""
-        try:
-            t0 = time.monotonic()
-            await self._http.get("/time")
-            ms = (time.monotonic() - t0) * 1000
-            logger.info(f"FastOrder keepalive: {ms:.0f}ms")
-        except Exception as e:
-            logger.warning(f"FastOrder keepalive failed: {e}")
+            self._pre_sign_lock.release()
 
     async def close(self):
-        """Close the HTTP client."""
-        await self._http.aclose()
+        """Close the HTTP client and thread pool."""
+        self._http.close()
+        self._executor.shutdown(wait=False)
