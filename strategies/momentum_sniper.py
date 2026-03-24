@@ -2722,7 +2722,7 @@ class MomentumSniperStrategy:
             self._last_presign = 0
         now = time.time()
 
-        if now - self._last_keepalive > 10:
+        if now - self._last_keepalive > 3:
             self._last_keepalive = now
             try:
                 if self._fast_order:

@@ -108,18 +108,51 @@ class FastOrderClient:
         except Exception as e:
             logger.warning(f"FastOrder warmup failed: {e}")
 
-    def _get_amounts(self, side: str, size: float, price: float):
-        """Calculate maker/taker amounts."""
-        if side.upper() == "BUY":
-            raw_taker = size
-            raw_maker = size * price
-        else:
-            raw_maker = size
-            raw_taker = size * price
+    @staticmethod
+    def _get_amounts(side: str, size: float, price: float):
+        """Calculate maker/taker amounts — matches SDK's exact rounding.
 
-        maker_amount = int(round(raw_maker, 4) * 1_000_000)
-        taker_amount = int(round(raw_taker, 4) * 1_000_000)
-        return maker_amount, taker_amount
+        Uses RoundConfig(price=2, size=2, amount=4) for tick_size=0.01.
+        """
+        from math import floor, ceil
+        from decimal import Decimal
+
+        def _round_normal(x, d):
+            return round(x * (10**d)) / (10**d)
+
+        def _round_down(x, d):
+            return floor(x * (10**d)) / (10**d)
+
+        def _round_up(x, d):
+            return ceil(x * (10**d)) / (10**d)
+
+        def _decimal_places(x):
+            return abs(Decimal(str(x)).as_tuple().exponent)
+
+        def _to_token_decimals(x):
+            f = (10**6) * x
+            if _decimal_places(f) > 0:
+                f = _round_normal(f, 0)
+            return int(f)
+
+        raw_price = _round_normal(price, 2)  # price precision = 2
+
+        if side.upper() == "BUY":
+            raw_taker = _round_down(size, 2)   # size precision = 2
+            raw_maker = raw_taker * raw_price
+            if _decimal_places(raw_maker) > 4:  # amount precision = 4
+                raw_maker = _round_up(raw_maker, 8)
+                if _decimal_places(raw_maker) > 4:
+                    raw_maker = _round_down(raw_maker, 4)
+        else:
+            raw_maker = _round_down(size, 2)
+            raw_taker = raw_maker * raw_price
+            if _decimal_places(raw_taker) > 4:
+                raw_taker = _round_up(raw_taker, 8)
+                if _decimal_places(raw_taker) > 4:
+                    raw_taker = _round_down(raw_taker, 4)
+
+        return _to_token_decimals(raw_maker), _to_token_decimals(raw_taker)
 
     def _sign_order(self, token_id: str, maker_amount: int, taker_amount: int,
                     side: str, fee_rate_bps: int = 1000, expiration: int = 0,
