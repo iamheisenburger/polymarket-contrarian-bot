@@ -274,24 +274,14 @@ class FastOrderClient:
         fee_rate_bps: int = 1000,
     ) -> dict:
         """
-        Place an order — runs in dedicated thread, polls for result to avoid
-        event loop latency from run_in_executor callback delay.
+        Place an order — blocks for ~20ms in dedicated thread.
+        No asyncio involvement. 20ms block beats 280ms event loop overhead.
         """
-        result_box = [None]
-        done_event = threading.Event()
-
-        def _run():
-            result_box[0] = self._place_order_sync(
-                token_id, price, size, side, order_type, fee_rate_bps,
-            )
-            done_event.set()
-
-        self._executor.submit(_run)
-
-        # Tight poll — avoids event loop callback delay (~300ms savings)
-        while not done_event.wait(timeout=0.001):  # 1ms poll
-            await asyncio.sleep(0)  # yield to event loop
-        return result_box[0]
+        future = self._executor.submit(
+            self._place_order_sync,
+            token_id, price, size, side, order_type, fee_rate_bps,
+        )
+        return future.result(timeout=10)  # Block 20ms, not 300ms
 
     def _keepalive_sync(self):
         """Keepalive in dedicated thread — keeps TCP+TLS warm."""

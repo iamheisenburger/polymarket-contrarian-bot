@@ -883,6 +883,7 @@ class MomentumSniperStrategy:
     async def start(self) -> bool:
         """Start the strategy: Binance feed + market managers for each coin."""
         self.running = True
+        self._start_time = time.time()  # Skip trades within 60s of boot
 
         # Start price feeds (Binance + Coinbase for HYPE if needed)
         coinbase_coins = [c for c in self.config.coins if c in COINBASE_COINS]
@@ -903,6 +904,9 @@ class MomentumSniperStrategy:
             """Called on EVERY Binance/Coinbase price tick — instant signal detection.
             Bypasses the tick loop entirely for maximum speed."""
             if not self.running or self.config.observe_only:
+                return
+            # Skip first 60s after boot — markets may be stale/partial
+            if time.time() - self._start_time < 60:
                 return
             state = self.coin_states.get(coin)
             if not state or not state.strike_price or state.strike_price <= 0:
