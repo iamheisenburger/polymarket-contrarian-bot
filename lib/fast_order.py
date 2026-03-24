@@ -232,7 +232,7 @@ class FastOrderClient:
                 "signatureType": v["signatureType"],
                 "signature": signed.signature,
             },
-            "owner": self._api_key,
+            "owner": self._l2_api_key,
             "orderType": order_type.upper(),
         }
 
@@ -345,7 +345,7 @@ class FastOrderClient:
                 "signatureType": v["signatureType"],
                 "signature": signed.signature,
             },
-            "owner": self._api_key,
+            "owner": self._l2_api_key,
             "orderType": order_type.upper(),
         }
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
