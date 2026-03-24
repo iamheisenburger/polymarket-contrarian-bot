@@ -175,12 +175,9 @@ class FastOrderClient:
             "Content-Type": "application/json",
         }
 
-        # Builder headers (from env)
-        builder_sig = self._build_hmac(self._api_secret, timestamp, method, path, body_str)
-        headers["POLY_BUILDER_API_KEY"] = self._api_key
-        headers["POLY_BUILDER_PASSPHRASE"] = self._api_passphrase
-        headers["POLY_BUILDER_SIGNATURE"] = builder_sig
-        headers["POLY_BUILDER_TIMESTAMP"] = str(timestamp)
+        # Builder headers NOT needed for order submission.
+        # SDK uses L2 auth only for /order endpoint.
+        # Builder auth is only for RelayClient (redemption).
 
         return headers
 
