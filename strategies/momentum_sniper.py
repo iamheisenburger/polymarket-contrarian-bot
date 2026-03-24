@@ -943,18 +943,71 @@ class MomentumSniperStrategy:
             if tte < min_tte or tte > max_tte:
                 return
 
-            # Fire trade IMMEDIATELY — don't wait for tick loop
+            # Flag for tick loop (fallback)
             if not hasattr(self, '_urgent_coins'):
                 self._urgent_coins = set()
             self._urgent_coins.add(coin)
 
-            # Direct execution: skip tick loop, fire snipe NOW
+            # FAST FIRE: submit order directly in FastOrder's thread — zero asyncio
+            if self._fast_order:
+                token_id = state.manager.token_ids.get(side)
+                if not token_id:
+                    return
+
+                # Depth filter
+                ob = state.manager.get_orderbook(side)
+                if ob and ob.asks and ob.asks[0].size > 10:
+                    return
+
+                # Check position + de-dup
+                if side == "up" and state.has_up_position:
+                    return
+                if side == "down" and state.has_down_position:
+                    return
+                snipe_key = f"{state.current_slug}:{side}"
+                if not hasattr(self, '_snipe_in_flight'):
+                    self._snipe_in_flight = set()
+                if snipe_key in self._snipe_in_flight:
+                    return
+                self._snipe_in_flight.add(snipe_key)
+
+                buy_price = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
+                signal_time = time.time()
+
+                def _fast_fire():
+                    """Runs entirely in FastOrder's dedicated thread."""
+                    try:
+                        result = self._fast_order._place_order_sync(
+                            token_id, buy_price, 5.0, "BUY", "FAK", 1000,
+                        )
+                        # Queue bookkeeping back to asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            loop.call_soon_threadsafe(
+                                lambda: asyncio.ensure_future(
+                                    self._handle_fast_fire_result(
+                                        state, side, buy_price, edge, fv,
+                                        result, signal_time,
+                                    )
+                                )
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        self._event_logger.warning(f"[FAST-FIRE] {coin} {side} error: {e}")
+                    finally:
+                        self._snipe_in_flight.discard(snipe_key)
+
+                self._fast_order._executor.submit(_fast_fire)
+                return  # Don't also fire via tick loop
+
+            # Fallback: fire via asyncio (slower path)
             try:
                 asyncio.get_event_loop().create_task(
                     self._execute_snipe(state, side, worst_fill, edge, fv, signal_time=time.time())
                 )
             except Exception:
-                pass  # Fallback: tick loop will pick it up via _urgent_coins
+                pass
 
         if hasattr(self.binance, 'on_price'):
             self.binance.on_price(_on_price_update)
@@ -1610,6 +1663,81 @@ class MomentumSniperStrategy:
         # Sort by edge, best first
         opportunities.sort(key=lambda x: x[3], reverse=True)
         return opportunities
+
+    async def _handle_fast_fire_result(
+        self, state, side, buy_price, edge, fv, result, signal_time,
+    ):
+        """Handle bookkeeping after a fast-fire order (runs in asyncio)."""
+        fast_success = result.get("success", False) or result.get("orderID", "")
+        fast_order_id = result.get("orderID", "")
+        taking = float(result.get("takingAmount", 0) or 0)
+
+        self.log(
+            f"[FAST-FIRE] {state.coin} {side.upper()} success={bool(fast_success)} "
+            f"id={fast_order_id[:16] if fast_order_id else 'none'} "
+            f"filled={taking:.1f} lat={((time.time() - signal_time) * 1000):.0f}ms",
+            "info"
+        )
+
+        if not fast_success:
+            return
+
+        # Track position
+        fair_prob = fv.fair_up if side == "up" else fv.fair_down
+        filled_tokens = taking if taking > 0 else 5.0
+        fee_per_tok = buy_price * 0.01  # ~1% taker fee estimate
+        actual_cost = (buy_price + fee_per_tok) * filled_tokens
+        self._balance -= actual_cost
+
+        if side == "up":
+            state.up_tokens += filled_tokens
+            state.up_cost += actual_cost
+        else:
+            state.down_tokens += filled_tokens
+            state.down_cost += actual_cost
+
+        state.last_trade_time = time.time()
+        self.stats.trades += 1
+        self.stats.pending += 1
+        self.stats.total_wagered += actual_cost
+        self.stats.opportunities_found += 1
+
+        total_lat = (time.time() - signal_time) * 1000
+        partial_tag = f" PARTIAL({filled_tokens:.0f}/5)" if filled_tokens < 5 else ""
+        self.log(
+            f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} x{filled_tokens:.0f} "
+            f"(${actual_cost:.2f}){partial_tag} edge={edge:.2f} [FAST-FIRE] "
+            f"strike={getattr(state, '_strike_source', '?')} lat={total_lat:.0f}ms",
+            "info"
+        )
+
+        # Log trade
+        spot = self.binance.get_price(state.coin)
+        vol, vol_src = self._get_volatility(state.coin)
+        strike_src = getattr(state, '_strike_source', 'unknown')
+        self.trade_logger.log_trade(
+            market_slug=state.current_slug,
+            coin=state.coin,
+            timeframe=self.config.timeframe,
+            side=side,
+            entry_price=buy_price,
+            bet_size_usdc=actual_cost,
+            num_tokens=filled_tokens,
+            bankroll=self._balance,
+            usdc_balance=self._balance,
+            btc_price=spot,
+            other_side_price=state.manager.get_mid_price("down" if side == "up" else "up"),
+            volatility_std=vol,
+            fair_value_at_entry=fair_prob,
+            time_to_expiry_at_entry=state.seconds_to_expiry(),
+            momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+            volatility_at_entry=vol,
+            signal_to_order_ms=0,
+            order_latency_ms=total_lat,
+            total_latency_ms=total_lat,
+            vol_source=vol_src,
+            strike_source=strike_src,
+        )
 
     async def _execute_snipe(
         self,
