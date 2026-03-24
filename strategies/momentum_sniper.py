@@ -1768,32 +1768,46 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # FAK taker — FastOrderClient (52ms) with SDK fallback (371ms)
+        # DUAL EXECUTION: FastOrderClient (fast) + SDK (reliable fallback)
+        # FastOrder fires first for speed. SDK always fires as backup.
+        # Both results logged for side-by-side comparison to diagnose FastOrder issues.
+        fast_success = False
         if self._fast_order:
             try:
                 fast_result = await self._fast_order.place_order(
                     token_id=token_id, price=buy_price,
                     size=num_tokens, side="BUY", order_type="FAK",
                 )
-                success = fast_result.get("success", False)
-                order_id = fast_result.get("orderID", "")
-                from src.bot import OrderResult
-                result = OrderResult(
-                    success=success, order_id=order_id,
-                    status=fast_result.get("status", ""),
-                    message="Fast order" if success else fast_result.get("error", ""),
-                    data=fast_result,
+                fast_success = fast_result.get("success", False)
+                fast_order_id = fast_result.get("orderID", "")
+                self.log(
+                    f"[FAST] {state.coin} {side.upper()} success={fast_success} "
+                    f"id={fast_order_id[:16] if fast_order_id else 'none'} "
+                    f"raw={str(fast_result)[:150]}",
+                    "info"
                 )
+                if fast_success and fast_order_id:
+                    from src.bot import OrderResult
+                    result = OrderResult(
+                        success=True, order_id=fast_order_id,
+                        status=fast_result.get("status", ""),
+                        message="Fast order filled",
+                        data=fast_result,
+                    )
             except Exception as e:
-                self.log(f"FastOrder failed ({e}), SDK fallback", "warning")
-                result = await self.bot.place_order(
-                    token_id=token_id, price=buy_price,
-                    size=num_tokens, side="BUY", order_type="FAK",
-                )
-        else:
+                self.log(f"[FAST] {state.coin} {side.upper()} EXCEPTION: {e}", "warning")
+
+        # SDK fallback — always runs if FastOrder didn't succeed
+        if not fast_success:
             result = await self.bot.place_order(
                 token_id=token_id, price=buy_price,
                 size=num_tokens, side="BUY", order_type="FAK",
+            )
+            sdk_success = result.success
+            self.log(
+                f"[SDK] {state.coin} {side.upper()} success={sdk_success} "
+                f"id={result.order_id[:16] if result.order_id else 'none'}",
+                "info"
             )
 
         actual_fill = result.fill_amount if result.fill_amount else num_tokens
