@@ -1768,34 +1768,11 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # FAK taker — try FastOrderClient first, SDK fallback
-        if self._fast_order:
-            try:
-                fast_result = await self._fast_order.place_order_fast(
-                    token_id=token_id, price=buy_price,
-                    size=num_tokens, side="BUY", order_type="FAK",
-                )
-                success = fast_result.get("success", False)
-                order_id = fast_result.get("orderID", "")
-                from src.bot import OrderResult
-                result = OrderResult(
-                    success=success, order_id=order_id,
-                    status=fast_result.get("status", ""),
-                    message=fast_result.get("errorMsg", "") if not success else "Fast order",
-                    data=fast_result,
-                )
-                self.log(f"[FAST] {state.coin} {side.upper()} success={success} id={order_id[:16] if order_id else 'none'}", "info")
-            except Exception as e:
-                self.log(f"FastOrder failed ({e}), falling back to SDK", "warning")
-                result = await self.bot.place_order(
-                    token_id=token_id, price=buy_price,
-                    size=num_tokens, side="BUY", order_type="FAK",
-                )
-        else:
-            result = await self.bot.place_order(
-                token_id=token_id, price=buy_price,
-                size=num_tokens, side="BUY", order_type="FAK",
-            )
+        # FAK taker — SDK path. Proven 39 fills. Simple and reliable.
+        result = await self.bot.place_order(
+            token_id=token_id, price=buy_price,
+            size=num_tokens, side="BUY", order_type="FAK",
+        )
 
         actual_fill = result.fill_amount if result.fill_amount else num_tokens
         self.log(
