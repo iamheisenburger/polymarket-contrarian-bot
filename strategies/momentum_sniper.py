@@ -950,6 +950,10 @@ class MomentumSniperStrategy:
 
             # FAST FIRE: submit order directly in FastOrder's thread — zero asyncio
             if self._fast_order:
+                # Skip first market window (incomplete data)
+                if not state.startup_slug or state.current_slug == state.startup_slug:
+                    return
+
                 token_id = state.manager.token_ids.get(side)
                 if not token_id:
                     return
@@ -971,6 +975,10 @@ class MomentumSniperStrategy:
                 self._snipe_in_flight.add(snipe_key)
 
                 buy_price = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
+                # Min order $1.00: at 5 tokens, need price >= $0.20
+                if buy_price < 0.20:
+                    self._snipe_in_flight.discard(snipe_key)
+                    return
                 signal_time = time.time()
 
                 # Capture event loop reference NOW (we're in the WS thread,
