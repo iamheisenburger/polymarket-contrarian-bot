@@ -2665,7 +2665,6 @@ class MomentumSniperStrategy:
             self._last_keepalive = now
             try:
                 if self._fast_order:
-                    import asyncio
                     asyncio.create_task(self._fast_order.keepalive())
                 else:
                     self.bot._official_client.get_server_time()
