@@ -261,6 +261,7 @@ class FastOrderClient:
         logger.info(
             f"FastOrder {side} {size}@{price} {order_type}: "
             f"total={total_ms:.0f}ms (sign={sign_ms:.0f}ms prep={prep_ms:.0f}ms net={net_ms:.0f}ms) "
+            f"RAW={json.dumps(result)[:200]} "
             f"success={result.get('success')} id={result.get('orderID','')[:16]}"
         )
 
