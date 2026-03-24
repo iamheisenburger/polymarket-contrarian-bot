@@ -2678,7 +2678,6 @@ class MomentumSniperStrategy:
                 if state.manager.current_market:
                     token_ids = state.manager.token_ids
                     try:
-                        import asyncio
                         asyncio.create_task(self._fast_order.pre_sign_orders(token_ids))
                     except Exception:
                         pass
