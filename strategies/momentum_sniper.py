@@ -2862,7 +2862,10 @@ class MomentumSniperStrategy:
             self._last_keepalive = now
             try:
                 if self._fast_order:
+                    # Keepalive client (keepalive thread)
                     asyncio.create_task(self._fast_order.keepalive())
+                    # Order client (order thread) — keep IT warm too
+                    self._fast_order._executor.submit(self._fast_order._order_keepalive_sync)
                 else:
                     self.bot._official_client.get_server_time()
             except Exception:

@@ -51,25 +51,34 @@ class FastOrderClient:
         self._api_secret = api_secret
         self._api_passphrase = api_passphrase
 
-        # SYNCHRONOUS HTTP client — runs in dedicated thread, not event loop
+        # SEPARATE HTTP clients per thread — httpx.Client is NOT thread-safe
+        # Order client: used ONLY by order thread
         self._http = httpx.Client(
             base_url="https://clob.polymarket.com",
             http2=False,
             timeout=10.0,
-            limits=httpx.Limits(max_connections=5, max_keepalive_connections=3),
+            limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+        )
+        # Keepalive client: used ONLY by keepalive thread
+        self._http_keepalive = httpx.Client(
+            base_url="https://clob.polymarket.com",
+            http2=False,
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
         )
 
         # Order executor — dedicated thread, NEVER blocked by keepalive
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="fastorder-order"
         )
-        # Separate keepalive executor — so keepalive never blocks orders
+        # Separate keepalive executor
         self._keepalive_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="fastorder-ping"
         )
 
-        # Warm up connection immediately in the dedicated thread
+        # Warm up BOTH connections
         self._executor.submit(self._warmup).result(timeout=5)
+        self._keepalive_executor.submit(self._warmup_keepalive).result(timeout=5)
 
         # Pre-signed order cache
         self._pre_signed: dict = {}
@@ -105,12 +114,20 @@ class FastOrderClient:
         logger.info(f"FastOrderClient initialized (dedicated thread): EOA={self._eoa_address[:10]}...")
 
     def _warmup(self):
-        """Warm up TCP+TLS connection in the dedicated thread."""
+        """Warm up order client TCP+TLS connection."""
         try:
             self._http.get("/time")
-            logger.info("FastOrder connection warmed up")
+            logger.info("FastOrder order connection warmed up")
         except Exception as e:
-            logger.warning(f"FastOrder warmup failed: {e}")
+            logger.warning(f"FastOrder order warmup failed: {e}")
+
+    def _warmup_keepalive(self):
+        """Warm up keepalive client TCP+TLS connection."""
+        try:
+            self._http_keepalive.get("/time")
+            logger.info("FastOrder keepalive connection warmed up")
+        except Exception as e:
+            logger.warning(f"FastOrder keepalive warmup failed: {e}")
 
     @staticmethod
     def _get_amounts(side: str, size: float, price: float):
@@ -284,14 +301,24 @@ class FastOrderClient:
         return future.result(timeout=10)  # Block 20ms, not 300ms
 
     def _keepalive_sync(self):
-        """Keepalive in dedicated thread — keeps TCP+TLS warm."""
+        """Keepalive — warms keepalive client only (its own thread)."""
         try:
             t0 = time.monotonic()
-            self._http.get("/time")
+            self._http_keepalive.get("/time")
             ms = (time.monotonic() - t0) * 1000
             logger.info(f"FastOrder keepalive: {ms:.0f}ms")
         except Exception as e:
             logger.warning(f"FastOrder keepalive failed: {e}")
+
+    def _order_keepalive_sync(self):
+        """Warm the ORDER client — runs in order thread only."""
+        try:
+            t0 = time.monotonic()
+            self._http.get("/time")
+            ms = (time.monotonic() - t0) * 1000
+            logger.info(f"FastOrder order-ping: {ms:.0f}ms")
+        except Exception:
+            pass
 
     async def keepalive(self):
         """Ping CLOB in keepalive thread (separate from order thread)."""
@@ -324,6 +351,8 @@ class FastOrderClient:
             self._pre_sign_lock.release()
 
     async def close(self):
-        """Close the HTTP client and thread pool."""
+        """Close HTTP clients and thread pools."""
         self._http.close()
+        self._http_keepalive.close()
         self._executor.shutdown(wait=False)
+        self._keepalive_executor.shutdown(wait=False)
