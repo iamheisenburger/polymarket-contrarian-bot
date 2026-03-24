@@ -1796,13 +1796,13 @@ class MomentumSniperStrategy:
             # Still log as shadow for data collection
             if self.shadow_logger:
                 fair_prob = fv.fair_up if side == "up" else fv.fair_down
+                mom = (self.binance.get_price(state.coin) - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
                 self.shadow_logger.log_signal(
                     market_slug=state.current_slug, coin=state.coin,
-                    side=side, paper_entry_price=original_ask,
-                    signal_edge=edge, signal_momentum=(self.binance.get_price(state.coin) - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
-                    signal_fv=fair_prob, signal_tte=state.seconds_to_expiry(),
+                    side=side, ask_price=original_ask,
+                    fair_value=fair_prob, edge=edge, momentum=mom,
+                    tte=state.seconds_to_expiry(),
                     strike_source=getattr(state, '_strike_source', 'unknown'),
-                    fok_rejected=True,
                 )
             return False
 
