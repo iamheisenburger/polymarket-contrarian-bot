@@ -352,9 +352,12 @@ class FastOrderClient:
     async def keepalive(self):
         """Ping CLOB to keep connection warm."""
         try:
+            t0 = time.monotonic()
             await self._http.get("/time")
-        except Exception:
-            pass
+            ms = (time.monotonic() - t0) * 1000
+            logger.info(f"FastOrder keepalive: {ms:.0f}ms")
+        except Exception as e:
+            logger.warning(f"FastOrder keepalive failed: {e}")
 
     async def close(self):
         """Close the HTTP client."""
