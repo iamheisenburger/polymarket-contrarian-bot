@@ -1582,9 +1582,10 @@ class MomentumSniperStrategy:
                     # Thin books (<50 tokens) are ignored by HFT = less adverse selection.
                     ob = state.manager.get_orderbook(side)
                     book_depth = ob.asks[0].size if ob and ob.asks else 0
-                    if book_depth > 50:
-                        self.log(f"[SKIP] {state.coin} {side.upper()} depth={book_depth:.0f} tokens (>50, HFT territory)", "info")
-                        continue
+                    # Depth filter DISABLED — collecting data on all book depths
+                    # Log depth for analysis but don't filter
+                    if book_depth > 0:
+                        pass  # no filter
 
                     opportunities.append((state, side, best_ask, edge, fv))
 
