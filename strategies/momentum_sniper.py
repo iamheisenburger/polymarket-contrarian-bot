@@ -852,12 +852,22 @@ class MomentumSniperStrategy:
         self.log(f"Resolved {resolved}/{len(pending)} orphaned trades", "success")
 
     def _refresh_balance(self):
-        """Query USDC balance (rate-limited to every 10s)."""
+        """Query USDC balance (rate-limited to every 10s). Sync version for non-async callers."""
         now = time.time()
         if now - self._last_balance_check < 10:
             return
         self._last_balance_check = now
         bal = self.bot.get_usdc_balance()
+        if bal is not None:
+            self._balance = bal
+
+    async def _async_refresh_balance(self):
+        """Query USDC balance without blocking event loop."""
+        now = time.time()
+        if now - self._last_balance_check < 10:
+            return
+        self._last_balance_check = now
+        bal = await asyncio.to_thread(self.bot.get_usdc_balance)
         if bal is not None:
             self._balance = bal
 
@@ -1863,9 +1873,8 @@ class MomentumSniperStrategy:
                 is_confirmed_fill = True
             else:
                 # Ambiguous status — check balance to confirm
-                import time as _time
-                _time.sleep(2)
-                bal_check = self.bot.get_usdc_balance()
+                await asyncio.sleep(2)
+                bal_check = await asyncio.to_thread(self.bot.get_usdc_balance)
                 expected_cost = buy_price * num_tokens
                 if bal_check is not None and bal_check < (self._balance - expected_cost * 0.3):
                     self.log(
@@ -1919,7 +1928,7 @@ class MomentumSniperStrategy:
             other_price = state.manager.get_mid_price("down" if side == "up" else "up")
 
             # Get real USDC balance for accurate logging
-            real_balance = self.bot.get_usdc_balance() or self._balance
+            real_balance = self._balance  # Use cached balance, don't block event loop
 
             strike_src = getattr(state, '_strike_source', 'unknown')
             self.trade_logger.log_trade(
@@ -2017,7 +2026,7 @@ class MomentumSniperStrategy:
         self.log(f"{state.coin} {old_slug} not yet resolved — will retry periodically")
         return None
 
-    def _periodic_settle(self):
+    async def _periodic_settle(self):
         """
         Periodically resolve pending trades via Gamma API.
 
@@ -2036,11 +2045,11 @@ class MomentumSniperStrategy:
 
         from src.gamma_client import GammaClient
         gamma = GammaClient()
-        real_balance = self.bot.get_usdc_balance() or self._balance
+        real_balance = await asyncio.to_thread(self.bot.get_usdc_balance) or self._balance
 
         for trade_key, record in list(pending.items()):
             try:
-                market_data = gamma.get_market_by_slug(record.market_slug)
+                market_data = await asyncio.to_thread(gamma.get_market_by_slug, record.market_slug)
                 if not market_data:
                     continue
 
@@ -2300,7 +2309,7 @@ class MomentumSniperStrategy:
         except RuntimeError:
             self._set_strike(state)
 
-    def _periodic_redeem(self):
+    async def _periodic_redeem(self):
         """Periodically attempt to redeem settled winning positions.
 
         The UMA oracle takes minutes to resolve markets after they expire.
@@ -2317,12 +2326,12 @@ class MomentumSniperStrategy:
             return
 
         try:
-            results = self.bot.redeem_all()
+            results = await asyncio.to_thread(self.bot.redeem_all)
             if results:
                 self.log(f"Redeemed {len(results)} position(s) to USDC", "success")
                 # Refresh balance after successful redemption
                 self._last_balance_check = 0
-                self._refresh_balance()
+                await asyncio.to_thread(self._refresh_balance)
         except Exception as e:
             self.log(f"Periodic redeem failed: {e}", "warning")
 
@@ -2637,11 +2646,9 @@ class MomentumSniperStrategy:
 
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
-        # Periodic settlement of pending trades via Gamma API
-        self._periodic_settle()
-
-        # Periodic redemption of settled winning positions
-        self._periodic_redeem()
+        # Periodic settlement + redemption — run in background so they don't block trading
+        asyncio.create_task(self._periodic_settle())
+        asyncio.create_task(self._periodic_redeem())
 
         # Flush stale shadow records that were never resolved
         if self.shadow_logger:
@@ -2694,8 +2701,8 @@ class MomentumSniperStrategy:
             if down > 0:
                 state.last_down_price = down
 
-        # Balance check
-        self._refresh_balance()
+        # Balance check (non-blocking)
+        await self._async_refresh_balance()
         if self._balance < self.config.min_bet_usdc and not self.config.observe_only:
             return
 
