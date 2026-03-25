@@ -884,6 +884,7 @@ class MomentumSniperStrategy:
         """Start the strategy: Binance feed + market managers for each coin."""
         self.running = True
         self._start_time = time.time()  # Skip trades within 60s of boot
+        self._loop = None  # Set after event loop is running
 
         # Start price feeds (Binance + Coinbase for HYPE if needed)
         coinbase_coins = [c for c in self.config.coins if c in COINBASE_COINS]
@@ -901,104 +902,82 @@ class MomentumSniperStrategy:
         # Register instant signal detection on price updates
         # Instead of waiting for next tick (100ms), evaluate signal immediately when price moves
         def _on_price_update(coin: str, price: float):
-            """Called on EVERY Binance/Coinbase price tick — instant signal detection.
-            Bypasses the tick loop entirely for maximum speed."""
+            """Called on EVERY Binance/Coinbase price tick.
+            LIGHTWEIGHT: only cheap checks (~0.1ms), then queue to signal thread."""
             if not self.running or self.config.observe_only:
                 return
-            # Skip first 60s after boot — markets may be stale/partial
             if time.time() - self._start_time < 60:
                 return
             state = self.coin_states.get(coin)
             if not state or not state.strike_price or state.strike_price <= 0:
                 return
+            if not state.startup_slug or state.current_slug == state.startup_slug:
+                return
             disp = (price - state.strike_price) / state.strike_price
             if abs(disp) < self.config.min_momentum:
                 return
 
-            # Check if we already have a position (max concurrent)
-            active = sum(1 for s in self.coin_states.values() if s.has_up_position or s.has_down_position)
-            if active >= self.config.max_concurrent_positions:
+            side = "up" if disp > 0 else "down"
+            if side == "up" and state.has_up_position:
+                return
+            if side == "down" and state.has_down_position:
                 return
 
-            # Quick filter: side, ask, edge
-            side = "up" if disp > 0 else "down"
             best_ask = state.manager.get_best_ask(side)
             if best_ask <= 0 or best_ask > self.config.max_entry_price:
                 return
 
-            fv = self._calculate_fair_value(state)
-            if not fv:
-                return
-            fair_prob = fv.fair_up if side == "up" else fv.fair_down
-            if fair_prob < self.config.min_fair_value:
-                return
-
-            worst_fill = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
-            fee = 0.005
-            edge = fair_prob - worst_fill - fee
-            if edge < self.config.min_edge:
-                return
-
-            # TTE check
+            # TTE check (cheap arithmetic)
             tte = state.seconds_to_expiry()
-            duration = 300
-            min_tte = duration - self.config.max_window_elapsed
-            max_tte = duration - self.config.min_window_elapsed
-            if tte < min_tte or tte > max_tte:
+            if tte < (300 - self.config.max_window_elapsed) or tte > (300 - self.config.min_window_elapsed):
                 return
 
-            # Flag for tick loop (fallback)
+            # Dedup: one signal per market/side in flight
+            snipe_key = f"{state.current_slug}:{side}"
+            if not hasattr(self, '_snipe_in_flight'):
+                self._snipe_in_flight = set()
+            if snipe_key in self._snipe_in_flight:
+                return
+            self._snipe_in_flight.add(snipe_key)
+
+            # Flag for tick loop (fallback if no fast_order)
             if not hasattr(self, '_urgent_coins'):
                 self._urgent_coins = set()
             self._urgent_coins.add(coin)
 
-            # FAST FIRE: submit order directly in FastOrder's thread — zero asyncio
+            signal_time = time.time()
+
             if self._fast_order:
-                # Skip first market window (incomplete data)
-                if not state.startup_slug or state.current_slug == state.startup_slug:
-                    return
-
-                token_id = state.manager.token_ids.get(side)
-                if not token_id:
-                    return
-
-                # Balance check
-                if self._balance < 1.0:
-                    return
-
-                # Check position + de-dup
-                if side == "up" and state.has_up_position:
-                    return
-                if side == "down" and state.has_down_position:
-                    return
-                snipe_key = f"{state.current_slug}:{side}"
-                if not hasattr(self, '_snipe_in_flight'):
-                    self._snipe_in_flight = set()
-                if snipe_key in self._snipe_in_flight:
-                    return
-                self._snipe_in_flight.add(snipe_key)
-
-                buy_price = min(round(best_ask + self.config.fok_tolerance, 2), self.config.max_entry_price)
-                # Min order $1.00: at 5 tokens, need price >= $0.20
-                if buy_price < 0.20:
-                    self._snipe_in_flight.discard(snipe_key)
-                    return
-                signal_time = time.time()
-
-                # Capture event loop reference NOW (we're in the WS thread,
-                # but the loop was created in the main thread)
-                try:
-                    _loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    _loop = None
-
-                def _fast_fire():
-                    """Runs entirely in FastOrder's dedicated thread."""
+                # Queue to signal thread: FV calc + sign + POST happen there (~34ms)
+                def _signal_task():
                     try:
+                        # FV calculation (7ms) — runs in signal thread, not WS thread
+                        fv = self._calculate_fair_value(state)
+                        if not fv:
+                            return
+                        fair_prob = fv.fair_up if side == "up" else fv.fair_down
+                        if fair_prob < self.config.min_fair_value:
+                            return
+
+                        buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
+                                        self.config.max_entry_price)
+                        edge = fair_prob - buy_price - 0.005
+                        if edge < self.config.min_edge:
+                            return
+                        if buy_price < 0.20 or self._balance < 1.0:
+                            return
+
+                        token_id = state.manager.token_ids.get(side)
+                        if not token_id:
+                            return
+
+                        # Sign + POST (~27ms on warm connection)
                         result = self._fast_order._place_order_sync(
                             token_id, buy_price, 5.0, "BUY", "FAK", 1000,
                         )
-                        # Queue bookkeeping back to asyncio event loop
+
+                        # Queue bookkeeping to asyncio event loop
+                        _loop = self._loop
                         if _loop and _loop.is_running():
                             _loop.call_soon_threadsafe(
                                 _loop.create_task,
@@ -1008,29 +987,23 @@ class MomentumSniperStrategy:
                                 )
                             )
                         else:
-                            # Fallback: log directly if no event loop
-                            success = result.get("success", False) or result.get("orderID", "")
+                            # Fallback log
+                            success = result.get("orderID", "")
                             taking = float(result.get("takingAmount", 0) or 0)
                             lat = (time.time() - signal_time) * 1000
                             self._event_logger.info(
                                 f"[FAST-FIRE] {coin} {side} success={bool(success)} "
-                                f"filled={taking:.1f} lat={lat:.0f}ms (no loop for bookkeeping)"
+                                f"filled={taking:.1f} lat={lat:.0f}ms (no loop)"
                             )
                     except Exception as e:
                         self._event_logger.warning(f"[FAST-FIRE] {coin} {side} error: {e}")
                     finally:
                         self._snipe_in_flight.discard(snipe_key)
 
-                self._fast_order._executor.submit(_fast_fire)
-                return  # Don't also fire via tick loop
-
-            # Fallback: fire via asyncio (slower path)
-            try:
-                asyncio.get_event_loop().create_task(
-                    self._execute_snipe(state, side, worst_fill, edge, fv, signal_time=time.time())
-                )
-            except Exception:
-                pass
+                self._fast_order._signal_queue.put(_signal_task)
+            else:
+                # No FastOrder — fallback to tick loop
+                self._snipe_in_flight.discard(snipe_key)
 
         if hasattr(self.binance, 'on_price'):
             self.binance.on_price(_on_price_update)
@@ -1967,17 +1940,16 @@ class MomentumSniperStrategy:
             "info"
         )
 
-        # DUAL EXECUTION: FastOrderClient (fast) + SDK (reliable fallback)
-        # FastOrder fires first for speed. SDK always fires as backup.
-        # Both results logged for side-by-side comparison to diagnose FastOrder issues.
+        # ORDER EXECUTION: route through signal queue (non-blocking for event loop)
         fast_success = False
+        fast_result = {}
         if self._fast_order:
             try:
                 fast_result = await self._fast_order.place_order(
                     token_id=token_id, price=buy_price,
                     size=num_tokens, side="BUY", order_type="FAK",
                 )
-                fast_success = fast_result.get("success", False)
+                fast_success = bool(fast_result.get("orderID", ""))
                 fast_order_id = fast_result.get("orderID", "")
                 self.log(
                     f"[FAST] {state.coin} {side.upper()} success={fast_success} "
@@ -1996,7 +1968,7 @@ class MomentumSniperStrategy:
             except Exception as e:
                 self.log(f"[FAST] {state.coin} {side.upper()} EXCEPTION: {e}", "warning")
 
-        # SDK fallback — always runs if FastOrder didn't succeed
+        # SDK fallback — only if FastOrder not available or failed
         if not fast_success:
             result = await self.bot.place_order(
                 token_id=token_id, price=buy_price,
@@ -2862,10 +2834,8 @@ class MomentumSniperStrategy:
             self._last_keepalive = now
             try:
                 if self._fast_order:
-                    # Keepalive client (keepalive thread)
+                    # Keepalive client only — order client warmed by signal loop idle ping
                     asyncio.create_task(self._fast_order.keepalive())
-                    # Order client (order thread) — keep IT warm too
-                    self._fast_order._executor.submit(self._fast_order._order_keepalive_sync)
                 else:
                     self.bot._official_client.get_server_time()
             except Exception:
@@ -2899,8 +2869,8 @@ class MomentumSniperStrategy:
             if down > 0:
                 state.last_down_price = down
 
-        # Balance check (non-blocking)
-        await self._async_refresh_balance()
+        # Balance check — background, don't block signal scanning
+        asyncio.create_task(self._async_refresh_balance())
         if self._balance < self.config.min_bet_usdc and not self.config.observe_only:
             return
 
@@ -3162,6 +3132,7 @@ class MomentumSniperStrategy:
                 return
 
             self.log("Sniper active — scanning for opportunities...", "success")
+            self._loop = asyncio.get_running_loop()
 
             while self.running:
                 await self._tick()
