@@ -957,8 +957,11 @@ class MomentumSniperStrategy:
                 self._active_orders += 1
 
                 # Queue to signal thread: FV calc + sign + POST + bookkeeping
+                _t_queued = time.time()
                 def _signal_task():
                     try:
+                        _t_start = time.time()
+                        _queue_wait = (_t_start - _t_queued) * 1000
                         # FV calculation (7ms)
                         fv = self._calculate_fair_value(state)
                         if not fv:
@@ -997,7 +1000,7 @@ class MomentumSniperStrategy:
                         self._event_logger.info(
                             f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
                             f"id={result.get('orderID','')[:16] or 'none'} "
-                            f"filled={taking:.1f} lat={total_lat:.0f}ms"
+                            f"filled={taking:.1f} lat={total_lat:.0f}ms qwait={_queue_wait:.0f}ms"
                         )
 
                         if not fast_success:
