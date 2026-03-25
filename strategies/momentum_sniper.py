@@ -948,20 +948,20 @@ class MomentumSniperStrategy:
             signal_time = time.time()
 
             if self._fast_order:
-                # Atomic position counter: increment BEFORE submitting
-                if not hasattr(self, '_active_orders'):
-                    self._active_orders = 0
-                if self._active_orders >= self.config.max_concurrent_positions:
-                    self._snipe_in_flight.discard(snipe_key)
-                    return
-                self._active_orders += 1
-
-                # Queue to signal thread: FV calc + sign + POST + bookkeeping
+                # Queue to signal thread — position check happens IN the thread
+                # (serial execution prevents race conditions)
                 _t_queued = time.time()
                 def _signal_task():
                     try:
                         _t_start = time.time()
                         _queue_wait = (_t_start - _t_queued) * 1000
+
+                        # Position check INSIDE signal thread (serial, no race)
+                        active = sum(1 for s in self.coin_states.values()
+                                     if s.has_up_position or s.has_down_position)
+                        if active >= self.config.max_concurrent_positions:
+                            return
+
                         # FV calculation (7ms)
                         fv = self._calculate_fair_value(state)
                         if not fv:
@@ -1073,7 +1073,7 @@ class MomentumSniperStrategy:
                             state.down_tokens = 0
                     finally:
                         self._snipe_in_flight.discard(snipe_key)
-                        self._active_orders = max(0, self._active_orders - 1)
+                        pass  # position tracked via state.up_tokens/down_tokens
 
                 self._fast_order._signal_queue.put(_signal_task)
             else:
