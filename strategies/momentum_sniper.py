@@ -979,6 +979,12 @@ class MomentumSniperStrategy:
                         if not token_id:
                             return
 
+                        # Mark position BEFORE ordering so tick loop won't double-fire
+                        if side == "up":
+                            state.up_tokens = 0.01  # sentinel
+                        else:
+                            state.down_tokens = 0.01  # sentinel
+
                         # Sign + POST
                         result = self._fast_order._place_order_sync(
                             token_id, buy_price, 5.0, "BUY", "FAK", 1000,
@@ -995,6 +1001,11 @@ class MomentumSniperStrategy:
                         )
 
                         if not fast_success:
+                            # Reset sentinel — order didn't fill
+                            if side == "up":
+                                state.up_tokens = 0
+                            else:
+                                state.down_tokens = 0
                             return
 
                         # === BOOKKEEPING: directly in signal thread (no asyncio) ===
@@ -1052,6 +1063,11 @@ class MomentumSniperStrategy:
 
                     except Exception as e:
                         self._event_logger.warning(f"[FAST-FIRE] {state.coin} {side} error: {e}")
+                        # Reset sentinel if we set it but never filled
+                        if side == "up" and state.up_tokens == 0.01:
+                            state.up_tokens = 0
+                        elif side == "down" and state.down_tokens == 0.01:
+                            state.down_tokens = 0
                     finally:
                         self._snipe_in_flight.discard(snipe_key)
                         self._active_orders = max(0, self._active_orders - 1)
