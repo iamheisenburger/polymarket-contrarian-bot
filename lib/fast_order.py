@@ -125,13 +125,13 @@ class FastOrderClient:
     def _signal_loop(self):
         """
         Runs in dedicated thread forever. Blocks on queue, processes signals.
-        When idle, pings /time every 3s to keep connection warm.
+        When idle, pings /time every 1s to keep connection warm (22ms on warm, 300ms on cold).
         """
         while self._running:
             try:
-                # Block for up to 3s — if no signal, do a keepalive ping
+                # Block for up to 1s — ping frequently to keep connection warm
                 try:
-                    task = self._signal_queue.get(timeout=3.0)
+                    task = self._signal_queue.get(timeout=1.0)
                 except queue.Empty:
                     # No signal — keep order connection warm
                     try:

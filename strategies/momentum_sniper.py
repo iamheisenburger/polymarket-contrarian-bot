@@ -948,10 +948,18 @@ class MomentumSniperStrategy:
             signal_time = time.time()
 
             if self._fast_order:
-                # Queue to signal thread: FV calc + sign + POST happen there (~34ms)
+                # Atomic position counter: increment BEFORE submitting
+                if not hasattr(self, '_active_orders'):
+                    self._active_orders = 0
+                if self._active_orders >= self.config.max_concurrent_positions:
+                    self._snipe_in_flight.discard(snipe_key)
+                    return
+                self._active_orders += 1
+
+                # Queue to signal thread: FV calc + sign + POST + bookkeeping
                 def _signal_task():
                     try:
-                        # FV calculation (7ms) — runs in signal thread, not WS thread
+                        # FV calculation (7ms)
                         fv = self._calculate_fair_value(state)
                         if not fv:
                             return
@@ -971,34 +979,82 @@ class MomentumSniperStrategy:
                         if not token_id:
                             return
 
-                        # Sign + POST (~27ms on warm connection)
+                        # Sign + POST
                         result = self._fast_order._place_order_sync(
                             token_id, buy_price, 5.0, "BUY", "FAK", 1000,
                         )
 
-                        # Queue bookkeeping to asyncio event loop
-                        _loop = self._loop
-                        if _loop and _loop.is_running():
-                            _loop.call_soon_threadsafe(
-                                _loop.create_task,
-                                self._handle_fast_fire_result(
-                                    state, side, buy_price, edge, fv,
-                                    result, signal_time,
-                                )
-                            )
+                        fast_success = bool(result.get("orderID", ""))
+                        taking = float(result.get("takingAmount", 0) or 0)
+                        total_lat = (time.time() - signal_time) * 1000
+
+                        self._event_logger.info(
+                            f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
+                            f"id={result.get('orderID','')[:16] or 'none'} "
+                            f"filled={taking:.1f} lat={total_lat:.0f}ms"
+                        )
+
+                        if not fast_success:
+                            return
+
+                        # === BOOKKEEPING: directly in signal thread (no asyncio) ===
+                        filled_tokens = taking if taking > 0 else 5.0
+                        fee_per_tok = buy_price * 0.01
+                        actual_cost = (buy_price + fee_per_tok) * filled_tokens
+                        self._balance -= actual_cost
+
+                        if side == "up":
+                            state.up_tokens += filled_tokens
+                            state.up_cost += actual_cost
                         else:
-                            # Fallback log
-                            success = result.get("orderID", "")
-                            taking = float(result.get("takingAmount", 0) or 0)
-                            lat = (time.time() - signal_time) * 1000
-                            self._event_logger.info(
-                                f"[FAST-FIRE] {coin} {side} success={bool(success)} "
-                                f"filled={taking:.1f} lat={lat:.0f}ms (no loop)"
-                            )
+                            state.down_tokens += filled_tokens
+                            state.down_cost += actual_cost
+
+                        state.last_trade_time = time.time()
+                        self.stats.trades += 1
+                        self.stats.pending += 1
+                        self.stats.total_wagered += actual_cost
+
+                        partial_tag = f" PARTIAL({filled_tokens:.0f}/5)" if filled_tokens < 5 else ""
+                        self._event_logger.info(
+                            f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
+                            f"x{filled_tokens:.0f} (${actual_cost:.2f}){partial_tag} "
+                            f"edge={edge:.2f} [FAST-FIRE] "
+                            f"strike={getattr(state, '_strike_source', '?')} lat={total_lat:.0f}ms"
+                        )
+
+                        # Write CSV — trade_logger is thread-safe (just file append)
+                        spot = self.binance.get_price(state.coin)
+                        vol, vol_src = self._get_volatility(state.coin)
+                        self.trade_logger.log_trade(
+                            market_slug=state.current_slug,
+                            coin=state.coin,
+                            timeframe=self.config.timeframe,
+                            side=side,
+                            entry_price=buy_price,
+                            bet_size_usdc=actual_cost,
+                            num_tokens=filled_tokens,
+                            bankroll=self._balance,
+                            usdc_balance=self._balance,
+                            btc_price=spot,
+                            other_side_price=state.manager.get_mid_price("down" if side == "up" else "up"),
+                            volatility_std=vol,
+                            fair_value_at_entry=fair_prob,
+                            time_to_expiry_at_entry=state.seconds_to_expiry(),
+                            momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+                            volatility_at_entry=vol,
+                            signal_to_order_ms=0,
+                            order_latency_ms=total_lat,
+                            total_latency_ms=total_lat,
+                            vol_source=vol_src,
+                            strike_source=getattr(state, '_strike_source', 'unknown'),
+                        )
+
                     except Exception as e:
-                        self._event_logger.warning(f"[FAST-FIRE] {coin} {side} error: {e}")
+                        self._event_logger.warning(f"[FAST-FIRE] {state.coin} {side} error: {e}")
                     finally:
                         self._snipe_in_flight.discard(snipe_key)
+                        self._active_orders = max(0, self._active_orders - 1)
 
                 self._fast_order._signal_queue.put(_signal_task)
             else:
