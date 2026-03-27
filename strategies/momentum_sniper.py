@@ -216,7 +216,7 @@ class SniperConfig:
     # Position limits: prevent deploying entire bankroll simultaneously.
     # max_concurrent_positions=1 means only 1 open trade at a time across ALL coins.
     # This prevents the V6 failure mode where 9 trades fired in 6 minutes.
-    max_concurrent_positions: int = 1
+    max_concurrent_positions: int = 99  # uncapped — 0% bust at all levels on recorder data
 
     # Market settings
     market_check_interval: float = 30.0
