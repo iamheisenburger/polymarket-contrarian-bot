@@ -152,6 +152,7 @@ class MarketManager:
         market_check_interval: float = 30.0,
         auto_switch_market: bool = True,
         timeframe: str = "15m",
+        ws_msg_skip_rate: int = 10,
     ):
         """
         Initialize market manager.
@@ -161,11 +162,13 @@ class MarketManager:
             market_check_interval: Seconds between market checks
             auto_switch_market: Auto switch when market changes
             timeframe: Market timeframe ("5m", "15m", "4h", "1h", "daily")
+            ws_msg_skip_rate: WS message processing rate (1=all, 10=default)
         """
         self.coin = coin.upper()
         self.market_check_interval = market_check_interval
         self.auto_switch_market = auto_switch_market
         self.timeframe = timeframe
+        self.ws_msg_skip_rate = ws_msg_skip_rate
 
         # Clients
         self.gamma = GammaClient()
@@ -333,7 +336,7 @@ class MarketManager:
         if not self.current_market:
             return False
 
-        self.ws = MarketWebSocket()
+        self.ws = MarketWebSocket(msg_skip_rate=self.ws_msg_skip_rate)
 
         @self.ws.on_book
         async def handle_book(snapshot: OrderbookSnapshot):  # pyright: ignore[reportUnusedFunction]
@@ -387,53 +390,61 @@ class MarketManager:
 
     async def _market_check_loop(self) -> None:
         """Periodically check for market changes."""
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        _logger.info(f"MarketManager check loop STARTED for {self.coin} (interval={self.market_check_interval}s)")
         while self._running:
-            await asyncio.sleep(self.market_check_interval)
+            try:
+                await asyncio.sleep(self.market_check_interval)
 
-            if not self._running:
+                if not self._running:
+                    break
+
+                old_market = self.current_market
+                old_tokens = set(old_market.token_ids.values()) if old_market else set()
+                old_slug = old_market.slug if old_market else None
+
+                # Run synchronous HTTP call in thread pool to avoid blocking
+                market = await asyncio.to_thread(self.discover_market, update_state=False)
+
+                if not market:
+                    _logger.debug(f"{self.coin} check: no market found")
+                    continue
+
+                # Check if market changed and resubscribe
+                new_tokens = set(market.token_ids.values())
+                if new_tokens == old_tokens:
+                    self._update_current_market(market)
+                    continue
+
+                _logger.info(f"{self.coin} MARKET CHANGE DETECTED: {old_slug} -> {market.slug}")
+
+                if not (self.auto_switch_market and self.ws):
+                    self._update_current_market(market)
+                    continue
+
+                if not self._should_switch_market(old_market, market):
+                    continue
+
+                # Market changed — update state. WS resubscribe deferred to avoid blocking.
+                self._update_current_market(market)
+                # Fire WS resubscribe in background (non-blocking)
+                if self.ws:
+                    asyncio.create_task(self.ws.subscribe(list(new_tokens), replace=True))
+
+                # Fire market change callbacks
+                effective_old_slug = old_slug or ""
+                if effective_old_slug != market.slug:
+                    for callback in self._on_market_change_callbacks:
+                        try:
+                            callback(effective_old_slug, market.slug)
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
                 break
-
-            old_market = self.current_market
-            old_tokens = set(old_market.token_ids.values()) if old_market else set()
-            old_slug = old_market.slug if old_market else None
-
-            # Run synchronous HTTP call in thread pool to avoid blocking
-            market = await asyncio.to_thread(self.discover_market, update_state=False)
-
-            if not market:
-                continue
-
-            # Check if market changed and resubscribe
-            new_tokens = set(market.token_ids.values())
-            if new_tokens == old_tokens:
-                self._update_current_market(market)
-                continue
-
-            if not (self.auto_switch_market and self.ws):
-                self._update_current_market(market)
-                continue
-
-            if not self._should_switch_market(old_market, market):
-                continue
-
-            # Market changed - force reconnect and resubscribe to new tokens.
-            # Polymarket websockets break on market transitions (garbled messages,
-            # then timeouts). Simply sending a subscribe on the dead connection
-            # doesn't work. We must close and reconnect.
-            await self.ws.subscribe(list(new_tokens), replace=True)
-            await self.ws.force_reconnect()
-            self._update_current_market(market)
-
-            # Fire market change callbacks in main thread
-            # Use empty string for old_slug on first discovery so strategy
-            # can set startup_slug protection for the coin.
-            effective_old_slug = old_slug or ""
-            if effective_old_slug != market.slug:
-                for callback in self._on_market_change_callbacks:
-                    try:
-                        callback(effective_old_slug, market.slug)
-                    except Exception:
-                        pass
+            except Exception as e:
+                _logger.error(f"MarketManager check loop error for {self.coin}: {e}")
+                await asyncio.sleep(5)
 
     async def start(self) -> bool:
         """
@@ -444,8 +455,9 @@ class MarketManager:
         """
         self._running = True
 
-        # Discover initial market
-        if not self.discover_market():
+        # Discover initial market (run sync HTTP in thread to avoid blocking event loop)
+        market = await asyncio.to_thread(self.discover_market)
+        if not market:
             self._running = False
             return False
 

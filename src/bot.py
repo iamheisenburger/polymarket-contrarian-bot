@@ -30,6 +30,8 @@ Example:
 """
 
 import os
+import re
+import time
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List, Callable, TypeVar
@@ -207,6 +209,11 @@ class TradingBot:
         self.relayer_client: Optional[RelayerClient] = None
         self._api_creds: Optional[ApiCredentials] = None
 
+        # Auto-redemption state — Polymarket relayer caps at ~100/day.
+        # When quota is exhausted, enter a cooldown until the daily reset.
+        self.redeem_cooldown_until: float = 0.0
+        self._redeem_batch_size: int = 25
+
         # Load private key
         if private_key:
             self.signer = OrderSigner(private_key)
@@ -337,17 +344,115 @@ class TradingBot:
             logger.warning(f"Failed to initialize official client: {e}")
             self._official_client = None
 
+    def _fetch_unredeemed_winning_positions(self) -> list:
+        """Fetch ALL unredeemed winning positions from Polymarket data API.
+
+        BUG FIX: poly_web3.fetch_positions() has a broken sort/filter combo:
+          - Calls API with sortBy=RESOLVING DESC, limit=100, redeemable=True
+          - First 100 results are typically OLD LOSERS (size>1, redeemable, $0 value)
+          - Then filters by percentPnl>0 → returns 0 because the first 100 are all losers
+        Result: real winners pile up unredeemed for hours.
+
+        This replacement paginates through ALL positions and filters by
+        currentValue > 0, catching every real win regardless of how many
+        old losers are between us and them.
+        """
+        import requests as _req
+        try:
+            user_addr = self._web3_service._resolve_user_address()
+        except Exception as e:
+            logger.warning(f"Cannot resolve user address: {e}")
+            return []
+
+        all_positions = []
+        offset = 0
+        page_size = 500
+        try:
+            while True:
+                r = _req.get(
+                    "https://data-api.polymarket.com/positions",
+                    params={
+                        "user": user_addr,
+                        "sizeThreshold": 0.01,
+                        "limit": page_size,
+                        "offset": offset,
+                        "redeemable": True,
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
+                batch = r.json()
+                if not batch:
+                    break
+                all_positions.extend(batch)
+                if len(batch) < page_size:
+                    break
+                offset += page_size
+                if offset > 20000:
+                    logger.warning("Position fetch hit safety limit at 20000")
+                    break
+        except Exception as e:
+            logger.warning(f"Position fetch failed: {e}")
+            return []
+
+        # Filter to actual wins (currentValue > 0 means redeeming will return USDC)
+        wins = [p for p in all_positions if float(p.get("currentValue", 0) or 0) > 0]
+        return wins
+
     def redeem_all(self) -> list:
-        """Redeem all settled winning positions back to USDC."""
+        """Redeem all settled winning positions back to USDC.
+
+        Respects the Polymarket relayer daily quota (~100 calls/day). If the
+        quota is exhausted, parses the reset time from the error and enters a
+        cooldown period. Calls during cooldown are silent no-ops — the next
+        attempt will run once the quota has refreshed.
+
+        Uses _fetch_unredeemed_winning_positions to bypass the upstream library's
+        broken sort/filter that was missing 99% of wins.
+        """
         if not hasattr(self, '_web3_service') or not self._web3_service:
             return []
+
+        # Skip silently while in cooldown — quota is exhausted.
+        now = time.time()
+        if now < self.redeem_cooldown_until:
+            return []
+
         try:
-            results = self._web3_service.redeem_all(batch_size=10)
+            wins = self._fetch_unredeemed_winning_positions()
+            if not wins:
+                return []
+            logger.info(
+                f"Found {len(wins)} unredeemed winning position(s), "
+                f"total value ${sum(float(p.get('currentValue', 0) or 0) for p in wins):.2f}"
+            )
+            results = self._web3_service._redeem_from_positions(
+                wins, batch_size=self._redeem_batch_size
+            )
             if results:
-                logger.info(f"Redeemed {len(results)} position(s)")
+                logger.info(f"Redeemed {len(results)} batch(es) covering {len(wins)} positions")
             return results
         except Exception as e:
-            logger.warning(f"Redemption failed: {e}")
+            err_str = str(e)
+            # Detect relayer daily-quota exhaustion (HTTP 429) and enter cooldown
+            # until the server-provided reset time elapses.
+            is_quota = ("quota exceeded" in err_str.lower()
+                        or "status_code=429" in err_str
+                        or "配额已超限" in err_str)
+            if is_quota:
+                m = re.search(r"resets in (\d+) seconds", err_str)
+                reset_s = int(m.group(1)) if m else 3600
+                # Safety buffer: wait an extra 60s past the reported reset.
+                self.redeem_cooldown_until = now + reset_s + 60
+                reset_local = time.strftime(
+                    "%H:%M:%S", time.localtime(self.redeem_cooldown_until))
+                logger.warning(
+                    f"Polymarket relayer quota exhausted — auto-redeem paused "
+                    f"for {reset_s + 60}s (resumes ~{reset_local} local). "
+                    f"Pending winnings will redeem automatically after quota resets."
+                )
+            else:
+                logger.warning(f"Redemption failed: {e}")
             return []
 
     def get_usdc_balance(self) -> Optional[float]:

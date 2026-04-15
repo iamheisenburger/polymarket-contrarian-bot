@@ -34,6 +34,9 @@ class GammaClient(ThreadLocalSessionMixin):
         "ETH": "eth-updown-15m",
         "SOL": "sol-updown-15m",
         "XRP": "xrp-updown-15m",
+        "DOGE": "doge-updown-15m",
+        "HYPE": "hype-updown-15m",
+        "BNB": "bnb-updown-15m",
     }
 
     COIN_SLUGS_5M = {

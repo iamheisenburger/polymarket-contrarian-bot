@@ -267,10 +267,14 @@ class ChainlinkPriceFeed:
                     # Start ping loop
                     self._ping_task = asyncio.create_task(self._ping_loop(ws))
 
+                    _msg_count = 0
                     async for msg in ws:
                         if not self._running:
                             break
                         self._handle_message(msg)
+                        _msg_count += 1
+                        if _msg_count % 50 == 0:
+                            await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break

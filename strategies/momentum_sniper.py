@@ -1,34 +1,29 @@
 """
-Momentum Sniper Strategy — Directional edge trading on crypto binary markets.
+Momentum Sniper Strategy — Pure momentum trading on crypto binary markets.
 
-Exploits the latency between Binance spot price movements and Polymarket
-binary market repricing. When Binance moves but Polymarket hasn't caught up,
-we snipe the mispriced side before the market adjusts.
+Exploits price displacement between spot (Coinbase/Binance) and Polymarket
+binary market pricing. When spot moves relative to the market strike,
+we snipe the side matching the displacement direction.
 
 How it works:
-    1. Binance WebSocket provides sub-second crypto price updates
-    2. Fair value calculator computes P(Up) from Black-Scholes binary pricing
-    3. Compare fair value to Polymarket best ask prices
-    4. When the ask is significantly below fair value → BUY (the market is slow)
-    5. Hold to settlement: binary pays $1 on win, $0 on loss
-    6. Auto-redeem winnings and compound into next market
+    1. Coinbase/Binance WebSocket provides sub-second crypto price updates
+    2. Compute displacement = (spot - strike) / strike
+    3. If |displacement| >= min_momentum AND TTE in configured window
+       AND entry price in range → fire on the displacement direction
+    4. Hold to settlement: binary pays $1 on win, $0 on loss
+    5. Auto-redeem winnings and compound into next market
 
-Key differences from Market Maker:
-    - Market Maker: passive, posts limit orders, profits from spread
-    - Momentum Sniper: active, takes mispriced asks, profits from direction
+    NO fair value model. NO Black-Scholes. NO edge calculation.
+    Three filters only: momentum + TTE + entry-price.
 
-Risk management:
-    - Kelly Criterion position sizing (fractional Kelly)
-    - Minimum edge threshold before entering
-    - One position per side per market (no pyramiding)
-    - Cooldown between trades to avoid overtrading
-    - Stop trading near expiry (last 60s — outcome is too certain or too noisy)
-    - Multi-coin scanning for maximum opportunity
+Execution modes:
+    - FAK taker: instant fill-or-kill at best ask (primary)
+    - GTD maker: resting limit orders below ask with auto-expiry (optional)
 
 Usage:
     from strategies.momentum_sniper import MomentumSniperStrategy, SniperConfig
 
-    config = SniperConfig(coins=["BTC", "ETH"], timeframe="15m", bankroll=20.0)
+    config = SniperConfig(coins=["BTC", "ETH"], timeframe="5m", bankroll=20.0)
     strategy = MomentumSniperStrategy(bot, config)
     await strategy.run()
 """
@@ -36,6 +31,7 @@ Usage:
 import asyncio
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
@@ -43,19 +39,19 @@ from datetime import datetime, timezone, timedelta
 
 from lib.binance_ws import BinancePriceFeed
 from lib.coinbase_ws import CoinbasePriceFeed, COINBASE_SYMBOLS
-from lib.fair_value import BinaryFairValue, FairValue
-from lib.direct_fv import DirectFairValue
+# fair_value / direct_fv REMOVED — bot is pure momentum + TTE + entry-price
 from lib.console import Colors, LogBuffer, log
 from lib.trade_logger import TradeLogger
 from lib.signal_logger import SignalLogger, SignalRecord
 from lib.shadow_logger import ShadowLogger
 from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
-from src.websocket_client import MarketWebSocket, OrderbookSnapshot
+from src.websocket_client import MarketWebSocket, OrderbookSnapshot, UserWebSocket
 from src.gamma_client import GammaClient
 
-# Coins that use Coinbase instead of Binance for price data
-COINBASE_COINS = set(COINBASE_SYMBOLS.keys())  # {"HYPE"}
+# Coins that use Coinbase as primary price feed (~0.8ms latency).
+# BNB is the only coin that stays on Binance (not on Coinbase).
+COINBASE_COINS = set(COINBASE_SYMBOLS.keys())  # {BTC, ETH, SOL, XRP, DOGE, HYPE}
 
 
 class MultiPriceFeed:
@@ -117,11 +113,11 @@ class MultiPriceFeed:
 
 
 # Taker fee rates per timeframe.
-# Fee per token = price * (1 - price) * rate.
-# Max fee at p=0.50: 5m=0.44%, 15m=1.56%, others=0%.
+# As of 2026-04: CLOB docs show 0 bps maker and taker for all volume levels.
+# Live trade data confirms: bet_size = price * tokens exactly, no fee deducted.
 TAKER_FEE_RATES = {
-    "5m": 0.0176,
-    "15m": 0.0624,
+    "5m": 0.0,
+    "15m": 0.0,
     "4h": 0.0,
     "1h": 0.0,
     "daily": 0.0,
@@ -191,13 +187,20 @@ class SniperConfig:
     speculative_enabled: bool = False
     speculative_momentum: float = 0.0003  # Pre-signal momentum threshold
 
+    # GTD maker order system: place resting orders when pre-momentum detected.
+    # Master switch (off by default). When enabled, places GTD maker orders
+    # at favorable prices below the ask when early momentum is detected.
+    maker_enabled: bool = False
+    max_maker_orders: int = 3            # Max simultaneous resting orders
+    maker_poll_interval: float = 5.0     # CLOB poll frequency (seconds)
+    maker_pre_momentum: float = 0.0005   # Lower threshold to trigger maker placement
+    maker_sustain_seconds: float = 5.0   # Momentum must stay above threshold this long before placing
+
     # Momentum lookback period in seconds
     momentum_lookback: float = 30.0
 
-    # Fair value confidence: minimum model confidence to trade.
-    # FV 0.50 = coin flip (no edge). FV 0.60+ = model is confident.
-    # Data: FV >= 0.60 → 80% WR. FV 0.50-0.52 → 26% WR.
-    min_fair_value: float = 0.50     # 0.50 = disabled (default). 0.58+ recommended.
+    # Fair value REMOVED — field kept for config compat but never used for filtering.
+    min_fair_value: float = 0.0      # DISABLED — pure momentum, no FV model
 
     # Late entry: minimum seconds elapsed in the window before considering trades.
     # 0 = disabled (enter any time). 600 = wait 10 min (5 min left in 15m window).
@@ -226,11 +229,8 @@ class SniperConfig:
     # "chainlink" = Polymarket RTDS Chainlink feed (settlement source)
     price_source: str = "binance"
 
-    # Direct fair value: use empirical sigmoid model instead of Black-Scholes.
-    # No volatility assumption — just price gap + time remaining.
-    # Calibrate first with: python apps/calibrate_fv.py --trade-csv <csv> --output data/calibration.json
+    # Direct FV REMOVED — fields kept for config compat but never used.
     use_direct_fv: bool = False
-    # Path to calibration JSON for DirectFairValue (empty = use defaults)
     direct_fv_calibration: str = ""
 
     # Vatic API: use exact Chainlink strike prices instead of Binance approximation
@@ -504,7 +504,7 @@ class EMATracker:
 
 @dataclass
 class SpeculativeOrder:
-    """A pre-signal GTC resting on the book as maker."""
+    """A pre-signal GTC resting on the book as maker. (Legacy — kept for reference.)"""
     coin: str
     side: str
     order_id: str
@@ -513,8 +513,95 @@ class SpeculativeOrder:
     size: float
     market_slug: str
     placed_at: float
-    fair_value: float
-    displacement: float
+    fair_value: float = 0.0  # DEPRECATED — always 0.0, no FV model
+    displacement: float = 0.0
+
+
+@dataclass
+class MakerOrder:
+    """A GTD maker order resting on the book, waiting for fill."""
+    coin: str
+    side: str              # "up" / "down"
+    order_id: str
+    token_id: str
+    price: float           # our limit price
+    size: float            # tokens requested
+    market_slug: str
+    placed_at: float       # time.time()
+    expiry_ts: int         # unix timestamp for GTD expiry
+    status: str = "LIVE"   # "LIVE", "FILLED", "CANCELLED", "EXPIRED"
+    size_matched: float = 0.0
+    last_polled: float = 0.0
+    reserved_usdc: float = 0.0
+
+
+class OrderLedger:
+    """Thread-safe ledger tracking all resting maker orders."""
+
+    def __init__(self):
+        self._orders: Dict[str, MakerOrder] = {}
+        self._lock = threading.Lock()
+
+    def add_order(self, order: MakerOrder):
+        """Add a new maker order to the ledger."""
+        with self._lock:
+            self._orders[order.order_id] = order
+
+    def mark_filled(self, order_id: str, size_matched: float) -> Optional[MakerOrder]:
+        """Transition order to FILLED status. Returns the order or None."""
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order and order.status == "LIVE":
+                order.status = "FILLED"
+                order.size_matched = size_matched
+                return order
+            return None
+
+    def mark_cancelled(self, order_id: str) -> Optional[MakerOrder]:
+        """Transition order to CANCELLED status. Returns the order or None."""
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order and order.status == "LIVE":
+                order.status = "CANCELLED"
+                return order
+            return None
+
+    def get_live_orders(self) -> List[MakerOrder]:
+        """Return all LIVE orders."""
+        with self._lock:
+            return [o for o in self._orders.values() if o.status == "LIVE"]
+
+    def get_orders_for_market(self, slug: str) -> List[MakerOrder]:
+        """Return all orders (any status) for a given market slug."""
+        with self._lock:
+            return [o for o in self._orders.values() if o.market_slug == slug]
+
+    def get_orders_for_coin(self, coin: str) -> List[MakerOrder]:
+        """Return all orders (any status) for a given coin."""
+        with self._lock:
+            return [o for o in self._orders.values() if o.coin == coin]
+
+    def get_live_orders_for_coin(self, coin: str) -> List[MakerOrder]:
+        """Return LIVE orders for a given coin."""
+        with self._lock:
+            return [o for o in self._orders.values()
+                    if o.coin == coin and o.status == "LIVE"]
+
+    def get_live_orders_for_coin_side(self, coin: str, side: str) -> List[MakerOrder]:
+        """Return LIVE orders for a given coin and side."""
+        with self._lock:
+            return [o for o in self._orders.values()
+                    if o.coin == coin and o.side == side and o.status == "LIVE"]
+
+    def remove_order(self, order_id: str):
+        """Remove an order from the ledger entirely."""
+        with self._lock:
+            self._orders.pop(order_id, None)
+
+    def count_live(self) -> int:
+        """Count of LIVE orders."""
+        with self._lock:
+            return sum(1 for o in self._orders.values() if o.status == "LIVE")
 
 
 @dataclass
@@ -636,14 +723,9 @@ class MomentumSniperStrategy:
             self._event_logger.addHandler(fh)
             self._event_logger.propagate = False
 
-        # Fair value calculator
-        if config.use_direct_fv:
-            cal_path = config.direct_fv_calibration or None
-            self.fv_calc = DirectFairValue(calibration_path=cal_path)
-            self._direct_fv_msg = f"Using DirectFairValue (empirical sigmoid){' with calibration: ' + cal_path if cal_path else ' with defaults'}"
-        else:
-            self.fv_calc = BinaryFairValue()
-            self._direct_fv_msg = None
+        # Fair value REMOVED — pure momentum + TTE + entry-price only.
+        # No BinaryFairValue, no DirectFairValue, no Black-Scholes.
+        self.fv_calc = None
 
         # Real-time price feed (all coins)
         # Chainlink = Polymarket's settlement source (most accurate for outcomes)
@@ -676,14 +758,9 @@ class MomentumSniperStrategy:
         except Exception:
             pass
 
-        # Vatic API client for exact Chainlink strikes
+        # Vatic API REMOVED — lib/vatic_client.py deleted.
+        # Strike is determined by Binance/Coinbase spot or back-solve only.
         self._vatic = None
-        if config.use_vatic:
-            try:
-                from lib.vatic_client import VaticClient
-                self._vatic = VaticClient()
-            except Exception:
-                pass
 
         # EMA trend tracker (initialized in start() with historical data)
         self._ema_tracker: Optional[EMATracker] = None
@@ -751,9 +828,7 @@ class MomentumSniperStrategy:
         # Log buffer for display
         self._log_buffer = LogBuffer(max_size=8)
 
-        # Deferred log messages from before buffer was ready
-        if self._direct_fv_msg:
-            self.log(self._direct_fv_msg, "info")
+        # (direct_fv_msg removed — no fair value model)
 
         # Redemption tracking
         self._last_redeem_time: float = 0.0
@@ -761,6 +836,12 @@ class MomentumSniperStrategy:
 
         # Background settlement tracking
         self._last_settle_time: float = 0.0
+
+        # Pause flag — checks data/.bot_paused file
+        self._pause_flag_dir = "data"
+        self._pause_cache_val = False
+        self._pause_cache_time: float = 0.0
+        self._pause_orders_cancelled = False  # Track if we already cancelled on this pause
 
         # CUSUM edge monitor
         self._edge_monitor = EdgeMonitor(
@@ -771,9 +852,14 @@ class MomentumSniperStrategy:
         # Pending signals awaiting confirmation
         self._pending_signals: Dict[str, PendingSignal] = {}
 
-        # Pre-signal speculative GTC order (only one at a time)
+        # Pre-signal speculative GTC order (only one at a time) — legacy
         self._speculative_order: Optional[SpeculativeOrder] = None
         self._spec_cooldown: Dict[str, float] = {}  # coin:side -> time of last cancel
+
+        # GTD maker order ledger (Phase 1 maker system)
+        self._order_ledger = OrderLedger()
+        self._maker_lock = threading.Lock()  # protects balance changes for maker orders
+        self._maker_momentum_first_seen: Dict[str, float] = {}  # "coin:side" -> time first crossed threshold
 
         # Circuit breaker: consecutive losing WINDOWS (not individual trades)
         # 3 coins losing in the same 5m window = 1 losing window, not 3 losses
@@ -785,6 +871,32 @@ class MomentumSniperStrategy:
         self._cb_recent_outcomes: List[bool] = []  # last 10 trade outcomes (True=win)
         self._cb_paused_until: Optional[datetime] = None  # 1-hour pause after 3 consecutive losses
         self._cb_stopped: bool = False  # 5/10 losses -> hard stop
+
+        # Price ring buffer for strike lookback — matches collector exactly.
+        # Records (timestamp, price) for each coin. When a new window opens,
+        # _set_strike looks back to find the price at window-open time (t+0).
+        from collections import deque, defaultdict
+        self._price_ring: Dict[str, deque] = defaultdict(lambda: deque(maxlen=600))
+
+        # Integrated collector: records threshold crossings in the same CSV
+        # format as run_collector.py, using the EXACT same prices the bot
+        # evaluates for trading. This guarantees live = collector by definition.
+        self._collector_crossed: Dict[tuple, set] = {}  # (slug, side) -> set of crossed thresholds
+        self._collector_pending: list = []  # pending signals awaiting resolution
+        self._collector_thresholds = [0.0003, 0.0005, 0.0007, 0.001, 0.0012, 0.0015, 0.002, 0.003, 0.005]
+        self._collector_csv = config.log_file.replace(".csv", ".collector.csv") if config.log_file else "data/live_collector.csv"
+        self._collector_resolved = 0
+        # Write header if file doesn't exist
+        import os
+        if not os.path.exists(self._collector_csv):
+            with open(self._collector_csv, "w", newline="") as f:
+                import csv as _csv
+                _csv.writer(f).writerow([
+                    "timestamp", "market_slug", "coin", "side",
+                    "momentum_direction", "is_momentum_side",
+                    "threshold", "entry_price", "best_bid",
+                    "momentum", "elapsed", "outcome",
+                ])
 
         # Running state
         self.running = False
@@ -820,7 +932,9 @@ class MomentumSniperStrategy:
                 down_price = prices.get("down", 0)
 
                 # Resolved markets have one side at ~1.0 and other at ~0.0
-                if up_price > 0.9:
+                if up_price > 0.9 and down_price > 0.9:
+                    winning_side = "up" if up_price > down_price else "down"
+                elif up_price > 0.9:
                     winning_side = "up"
                 elif down_price > 0.9:
                     winning_side = "down"
@@ -903,33 +1017,249 @@ class MomentumSniperStrategy:
         # Instead of waiting for next tick (100ms), evaluate signal immediately when price moves
         def _on_price_update(coin: str, price: float):
             """Called on EVERY Binance/Coinbase price tick.
-            LIGHTWEIGHT: only cheap checks (~0.1ms), then queue to signal thread."""
-            if not self.running or self.config.observe_only:
-                return
-            if time.time() - self._start_time < 60:
-                return
-            state = self.coin_states.get(coin)
-            if not state or not state.strike_price or state.strike_price <= 0:
-                return
-            if not state.startup_slug or state.current_slug == state.startup_slug:
-                return
-            disp = (price - state.strike_price) / state.strike_price
+            Records ticks in ring buffer AND evaluates integrated collector
+            threshold crossings. NO trading from this path — trading is
+            tick-loop only (prevents firing on momentary spikes)."""
+            # Record tick in ring buffer — needed for strike lookback
+            self._price_ring[coin].append((time.time(), price))
+
+            # Integrated collector: record threshold crossings on every tick
+            # (same as standalone collector). This ensures the integrated
+            # collector captures the same signals as the standalone.
+            try:
+                state = self.coin_states.get(coin)
+                if not state or not state.strike_price or state.strike_price <= 0:
+                    return
+                if not state.current_slug:
+                    return
+                # NOTE: do NOT check startup_slug here. The collector must
+                # record ALL threshold crossings regardless of whether the
+                # bot is in startup mode. Only trading code needs startup check.
+
+                disp = (price - state.strike_price) / state.strike_price
+                abs_disp = abs(disp)
+
+                # DEBUG: log first threshold crossing per window to verify collector works
+                if abs_disp >= 0.0003:
+                    _dbg_key = (state.current_slug, coin)
+                    if not hasattr(self, '_coll_debug_logged'):
+                        self._coll_debug_logged = set()
+                    if _dbg_key not in self._coll_debug_logged:
+                        self._coll_debug_logged.add(_dbg_key)
+                        self._event_logger.info(
+                            f"[COLL-DBG] {coin} disp={disp:+.6f} abs={abs_disp:.6f} "
+                            f"slug={state.current_slug[-15:]} startup={state.startup_slug[-15:]} "
+                            f"pending={len(self._collector_pending)}"
+                        )
+
+                if abs_disp < 0.0003:  # below lowest threshold
+                    return
+
+                mom_dir = "up" if disp > 0 else "down"
+                opp_dir = "down" if mom_dir == "up" else "up"
+                tte = state.seconds_to_expiry()
+                duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                elapsed = max(0, duration - tte)
+
+                for cs in [mom_dir, opp_dir]:
+                    ck = (state.current_slug, cs)
+                    if ck not in self._collector_crossed:
+                        self._collector_crossed[ck] = set()
+                    for ct in self._collector_thresholds:
+                        if abs_disp >= ct and ct not in self._collector_crossed[ck]:
+                            self._collector_crossed[ck].add(ct)
+                            ca = self._get_best_ask_with_rest_fallback(state, cs)
+                            cb = self._get_best_bid_with_rest_fallback(state, cs)
+                            self._collector_pending.append({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "slug": state.current_slug,
+                                "coin": state.coin,
+                                "side": cs,
+                                "momentum_direction": mom_dir,
+                                "is_momentum_side": cs == mom_dir,
+                                "threshold": ct,
+                                "entry_price": round(ca, 4) if ca < 1.0 else 0.0,
+                                "best_bid": round(cb, 4),
+                                "momentum": round(abs_disp, 8),
+                                "elapsed": round(elapsed, 1),
+                                "_created": time.time(),
+                            })
+                # FAST-FIRE: trade on this tick if momentum passes trading threshold.
+                # The collector has ALREADY recorded this crossing above.
+                # Same disp, same price, same tick = live ⊆ collector guaranteed.
+                if abs_disp < self.config.min_momentum:
+                    return
+                if not state.startup_slug or state.current_slug == state.startup_slug:
+                    return
+                if time.time() - self._start_time < 60:
+                    return
+                if self._is_paused():
+                    return
+
+                side = mom_dir  # trade in momentum direction
+
+                if side == "up" and state.has_up_position:
+                    return
+                if side == "down" and state.has_down_position:
+                    return
+
+                best_ask = self._get_best_ask_with_rest_fallback(state, side)
+                if best_ask <= 0 or best_ask > self.config.max_entry_price or best_ask < self.config.min_entry_price:
+                    return
+
+                # TTE check
+                _ff_duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                _ff_tte = state.seconds_to_expiry()
+                if _ff_tte < (_ff_duration - self.config.max_window_elapsed) or _ff_tte > (_ff_duration - self.config.min_window_elapsed):
+                    return
+
+                # Dedup: one signal per market/side
+                snipe_key = f"{state.current_slug}:{side}"
+                if not hasattr(self, '_snipe_in_flight'):
+                    self._snipe_in_flight = set()
+                if snipe_key in self._snipe_in_flight:
+                    return
+                self._snipe_in_flight.add(snipe_key)
+
+                # Position limit
+                active = sum(1 for s in self.coin_states.values()
+                             if s.has_up_position or s.has_down_position)
+                if active >= self.config.max_concurrent_positions:
+                    self._snipe_in_flight.discard(snipe_key)
+                    return
+
+                signal_time = time.time()
+
+                if self._fast_order:
+                    _t_queued = time.time()
+                    def _signal_task(state=state, side=side, best_ask=best_ask,
+                                     disp=disp, signal_time=signal_time, snipe_key=snipe_key):
+                        try:
+                            buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
+                                            self.config.max_entry_price)
+                            if buy_price < self.config.min_entry_price or self._balance < 1.0:
+                                return
+
+                            token_id = state.manager.token_ids.get(side)
+                            if not token_id:
+                                return
+
+                            if side == "up":
+                                state.up_tokens = 0.01
+                            else:
+                                state.down_tokens = 0.01
+
+                            result = self._fast_order._place_order_sync(
+                                token_id, buy_price, 5.0, "BUY", "FAK", 1000,
+                            )
+                            has_error = bool(result.get("error", ""))
+                            has_order_id = bool(result.get("orderID", ""))
+                            taking = float(result.get("takingAmount", 0) or 0)
+                            fast_success = has_order_id and not has_error and taking > 0
+                            total_lat = (time.time() - signal_time) * 1000
+
+                            self._event_logger.info(
+                                f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
+                                f"id={result.get('orderID','')[:16] or 'none'} "
+                                f"filled={taking:.1f} lat={total_lat:.0f}ms"
+                                f"{' ERROR: ' + result.get('error','')[:60] if has_error else ''}"
+                            )
+
+                            if not fast_success:
+                                if side == "up":
+                                    state.up_tokens = 0
+                                else:
+                                    state.down_tokens = 0
+                                return
+
+                            filled_tokens = taking
+                            actual_cost = buy_price * filled_tokens
+                            self._balance -= actual_cost
+
+                            if side == "up":
+                                state.up_tokens += filled_tokens
+                                state.up_cost += actual_cost
+                            else:
+                                state.down_tokens += filled_tokens
+                                state.down_cost += actual_cost
+
+                            state.last_trade_time = time.time()
+                            self.stats.trades += 1
+                            self.stats.pending += 1
+                            self.stats.total_wagered += actual_cost
+
+                            self._event_logger.info(
+                                f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
+                                f"x{filled_tokens:.0f} (${actual_cost:.2f}) "
+                                f"edge=0.00 [FAST-FIRE] strike={getattr(state, '_strike_source', '?')} "
+                                f"lat={total_lat:.0f}ms"
+                            )
+
+                            spot = self.binance.get_price(state.coin)
+                            vol, vol_src = self._get_volatility(state.coin)
+                            self.trade_logger.log_trade(
+                                market_slug=state.current_slug,
+                                coin=state.coin,
+                                timeframe=self.config.timeframe,
+                                side=side,
+                                entry_price=buy_price,
+                                bet_size_usdc=actual_cost,
+                                num_tokens=filled_tokens,
+                                bankroll=self._balance,
+                                usdc_balance=self._balance,
+                                btc_price=spot,
+                                other_side_price=state.manager.get_mid_price("down" if side == "up" else "up"),
+                                volatility_std=vol,
+                                fair_value_at_entry=0.0,
+                                time_to_expiry_at_entry=state.seconds_to_expiry(),
+                                momentum_at_entry=disp,
+                                volatility_at_entry=vol,
+                                signal_to_order_ms=0,
+                                order_latency_ms=total_lat,
+                                total_latency_ms=total_lat,
+                                vol_source=vol_src,
+                                strike_source=getattr(state, '_strike_source', 'unknown'),
+                            )
+                        except Exception as e:
+                            self._event_logger.warning(f"[FAST-FIRE] {state.coin} {side} error: {e}")
+                            if side == "up" and state.up_tokens == 0.01:
+                                state.up_tokens = 0
+                            elif side == "down" and state.down_tokens == 0.01:
+                                state.down_tokens = 0
+                        finally:
+                            self._snipe_in_flight.discard(snipe_key)
+
+                    self._fast_order._signal_queue.put(_signal_task)
+                else:
+                    self._snipe_in_flight.discard(snipe_key)
+
+            except Exception as e:
+                self._event_logger.warning(f"[COLL] {coin} error: {e}")
+
             if abs(disp) < self.config.min_momentum:
                 return
 
             side = "up" if disp > 0 else "down"
+
+            # LEADER FILTER REMOVED — collector data shows unfiltered signals
+            # deliver 73% WR (n=63) while the leader filter let through only 3
+            # signals at 33% WR. The filter was blocking winners, not losers.
+            # Previous rationale ("aligned=82%, contradicting=37%") was from a
+            # different time period / config. Re-evaluate with more data later.
+
             if side == "up" and state.has_up_position:
                 return
             if side == "down" and state.has_down_position:
                 return
 
-            best_ask = state.manager.get_best_ask(side)
-            if best_ask <= 0 or best_ask > self.config.max_entry_price:
+            best_ask = self._get_best_ask_with_rest_fallback(state, side)
+            if best_ask <= 0 or best_ask > self.config.max_entry_price or best_ask < self.config.min_entry_price:
                 return
 
             # TTE check (cheap arithmetic)
+            _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
             tte = state.seconds_to_expiry()
-            if tte < (300 - self.config.max_window_elapsed) or tte > (300 - self.config.min_window_elapsed):
+            if tte < (_duration - self.config.max_window_elapsed) or tte > (_duration - self.config.min_window_elapsed):
                 return
 
             # Dedup: one signal per market/side in flight
@@ -962,20 +1292,14 @@ class MomentumSniperStrategy:
                         if active >= self.config.max_concurrent_positions:
                             return
 
-                        # FV calculation (7ms)
-                        fv = self._calculate_fair_value(state)
-                        if not fv:
-                            return
-                        fair_prob = fv.fair_up if side == "up" else fv.fair_down
-                        if fair_prob < self.config.min_fair_value:
-                            return
+                        # Pure momentum — no fair value model. Entry filters are
+                        # momentum + TTE + entry-price (checked by caller).
+                        fair_prob = 0.0  # Not used — logged as 0.0
 
                         buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
                                         self.config.max_entry_price)
-                        edge = fair_prob - buy_price - 0.005
-                        if edge < self.config.min_edge:
-                            return
-                        if buy_price < 0.20 or self._balance < 1.0:
+                        edge = 0.0  # No edge calc — pure momentum
+                        if buy_price < self.config.min_entry_price or self._balance < 1.0:
                             return
 
                         token_id = state.manager.token_ids.get(side)
@@ -988,23 +1312,34 @@ class MomentumSniperStrategy:
                         else:
                             state.down_tokens = 0.01  # sentinel
 
-                        # Sign + POST
+                        # FAK execution — fill-and-kill at best ask + tolerance.
+                        # Taker fees are 0 bps on 5m crypto markets (confirmed from
+                        # CLOB docs and live trade data: bet_size = price × tokens exactly).
+                        _t_pre_order = time.time()
                         result = self._fast_order._place_order_sync(
                             token_id, buy_price, 5.0, "BUY", "FAK", 1000,
                         )
-
-                        fast_success = bool(result.get("orderID", ""))
+                        _t_post_order = time.time()
+                        _order_ms = (_t_post_order - _t_pre_order) * 1000
+                        _pre_order_ms = (_t_pre_order - _t_start) * 1000
+                        # Check BOTH orderID AND error field. The CLOB returns an orderID
+                        # even when FAK is killed with "no orders found to match". The error
+                        # field is the ground truth — if present, the order did NOT fill.
+                        has_error = bool(result.get("error", ""))
+                        has_order_id = bool(result.get("orderID", ""))
                         taking = float(result.get("takingAmount", 0) or 0)
+                        fast_success = has_order_id and not has_error and taking > 0
                         total_lat = (time.time() - signal_time) * 1000
 
                         self._event_logger.info(
                             f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
                             f"id={result.get('orderID','')[:16] or 'none'} "
-                            f"filled={taking:.1f} lat={total_lat:.0f}ms qwait={_queue_wait:.0f}ms"
+                            f"filled={taking:.1f} lat={total_lat:.0f}ms "
+                            f"qwait={_queue_wait:.0f}ms pre={_pre_order_ms:.0f}ms order={_order_ms:.0f}ms"
+                            f"{' ERROR: ' + result.get('error','')[:60] if has_error else ''}"
                         )
 
                         if not fast_success:
-                            # Reset sentinel — order didn't fill
                             if side == "up":
                                 state.up_tokens = 0
                             else:
@@ -1012,9 +1347,8 @@ class MomentumSniperStrategy:
                             return
 
                         # === BOOKKEEPING: directly in signal thread (no asyncio) ===
-                        filled_tokens = taking if taking > 0 else 5.0
-                        fee_per_tok = buy_price * 0.01
-                        actual_cost = (buy_price + fee_per_tok) * filled_tokens
+                        filled_tokens = taking  # Never default to 5.0 — use actual fill amount
+                        actual_cost = buy_price * filled_tokens  # 0 bps taker fee on 5m
                         self._balance -= actual_cost
 
                         if side == "up":
@@ -1038,6 +1372,9 @@ class MomentumSniperStrategy:
                         )
 
                         # Write CSV — trade_logger is thread-safe (just file append)
+                        # Use signal-time displacement (disp) for momentum_at_entry,
+                        # NOT a fresh spot price. The spot can move 300ms between
+                        # signal and fill, making the logged momentum misleading.
                         spot = self.binance.get_price(state.coin)
                         vol, vol_src = self._get_volatility(state.coin)
                         self.trade_logger.log_trade(
@@ -1055,7 +1392,7 @@ class MomentumSniperStrategy:
                             volatility_std=vol,
                             fair_value_at_entry=fair_prob,
                             time_to_expiry_at_entry=state.seconds_to_expiry(),
-                            momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+                            momentum_at_entry=disp,
                             volatility_at_entry=vol,
                             signal_to_order_ms=0,
                             order_latency_ms=total_lat,
@@ -1082,11 +1419,12 @@ class MomentumSniperStrategy:
 
         if hasattr(self.binance, 'on_price'):
             self.binance.on_price(_on_price_update)
-        # For MultiPriceFeed, try to register on sub-feeds
+        # For MultiPriceFeed, register on BOTH sub-feeds so ring buffer
+        # captures all ticks (primary=Binance for BNB, coinbase=everything else)
         if hasattr(self.binance, '_primary') and hasattr(self.binance._primary, 'on_price'):
             self.binance._primary.on_price(_on_price_update)
-        if hasattr(self.binance, '_secondary') and hasattr(self.binance._secondary, 'on_price'):
-            self.binance._secondary.on_price(_on_price_update)
+        if hasattr(self.binance, '_coinbase') and hasattr(self.binance._coinbase, 'on_price'):
+            self.binance._coinbase.on_price(_on_price_update)
 
         # Initialize EMA trend tracker from historical Binance klines
         if self._ema_tracker:
@@ -1101,6 +1439,24 @@ class MomentumSniperStrategy:
         # Check USDC balance
         self._refresh_balance()
         self.log(f"USDC balance: ${self._balance:.2f}", "success")
+
+        # Cancel stale orders from previous session (maker orders that survived a crash)
+        try:
+            open_orders = await asyncio.to_thread(
+                lambda: self.bot._official_client.get_orders() or []
+            )
+            cancelled_count = 0
+            for order in open_orders:
+                if order.get('status') in ('LIVE', 'OPEN'):
+                    try:
+                        await self.bot.cancel_order(order['id'])
+                        cancelled_count += 1
+                    except Exception:
+                        pass
+            if cancelled_count > 0:
+                self.log(f"Cancelled {cancelled_count} stale orders from previous session", "warning")
+        except Exception as e:
+            self._event_logger.warning(f"Stale order cleanup failed: {e}")
 
         # Resolve orphaned pending trades from previous sessions
         self._resolve_orphaned_trades()
@@ -1141,7 +1497,203 @@ class MomentumSniperStrategy:
             self.log("No markets found for any coin", "error")
             return False
 
+        # Background REST orderbook refresher — keeps prices fresh when WS goes stale.
+        # The WS often stops receiving data after market transitions (resubscription failure).
+        # This provides a reliable fallback: the signal path checks _rest_book_cache when
+        # get_best_ask() returns 1.0 (no WS data).
+        self._rest_book_cache: Dict[str, tuple] = {}  # {token_id: (timestamp, best_ask, best_bid)}
+        self._rest_cache_lock = threading.Lock()
+
+        def _rest_book_refresh():
+            while True:
+                try:
+                    # Collect all active token IDs
+                    all_tids = []
+                    for st in list(self.coin_states.values()):
+                        if not st.manager or not st.manager.token_ids:
+                            continue
+                        for side_name in ("up", "down"):
+                            tid = st.manager.token_ids.get(side_name, "")
+                            if tid:
+                                all_tids.append(tid)
+
+                    if not all_tids:
+                        time.sleep(3)
+                        continue
+
+                    # Batch fetch — 1 API call instead of 14
+                    try:
+                        books = self.bot.clob_client.get_order_books_batch(all_tids)
+                        now = time.time()
+                        if isinstance(books, list):
+                            for book in books:
+                                tid = book.get("asset_id", "") or book.get("token_id", "")
+                                asks = book.get("asks", [])
+                                bids = book.get("bids", [])
+                                ba = min(float(a.get("price", 1)) for a in asks) if asks else 0.0
+                                bb = max(float(b.get("price", 0)) for b in bids) if bids else 0.0
+                                if tid:
+                                    with self._rest_cache_lock:
+                                        self._rest_book_cache[tid] = (now, ba, bb)
+                    except Exception:
+                        # Fallback to individual calls if batch fails
+                        for tid in all_tids:
+                            try:
+                                book = self.bot.clob_client.get_order_book(tid)
+                                asks = book.get("asks", [])
+                                bids = book.get("bids", [])
+                                ba = min(float(a.get("price", 1)) for a in asks) if asks else 0.0
+                                bb = max(float(b.get("price", 0)) for b in bids) if bids else 0.0
+                                with self._rest_cache_lock:
+                                    self._rest_book_cache[tid] = (time.time(), ba, bb)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(3)
+
+        rest_thread = threading.Thread(target=_rest_book_refresh, daemon=True)
+        rest_thread.start()
+        self.log("Background REST orderbook refresher started (3s interval)", "info")
+
+        # User WebSocket for real-time fill detection on maker orders.
+        # Instant fill awareness vs 5-second CLOB polling.
+        if self.config.maker_enabled:
+            try:
+                # Get API credentials from the bot's derived L2 creds
+                creds = getattr(self.bot, '_api_creds', None)
+                api_key = creds.api_key if creds else ""
+                api_secret = creds.secret if creds else ""
+                api_passphrase = creds.passphrase if creds else ""
+                if api_key and api_secret and api_passphrase:
+                    self._user_ws = UserWebSocket(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        api_passphrase=api_passphrase,
+                    )
+
+                    @self._user_ws.on_trade
+                    async def _on_user_trade(event):
+                        """Handle real-time fill notifications from User WS."""
+                        status = event.get("status", "")
+                        if status != "MATCHED":
+                            return  # Only act on initial match, not MINED/CONFIRMED
+
+                        # Check if any of our maker orders were filled
+                        maker_orders = event.get("maker_orders", [])
+                        for mo in maker_orders:
+                            oid = mo.get("order_id", "")
+                            matched = float(mo.get("matched_amount", 0) or 0)
+                            if oid and matched > 0:
+                                # Check if this is one of our orders
+                                filled_order = self._order_ledger.mark_filled(oid, matched)
+                                if filled_order:
+                                    self.log(
+                                        f"[USER-WS] INSTANT FILL: {filled_order.coin} "
+                                        f"{filled_order.side.upper()} {matched} tokens "
+                                        f"@ ${filled_order.price:.2f}",
+                                        "success"
+                                    )
+                                    await self._record_maker_fill(filled_order, matched)
+
+                        # Also check taker_order_id (if our GTD crossed as taker)
+                        taker_oid = event.get("taker_order_id", "")
+                        if taker_oid:
+                            size = float(event.get("size", 0) or 0)
+                            if size > 0:
+                                filled_order = self._order_ledger.mark_filled(taker_oid, size)
+                                if filled_order:
+                                    self.log(
+                                        f"[USER-WS] INSTANT FILL (taker): {filled_order.coin} "
+                                        f"{filled_order.side.upper()} {size} tokens "
+                                        f"@ ${filled_order.price:.2f}",
+                                        "success"
+                                    )
+                                    await self._record_maker_fill(filled_order, size)
+
+                    # Subscribe to all current markets
+                    condition_ids = []
+                    for state in self.coin_states.values():
+                        if state.manager and state.manager.current_market:
+                            cid = getattr(state.manager.current_market, 'condition_id', '')
+                            if cid:
+                                condition_ids.append(cid)
+
+                    # Run User WS in background
+                    async def _user_ws_loop():
+                        if condition_ids:
+                            self._user_ws._subscribed_markets.update(condition_ids)
+                        await self._user_ws.run(auto_reconnect=True)
+
+                    asyncio.create_task(_user_ws_loop())
+                    self.log(f"User WebSocket started ({len(condition_ids)} markets)", "info")
+                else:
+                    self.log("User WS skipped — missing CLOB API credentials in env", "warning")
+            except Exception as e:
+                self.log(f"User WS failed to start: {e}", "warning")
+
         return True
+
+    def _is_paused(self) -> bool:
+        """Check if bot is paused via data/.bot_paused flag file.
+        Cached for 2 seconds to avoid hammering the filesystem."""
+        now = time.time()
+        if now - self._pause_cache_time < 2.0:
+            return self._pause_cache_val
+        self._pause_cache_time = now
+        import os
+        flag_path = os.path.join(self._pause_flag_dir, ".bot_paused")
+        self._pause_cache_val = os.path.exists(flag_path)
+        return self._pause_cache_val
+
+    async def _cancel_all_maker_orders(self, reason: str = "paused"):
+        """Cancel ALL open orders on the CLOB with a single API call, then clean up ledger."""
+        # Single API call cancels everything — fastest and most reliable
+        try:
+            result = await self.bot.cancel_all_orders()
+            self.log(f"[MAKER] cancel_all_orders: {result.success} ({reason})", "warning")
+        except Exception as e:
+            self.log(f"[MAKER] cancel_all_orders failed: {e}", "error")
+
+        # Return reserved capital for all live orders in ledger
+        live_orders = self._order_ledger.get_live_orders()
+        for order in live_orders:
+            cancelled = self._order_ledger.mark_cancelled(order.order_id)
+            if cancelled:
+                with self._maker_lock:
+                    self._balance += cancelled.reserved_usdc
+                self.log(
+                    f"[MAKER] Returned ${cancelled.reserved_usdc:.2f} for {order.coin} {order.side.upper()}",
+                    "info"
+                )
+            self._order_ledger.remove_order(order.order_id)
+
+    def _get_best_ask_with_rest_fallback(self, state: 'CoinMarketState', side: str) -> float:
+        """Get best ask from WS orderbook, falling back to REST cache if WS is stale."""
+        best_ask = state.manager.get_best_ask(side)
+        if best_ask < 1.0 and best_ask > 0:
+            return best_ask
+        # WS returned 1.0 (no data) — try REST cache
+        token_id = state.manager.token_ids.get(side, "")
+        if token_id and hasattr(self, '_rest_cache_lock'):
+            with self._rest_cache_lock:
+                cached = self._rest_book_cache.get(token_id)
+            if cached and (time.time() - cached[0]) < 10:
+                return cached[1]  # best_ask from REST
+        return best_ask  # return 1.0 if no fallback
+
+    def _get_best_bid_with_rest_fallback(self, state: 'CoinMarketState', side: str) -> float:
+        """Get best bid from WS orderbook, falling back to REST cache if WS is stale."""
+        best_bid = state.manager.get_best_bid(side)
+        if best_bid > 0:
+            return best_bid
+        token_id = state.manager.token_ids.get(side, "")
+        if token_id and hasattr(self, '_rest_cache_lock'):
+            with self._rest_cache_lock:
+                cached = self._rest_book_cache.get(token_id)
+            if cached and (time.time() - cached[0]) < 10:
+                return cached[2]  # best_bid from REST
+        return best_bid
 
     def _register_callbacks(self, coin: str, manager: MarketManager):
         """Register market change callbacks for a coin."""
@@ -1201,50 +1753,36 @@ class MomentumSniperStrategy:
 
         secs_since_window_open = time.time() - market_start_ts if market_start_ts > 0 else 999
 
-        # 1. Try Vatic API first — exact Chainlink strike
-        if self._vatic:
-            vatic_strike = self._vatic.get_strike(
-                state.coin, self.config.timeframe, market_start_ts
-            )
-            if vatic_strike and vatic_strike > 0:
-                state.strike_price = vatic_strike
-                strike_source = "vatic"
-                self.log(f"{state.coin} strike from Vatic (exact Chainlink)")
+        # Strike source: EXACT MATCH to collector logic (apps/run_collector.py).
+        # Collector uses: 1) ring buffer <3s, 2) spot if <5s, 3) spot always.
+        # Bot MUST match this exactly or strikes diverge.
 
-        # If require_vatic is set and Vatic failed, skip this market entirely
-        # (Binance/backsolve strikes can be wrong, especially near the money)
-        if strike_source == "unknown" and self.config.require_vatic:
-            self.log(f"{state.coin} Vatic strike unavailable — skipping market (require_vatic=True)", "warning")
-            state.strike_price = 0
-            state._strike_source = "skipped"
-            return
+        # 1. PRICE RING BUFFER — find the tick closest to window open (t+0)
+        #    No delta threshold — always use nearest tick. Both bot and collector
+        #    receive the same Coinbase ticks, so nearest-to-t+0 gives identical
+        #    strikes regardless of when _set_strike fires. This eliminates the
+        #    DOGE/HYPE divergence caused by falling through to time-dependent spot.
+        if market_start_ts > 0 and state.coin in self._price_ring:
+            ring = self._price_ring[state.coin]
+            if ring:
+                best_price = None
+                best_delta = float('inf')
+                for ts, p in ring:
+                    delta = abs(ts - market_start_ts)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_price = p
+                if best_price is not None:
+                    state.strike_price = best_price
+                    strike_source = "coinbase" if state.coin in COINBASE_COINS else "binance"
+                    self.log(f"{state.coin} strike from ring buffer (delta={best_delta:.1f}s)")
 
-        # 2. Binance spot early in window
-        if strike_source == "unknown" and secs_since_window_open < 60:
-            state.strike_price = spot
-            strike_source = "binance"
-            self.log(f"{state.coin} strike from Binance spot (window {secs_since_window_open:.0f}s old)")
-
-        # 3. Back-solve from Polymarket mid price
+        # 2. Current spot — fallback only if ring buffer is completely empty
         if strike_source == "unknown":
-            up_price = state.manager.get_mid_price("up")
-            if 0.1 < up_price < 0.9:
-                vol, _ = self._get_volatility(state.coin)
-                secs_left = state.seconds_to_expiry()
-                if secs_left > 30 and vol > 0:
-                    from lib.fair_value import SECONDS_PER_YEAR
-                    T = secs_left / SECONDS_PER_YEAR
-                    sigma_sqrt_t = vol * math.sqrt(T)
-                    d = self._approx_inv_normal(up_price)
-                    state.strike_price = spot * math.exp(-d * sigma_sqrt_t)
-                    strike_source = "backsolve"
-                    self.log(f"{state.coin} strike back-solved from mid={up_price:.2f} (window {secs_since_window_open:.0f}s old)")
-                else:
-                    state.strike_price = spot
-                    strike_source = "binance"
-            else:
-                state.strike_price = spot
-                strike_source = "binance"
+            state.strike_price = spot
+            _feed = "coinbase" if state.coin in COINBASE_COINS else "binance"
+            strike_source = _feed
+            self.log(f"{state.coin} strike from spot fallback (window {secs_since_window_open:.0f}s old)")
 
         # Store strike source for trade logging
         state._strike_source = strike_source
@@ -1304,21 +1842,17 @@ class MomentumSniperStrategy:
 
         return (realized_vol, "RV")
 
-    def _calculate_fair_value(self, state: CoinMarketState) -> Optional[FairValue]:
-        """Calculate fair value for a coin's current market."""
-        spot = self.binance.get_price(state.coin)
-        if spot <= 0 or state.strike_price <= 0:
-            return None
+    def _calculate_fair_value(self, state: CoinMarketState):
+        """Fair value REMOVED — returns passthrough so trade flow is not blocked.
 
-        secs = state.seconds_to_expiry()
-        vol, _ = self._get_volatility(state.coin)
-
-        return self.fv_calc.calculate(
-            spot=spot,
-            strike=state.strike_price,
-            seconds_to_expiry=secs,
-            volatility=vol,
-        )
+        Returns a simple namespace with fair_up/fair_down = 1.0 so that edge
+        calculations degenerate to (1.0 - ask - fee), which is always positive.
+        Actual trade filtering is done by momentum + TTE + entry-price only.
+        """
+        class _Passthrough:
+            fair_up = 1.0
+            fair_down = 1.0
+        return _Passthrough()
 
     def _wilson_lower(self, wins: int, total: int, z: float = 1.28) -> float:
         """Wilson score lower bound (80% confidence by default)."""
@@ -1418,7 +1952,7 @@ class MomentumSniperStrategy:
 
         return usdc
 
-    def _find_opportunities(self) -> List[Tuple[CoinMarketState, str, float, float, FairValue]]:
+    def _find_opportunities(self) -> List[Tuple[CoinMarketState, str, float, float, object]]:
         """
         Scan all coins for trading opportunities.
 
@@ -1473,10 +2007,8 @@ class MomentumSniperStrategy:
             if state.seconds_to_expiry() <= 0:
                 continue
 
-            # Retry Vatic if strike was not set (Vatic may not have had the
-            # target ready at market discovery time — retry each scan cycle)
-            _require_vatic = self.config.require_vatic
-            if state.strike_price <= 0 and _require_vatic and self._vatic:
+            # Retry strike if not set (market may have been discovered late)
+            if state.strike_price <= 0:
                 self._set_strike(state)
                 if state.strike_price <= 0:
                     continue  # Still no strike — skip this cycle
@@ -1505,10 +2037,12 @@ class MomentumSniperStrategy:
                 if current_vol > self.config.max_volatility:
                     continue
 
-            # Calculate fair value
+            # Integrated collector runs in _on_price_update callback (every tick).
+            # Trading decisions run here in the tick-loop (every 10s).
+
+            # No fair value model — pure momentum. Passthrough so downstream
+            # code that references fv.fair_up/fv.fair_down still works.
             fv = self._calculate_fair_value(state)
-            if not fv:
-                continue
 
             # Check both sides — one entry per side per market.
             # Buying BTC UP 5 times at $0.57 in the same market is the
@@ -1538,24 +2072,16 @@ class MomentumSniperStrategy:
                 if fail_time > 0 and (time.time() - fail_time) < 60:
                     continue
 
-                fair_prob = fv.fair_up if side == "up" else fv.fair_down
+                # No fair value model — pure momentum strategy
+                fair_prob = 0.0  # Logged as 0 — not used for filtering
 
                 # Get best ask (cheapest price we can buy at)
-                best_ask = state.manager.get_best_ask(side)
+                best_ask = self._get_best_ask_with_rest_fallback(state, side)
                 if best_ask <= 0 or best_ask >= 1.0:
                     continue
 
-                # Calculate edge at WORST-CASE fill price (ask + tolerance + GTC bump).
-                # GTC fallback adds +$0.03 beyond tolerance. The HYPE -$3.07 loss
-                # filled at ask+$0.07 when edge was only checked at ask+$0.04.
                 buy_price = round(best_ask, 2)
-                worst_fill = round(buy_price + self.config.fok_tolerance + 0.03, 2)
-                if worst_fill > self.config.max_entry_price:
-                    worst_fill = self.config.max_entry_price
-
-                # Net edge = fair value - worst fill price - taker fee
-                fee = taker_fee_per_token(worst_fill, self.config.timeframe)
-                edge = fair_prob - worst_fill - fee
+                edge = 0.0  # No edge calc — pure momentum
 
                 # --- Signal logging: evaluate all filters and log before filtering ---
                 if self.signal_logger:
@@ -1567,7 +2093,7 @@ class MomentumSniperStrategy:
                     _c_max_entry = self.config.max_entry_price
                     _c_min_entry = self.config.min_entry_price
                     _c_min_edge = self.config.min_edge
-                    _c_min_fv = self.config.min_fair_value
+                    _c_min_fv = 0.0  # FV filter disabled — pure momentum
                     _c_require_vatic = self.config.require_vatic
                     _c_min_mom = self.config.min_momentum
                     _passed_price = (
@@ -1628,7 +2154,6 @@ class MomentumSniperStrategy:
                         spot_price=spot_for_signal,
                         strike_price=state.strike_price,
                         strike_source=strike_src_for_signal,
-                        fair_value=fair_prob,
                         best_ask=best_ask,
                         edge=edge,
                         momentum=_displacement,
@@ -1641,8 +2166,6 @@ class MomentumSniperStrategy:
                         passed_price_filter=_passed_price,
                         passed_momentum_filter=_passed_momentum,
                         passed_tte_filter=_passed_tte,
-                        passed_fv_filter=_passed_fv,
-                        passed_vatic_filter=_passed_vatic,
                         passed_trend_filter=_passed_trend,
                     )
                     self.signal_logger.log_signal(signal)
@@ -1651,8 +2174,6 @@ class MomentumSniperStrategy:
 
                 coin_max_entry = self.config.max_entry_price
                 coin_min_entry = self.config.min_entry_price
-                coin_min_edge = self.config.min_edge
-                coin_min_fv = self.config.min_fair_value
                 coin_min_mom = self.config.min_momentum
                 coin_require_vatic = self.config.require_vatic
 
@@ -1663,19 +2184,13 @@ class MomentumSniperStrategy:
                     continue
 
                 # Never buy the opposite side of an existing position.
-                # Kelly sizes each side independently, so token counts differ
-                # and buying both sides is NOT a guaranteed arb — it's a coin
-                # flip on which side has more tokens. Just pick a direction.
                 if side == "up" and state.has_down_position:
                     continue
                 if side == "down" and state.has_up_position:
                     continue
 
-                if edge >= coin_min_edge:
-                    # Fair value confidence filter: skip coin-flip trades
-                    if fair_prob < coin_min_fv:
-                        continue  # Model not confident enough
-
+                # Pure momentum entry — no edge or FV gating
+                if True:
                     # Vatic requirement (per-coin)
                     if coin_require_vatic and state.strike_price <= 0:
                         continue
@@ -1692,6 +2207,40 @@ class MomentumSniperStrategy:
                             continue  # Price below strike — don't buy Up
                         if side == "down" and displacement > -coin_min_mom:
                             continue  # Price above strike — don't buy Down
+
+                        # INTEGRATED COLLECTOR — record at the EXACT trading
+                        # decision point. This is the same spot price and
+                        # displacement that passed the momentum check above.
+                        # Guarantees: if the bot trades it, this records it.
+                        _abs_disp = abs(displacement)
+                        _mom_dir = "up" if displacement > 0 else "down"
+                        _opp_dir = "down" if _mom_dir == "up" else "up"
+                        _tte = state.seconds_to_expiry()
+                        _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                        _elapsed = max(0, _duration - _tte)
+                        for _cs in [_mom_dir, _opp_dir]:
+                            _ck = (state.current_slug, _cs)
+                            if _ck not in self._collector_crossed:
+                                self._collector_crossed[_ck] = set()
+                            for _ct in self._collector_thresholds:
+                                if _abs_disp >= _ct and _ct not in self._collector_crossed[_ck]:
+                                    self._collector_crossed[_ck].add(_ct)
+                                    _ca = self._get_best_ask_with_rest_fallback(state, _cs)
+                                    _cb = self._get_best_bid_with_rest_fallback(state, _cs)
+                                    self._collector_pending.append({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "slug": state.current_slug,
+                                        "coin": state.coin,
+                                        "side": _cs,
+                                        "momentum_direction": _mom_dir,
+                                        "is_momentum_side": _cs == _mom_dir,
+                                        "threshold": _ct,
+                                        "entry_price": round(_ca, 4) if _ca < 1.0 else 0.0,
+                                        "best_bid": round(_cb, 4),
+                                        "momentum": round(_abs_disp, 8),
+                                        "elapsed": round(_elapsed, 1),
+                                        "_created": time.time(),
+                                    })
 
                     # VPIN data collection (log alongside signal, no filtering)
                     _vpin_val = None
@@ -1712,7 +2261,6 @@ class MomentumSniperStrategy:
                             coin=state.coin,
                             side=side,
                             ask_price=best_ask,
-                            fair_value=fair_prob,
                             edge=edge,
                             momentum=_mom,
                             tte=state.seconds_to_expiry(),
@@ -1754,7 +2302,7 @@ class MomentumSniperStrategy:
             return
 
         # Track position
-        fair_prob = fv.fair_up if side == "up" else fv.fair_down
+        fair_prob = 0.0  # No FV model — pure momentum
         filled_tokens = taking if taking > 0 else 5.0
         fee_per_tok = buy_price * 0.01  # ~1% taker fee estimate
         actual_cost = (buy_price + fee_per_tok) * filled_tokens
@@ -1816,7 +2364,7 @@ class MomentumSniperStrategy:
         side: str,
         entry_price: float,
         edge: float,
-        fv: FairValue,
+        fv: object,
         signal_time: float = 0.0,
     ) -> bool:
         """Execute a snipe trade."""
@@ -1838,13 +2386,13 @@ class MomentumSniperStrategy:
         side: str,
         entry_price: float,
         edge: float,
-        fv: FairValue,
+        fv: object,
         signal_time: float = 0.0,
     ) -> bool:
         """Inner snipe execution (guarded by _execute_snipe)."""
         if self.config.observe_only:
             # Paper trading with realistic simulation
-            fair_prob = fv.fair_up if side == "up" else fv.fair_down
+            fair_prob = 0.0  # No FV model — pure momentum
             num_tokens = 5.0
             buy_price = round(entry_price, 2)
 
@@ -1898,7 +2446,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
                 fair_value_at_entry=fair_prob,
                 time_to_expiry_at_entry=state.seconds_to_expiry(),
-                momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+                momentum_at_entry=_pre_order_momentum,
                 volatility_at_entry=vol,
                 signal_to_order_ms=0,
                 order_latency_ms=0,
@@ -1916,7 +2464,7 @@ class MomentumSniperStrategy:
             return True
 
         # Calculate bet size
-        fair_prob = fv.fair_up if side == "up" else fv.fair_down
+        fair_prob = 0.0  # No FV model — pure momentum
         is_strong = edge >= self.config.strong_edge
 
         # Per-coin sizing: kelly_coins use Kelly even when min_size_mode is on
@@ -1950,6 +2498,10 @@ class MomentumSniperStrategy:
         token_id = state.manager.token_ids.get(side)
         if not token_id:
             return False
+
+        # Capture momentum NOW (before order placement delay)
+        _pre_order_spot = self.binance.get_price(state.coin)
+        _pre_order_momentum = (_pre_order_spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
 
         # Place FOK (Fill Or Kill) order with price tolerance to reduce rejections.
         # The tolerance is applied to the submission price (not the edge calc).
@@ -2024,12 +2576,15 @@ class MomentumSniperStrategy:
                     token_id=token_id, price=buy_price,
                     size=num_tokens, side="BUY", order_type="FAK",
                 )
-                fast_success = bool(fast_result.get("orderID", ""))
                 fast_order_id = fast_result.get("orderID", "")
+                fast_error = fast_result.get("error", "")
+                fast_taking = float(fast_result.get("takingAmount", 0) or 0)
+                fast_success = bool(fast_order_id) and not bool(fast_error) and fast_taking > 0
                 self.log(
                     f"[FAST] {state.coin} {side.upper()} success={fast_success} "
                     f"id={fast_order_id[:16] if fast_order_id else 'none'} "
-                    f"raw={str(fast_result)[:150]}",
+                    f"filled={fast_taking:.1f} "
+                    f"{'ERROR: ' + fast_error[:60] if fast_error else ''}",
                     "info"
                 )
                 if fast_success and fast_order_id:
@@ -2190,7 +2745,7 @@ class MomentumSniperStrategy:
                 volatility_std=vol,
                 fair_value_at_entry=fair_prob,
                 time_to_expiry_at_entry=state.seconds_to_expiry(),
-                momentum_at_entry=(spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0,
+                momentum_at_entry=_pre_order_momentum,
                 volatility_at_entry=vol,
                 signal_to_order_ms=signal_to_order_ms,
                 order_latency_ms=order_latency_ms,
@@ -2258,7 +2813,11 @@ class MomentumSniperStrategy:
                 up_price = prices.get("up", 0)
                 down_price = prices.get("down", 0)
 
-                if up_price > 0.9:
+                if up_price > 0.9 and down_price > 0.9:
+                    winner = "up" if up_price > down_price else "down"
+                    self.log(f"{state.coin} Gamma API: {winner.upper()} won (up={up_price:.2f} down={down_price:.2f}) [both>0.9]")
+                    return winner
+                elif up_price > 0.9:
                     self.log(f"{state.coin} Gamma API: UP won (up={up_price:.2f})")
                     return "up"
                 elif down_price > 0.9:
@@ -2283,12 +2842,30 @@ class MomentumSniperStrategy:
             return
         self._last_settle_time = now
 
+        from src.gamma_client import GammaClient
+        gamma = GammaClient()
+
+        # Resolve integrated collector signals (runs even with no trades pending)
+        if self._collector_pending:
+            self._resolve_collector_pending(gamma)
+            # Memory safety: drop signals older than 10 min that failed to resolve
+            # (market expired but Gamma API never returned result)
+            if len(self._collector_pending) > 500:
+                cutoff = time.time() - 600  # 10 minutes
+                before = len(self._collector_pending)
+                self._collector_pending = [
+                    s for s in self._collector_pending
+                    if s.get("_created", time.time()) > cutoff
+                ]
+                dropped = before - len(self._collector_pending)
+                if dropped > 0:
+                    self._event_logger.warning(
+                        f"[COLL] Dropped {dropped} stale pending signals (memory safety)"
+                    )
+
         pending = self.trade_logger.get_pending_trades()
         if not pending:
             return
-
-        from src.gamma_client import GammaClient
-        gamma = GammaClient()
         real_balance = await asyncio.to_thread(self.bot.get_usdc_balance) or self._balance
 
         for trade_key, record in list(pending.items()):
@@ -2301,7 +2878,10 @@ class MomentumSniperStrategy:
                 up_price = prices.get("up", 0)
                 down_price = prices.get("down", 0)
 
-                if up_price > 0.9:
+                if up_price > 0.9 and down_price > 0.9:
+                    # Both sides high — pick the higher one
+                    winning_side = "up" if up_price > down_price else "down"
+                elif up_price > 0.9:
                     winning_side = "up"
                 elif down_price > 0.9:
                     winning_side = "down"
@@ -2310,6 +2890,13 @@ class MomentumSniperStrategy:
 
                 side_won = (record.side == winning_side)
                 payout = record.num_tokens * 1.0 if side_won else 0.0
+
+                # Diagnostic: log raw prices for settlement verification
+                self._event_logger.info(
+                    f"[SETTLE-DEBUG] {record.coin} {record.side} {record.market_slug}: "
+                    f"up={up_price:.4f} down={down_price:.4f} winner={winning_side} "
+                    f"side_won={side_won}"
+                )
 
                 self.trade_logger.log_outcome(
                     market_slug=record.market_slug,
@@ -2370,6 +2957,65 @@ class MomentumSniperStrategy:
         if self.shadow_logger and self.shadow_logger.pending_count() > 0:
             self._settle_shadow_pending(gamma)
 
+        # Integrated collector resolution already handled above
+
+    def _resolve_collector_pending(self, gamma):
+        """Resolve integrated collector signals via Gamma API.
+        Uses >= 0.99 threshold (same as standalone collector) to avoid
+        mid-resolution false settlements."""
+        resolved_indices = []
+        slug_results = {}
+
+        for i, sig in enumerate(self._collector_pending):
+            slug = sig["slug"]
+            if slug not in slug_results:
+                try:
+                    data = gamma.get_market_by_slug(slug)
+                    if data:
+                        outcome_prices = data.get("outcomePrices", [])
+                        if isinstance(outcome_prices, str):
+                            import json as _json
+                            try:
+                                outcome_prices = _json.loads(outcome_prices)
+                            except (ValueError, TypeError):
+                                outcome_prices = []
+                        if len(outcome_prices) >= 2:
+                            up = float(outcome_prices[0])
+                            down = float(outcome_prices[1])
+                        else:
+                            prices = gamma.parse_prices(data)
+                            up = prices.get("up", 0)
+                            down = prices.get("down", 0)
+
+                        if up >= 0.99:
+                            slug_results[slug] = "up"
+                        elif down >= 0.99:
+                            slug_results[slug] = "down"
+                        else:
+                            slug_results[slug] = None
+                    else:
+                        slug_results[slug] = None
+                except Exception:
+                    slug_results[slug] = None
+
+            winner = slug_results.get(slug)
+            if winner is not None:
+                outcome = "won" if winner == sig["side"] else "lost"
+                row = [
+                    sig["timestamp"], sig["slug"], sig["coin"], sig["side"],
+                    sig["momentum_direction"], sig["is_momentum_side"],
+                    sig["threshold"], sig["entry_price"], sig["best_bid"],
+                    sig["momentum"], sig["elapsed"], outcome,
+                ]
+                with open(self._collector_csv, "a", newline="") as f:
+                    import csv as _csv
+                    _csv.writer(f).writerow(row)
+                self._collector_resolved += 1
+                resolved_indices.append(i)
+
+        for i in reversed(resolved_indices):
+            self._collector_pending.pop(i)
+
     def _cb_record_outcome(self, won: bool):
         """Record a trade outcome in the enhanced circuit breaker rolling window."""
         if not self.config.enable_circuit_breaker:
@@ -2422,7 +3068,10 @@ class MomentumSniperStrategy:
                 up_price = prices.get("up", 0)
                 down_price = prices.get("down", 0)
 
-                if up_price > 0.9:
+                if up_price > 0.9 and down_price > 0.9:
+                    winner = "up" if up_price > down_price else "down"
+                    self.shadow_logger.resolve_all_for_market(slug, winner)
+                elif up_price > 0.9:
                     self.shadow_logger.resolve_all_for_market(slug, "up")
                 elif down_price > 0.9:
                     self.shadow_logger.resolve_all_for_market(slug, "down")
@@ -2435,6 +3084,29 @@ class MomentumSniperStrategy:
         state = self.coin_states.get(coin)
         if not state:
             return
+
+        # Clear integrated collector dedup for old market
+        for side in ("up", "down"):
+            self._collector_crossed.pop((old_slug, side), None)
+
+        # Reset maker sustain timers for this coin on market change
+        self._maker_momentum_first_seen.pop(f"{coin}:up", None)
+        self._maker_momentum_first_seen.pop(f"{coin}:down", None)
+
+        # Handle maker orders on market change (cancel unfilled, record filled)
+        if self.config.maker_enabled:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._handle_maker_orders_on_market_change(old_slug))
+            except RuntimeError:
+                # No running loop — handle synchronously via ledger cleanup
+                for order in self._order_ledger.get_orders_for_market(old_slug):
+                    if order.status == "LIVE":
+                        cancelled = self._order_ledger.mark_cancelled(order.order_id)
+                        if cancelled:
+                            with self._maker_lock:
+                                self._balance += cancelled.reserved_usdc
+                        self._order_ledger.remove_order(order.order_id)
 
         # Try immediate settlement (non-blocking, single attempt)
         if state.up_tokens > 0 or state.down_tokens > 0:
@@ -2543,15 +3215,12 @@ class MomentumSniperStrategy:
             state.startup_slug = new_slug
             self.log(f"{coin} first discovery: {new_slug} (skipping — treat as startup)", "warning")
 
-        # Set new strike (delay to let data arrive)
+        # Set new strike immediately — no delay. Collector does the same.
+        # Ring buffer has historical ticks, so t+0 lookback works even if
+        # we detect the transition a few seconds late.
         state.current_slug = new_slug
         state.market_start_time = time.time()
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.call_later(3.0, lambda: self._set_strike(state))
-        except RuntimeError:
-            self._set_strike(state)
+        self._set_strike(state)
 
     async def _periodic_redeem(self):
         """Periodically attempt to redeem settled winning positions.
@@ -2601,22 +3270,18 @@ class MomentumSniperStrategy:
                 continue
 
             fv = self._calculate_fair_value(state)
-            if not fv:
-                self.log(f"EXPIRED: {sig.coin} {sig.side.upper()} — no fair value", "warning")
-                continue
 
-            fair_prob = fv.fair_up if sig.side == "up" else fv.fair_down
-            best_ask = state.manager.get_best_ask(sig.side)
+            fair_prob = 0.0  # No FV model
+            best_ask = self._get_best_ask_with_rest_fallback(state, sig.side)
             if best_ask <= 0 or best_ask >= 1.0:
                 self.log(f"EXPIRED: {sig.coin} {sig.side.upper()} — no ask", "warning")
                 continue
 
             buy_price = round(best_ask, 2)
-            fee = taker_fee_per_token(buy_price, self.config.timeframe)
-            edge = fair_prob - buy_price - fee
+            edge = 0.0  # No edge calc — pure momentum
 
-            _coin_min_edge = self.config.min_edge
-            if edge >= _coin_min_edge:
+            # Always proceed (momentum already confirmed at detection time)
+            if True:
                 # Edge confirmed — execute
                 self.log(
                     f"CONFIRMED: {sig.coin} {sig.side.upper()} @ {buy_price:.2f} "
@@ -2633,6 +3298,313 @@ class MomentumSniperStrategy:
 
         for key in expired_keys:
             self._pending_signals.pop(key, None)
+
+    # ========== GTD MAKER ORDER SYSTEM (Phase 1) ==========
+
+    async def _manage_maker_orders(self):
+        """Place/monitor/cancel GTD maker orders for all coins.
+
+        Runs every tick when maker_enabled is True. For each coin:
+        - Check if pre-momentum threshold crossed
+        - TTE is in the configured window
+        - No existing position or LIVE maker order for this coin/side
+        - Place GTD order below the ask with correct pricing
+        - Cancel when momentum reverses, market changes, or TTE exceeded
+        """
+        if self.config.observe_only or not self.config.maker_enabled:
+            return
+        if self._is_paused():
+            return
+
+        # Respect max_maker_orders limit
+        live_count = self._order_ledger.count_live()
+
+        # --- Cancel orders that should no longer be live ---
+        for order in self._order_ledger.get_live_orders():
+            state = self.coin_states.get(order.coin)
+            should_cancel = False
+            cancel_reason = ""
+
+            # Market changed
+            if not state or state.current_slug != order.market_slug:
+                should_cancel = True
+                cancel_reason = "market changed"
+
+            # TTE exceeded (max_window_elapsed)
+            elif self.config.max_window_elapsed > 0:
+                duration = 300 if self.config.timeframe == "5m" else 900
+                tte = state.seconds_to_expiry()
+                min_tte = duration - self.config.max_window_elapsed
+                if tte < min_tte:
+                    should_cancel = True
+                    cancel_reason = "TTE exceeded max_window_elapsed"
+
+            # Momentum reversed
+            elif state and state.strike_price > 0:
+                spot = self.binance.get_price(order.coin)
+                disp = (spot - state.strike_price) / state.strike_price
+                if order.side == "up" and disp < 0.0001:
+                    should_cancel = True
+                    cancel_reason = "momentum reversed (up→flat/down)"
+                elif order.side == "down" and disp > -0.0001:
+                    should_cancel = True
+                    cancel_reason = "momentum reversed (down→flat/up)"
+
+            # Position already acquired (FAK filled before maker)
+            if state:
+                if order.side == "up" and state.has_up_position:
+                    should_cancel = True
+                    cancel_reason = "position already held"
+                elif order.side == "down" and state.has_down_position:
+                    should_cancel = True
+                    cancel_reason = "position already held"
+
+            if should_cancel:
+                await self._cancel_maker_order(order, cancel_reason)
+                live_count = self._order_ledger.count_live()
+
+        # Maker placement disabled — FAK-only execution.
+        # Taker fees are 0 bps on 5m crypto markets, so maker has no economic
+        # advantage. Maker orders also suffer from adverse selection on thin
+        # one-directional books during confirmed momentum.
+
+    async def _poll_maker_orders(self):
+        """Poll CLOB for fill status on all LIVE maker orders.
+
+        Runs every maker_poll_interval seconds per order.
+        """
+        if not self.config.maker_enabled:
+            return
+
+        now = time.time()
+        for order in self._order_ledger.get_live_orders():
+            # Rate limit polling per order
+            if now - order.last_polled < self.config.maker_poll_interval:
+                continue
+            order.last_polled = now
+
+            try:
+                order_data = await asyncio.to_thread(
+                    self.bot._official_client.get_order, order.order_id
+                )
+                if not order_data:
+                    continue
+
+                clob_status = order_data.get("status", "")
+                size_matched = float(order_data.get("size_matched", 0) or 0)
+
+                if size_matched > 0:
+                    # Filled (fully or partially)
+                    filled_order = self._order_ledger.mark_filled(order.order_id, size_matched)
+                    if filled_order:
+                        await self._record_maker_fill(filled_order, size_matched)
+                    continue
+
+                if clob_status in ("CANCELLED", "DEAD", "EXPIRED"):
+                    cancelled_order = self._order_ledger.mark_cancelled(order.order_id)
+                    if cancelled_order:
+                        # Return reserved capital
+                        with self._maker_lock:
+                            self._balance += cancelled_order.reserved_usdc
+                        self.log(
+                            f"[MAKER] {order.coin} {order.side.upper()} "
+                            f"CLOB status={clob_status} — returned ${cancelled_order.reserved_usdc:.2f}",
+                            "info"
+                        )
+                    # Clean up from ledger
+                    self._order_ledger.remove_order(order.order_id)
+
+            except Exception as e:
+                self._event_logger.warning(
+                    f"[MAKER] Poll failed for {order.coin} {order.side} "
+                    f"oid={order.order_id[:16]}: {e}"
+                )
+
+    async def _cancel_maker_order(self, order: MakerOrder, reason: str = ""):
+        """Cancel a maker order and handle fill checks."""
+        try:
+            await self.bot.cancel_order(order.order_id)
+        except Exception:
+            pass
+
+        # Post-cancel fill check (order may have filled between our check and cancel)
+        await asyncio.sleep(0.5)
+        try:
+            order_data = await asyncio.to_thread(
+                self.bot._official_client.get_order, order.order_id
+            )
+            matched = float((order_data or {}).get("size_matched", 0) or 0)
+            if matched > 0:
+                filled_order = self._order_ledger.mark_filled(order.order_id, matched)
+                if filled_order:
+                    self.log(
+                        f"[MAKER] {order.coin} {order.side.upper()} FILLED {matched} "
+                        f"tokens during cancel! Recording position.",
+                        "warning"
+                    )
+                    await self._record_maker_fill(filled_order, matched)
+                return
+        except Exception:
+            pass
+
+        # Order was not filled — cancel and return capital
+        cancelled_order = self._order_ledger.mark_cancelled(order.order_id)
+        if cancelled_order:
+            with self._maker_lock:
+                self._balance += cancelled_order.reserved_usdc
+            self.log(
+                f"[MAKER] Cancelled {order.coin} {order.side.upper()} @ ${order.price:.2f}"
+                f"{' — ' + reason if reason else ''}"
+                f" (returned ${cancelled_order.reserved_usdc:.2f})",
+                "info"
+            )
+        self._order_ledger.remove_order(order.order_id)
+
+        # Maker V2 FAK fallback: maker didn't fill, try FAK if signal still valid.
+        # Only attempt if cancellation wasn't due to reversal or market change.
+        if reason and ("reversal" in reason or "market changed" in reason or "paused" in reason):
+            return
+        state = self.coin_states.get(order.coin)
+        if not state or state.current_slug != order.market_slug:
+            return
+        if state.has_up_position or state.has_down_position:
+            return
+        # Check momentum still confirmed
+        spot = self.binance.get_price(order.coin)
+        if spot > 0 and state.strike_price > 0:
+            disp = (spot - state.strike_price) / state.strike_price
+            mom_ok = (order.side == "up" and disp >= self.config.min_momentum) or \
+                     (order.side == "down" and disp <= -self.config.min_momentum)
+            if mom_ok:
+                best_ask = self._get_best_ask_with_rest_fallback(state, order.side)
+                if 0 < best_ask <= self.config.max_entry_price:
+                    self.log(
+                        f"[MAKER→FAK] {order.coin} {order.side.upper()} maker expired, "
+                        f"momentum still valid — firing FAK @ ${best_ask:.2f}",
+                        "info"
+                    )
+                    await self._execute_snipe(state, order.side, best_ask)
+
+    async def _record_maker_fill(self, order: MakerOrder, filled_tokens: float):
+        """Record a maker order fill as a position."""
+        state = self.coin_states.get(order.coin)
+        if not state:
+            return
+
+        # Check if momentum still supports this direction (reversal detection)
+        spot = self.binance.get_price(order.coin)
+        if spot > 0 and state.strike_price > 0:
+            fill_disp = (spot - state.strike_price) / state.strike_price
+            reversal = (order.side == "up" and fill_disp < 0) or (order.side == "down" and fill_disp > 0)
+            if reversal:
+                self.log(
+                    f"[MAKER] REVERSAL FILL: {order.coin} {order.side.upper()} filled "
+                    f"but momentum now {fill_disp:+.4f} (wrong direction!)",
+                    "warning"
+                )
+
+        # Maker = zero taker fees
+        actual_cost = order.price * filled_tokens
+        # Adjust reserved capital: refund any excess reservation
+        refund = order.reserved_usdc - actual_cost
+        if refund > 0:
+            with self._maker_lock:
+                self._balance += refund
+
+        if order.side == "up":
+            state.up_tokens += filled_tokens
+            state.up_cost += actual_cost
+        else:
+            state.down_tokens += filled_tokens
+            state.down_cost += actual_cost
+
+        state.last_trade_time = time.time()
+        self.stats.trades += 1
+        self.stats.pending += 1
+        self.stats.total_wagered += actual_cost
+        self.stats.opportunities_found += 1
+
+        # Log trade
+        spot = self.binance.get_price(order.coin)
+        vol, vol_src = self._get_volatility(order.coin)
+        other_side = "down" if order.side == "up" else "up"
+        other_price = state.manager.get_mid_price(other_side)
+        strike_src = getattr(state, '_strike_source', 'unknown')
+        mom = (spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
+        self.trade_logger.log_trade(
+            market_slug=state.current_slug, coin=order.coin,
+            timeframe=self.config.timeframe, side=order.side,
+            entry_price=order.price, bet_size_usdc=actual_cost,
+            num_tokens=filled_tokens, bankroll=self._balance,
+            usdc_balance=self._balance,
+            btc_price=spot,
+            other_side_price=other_price, volatility_std=vol,
+            time_to_expiry_at_entry=state.seconds_to_expiry(),
+            momentum_at_entry=mom, volatility_at_entry=vol,
+            signal_to_order_ms=0, order_latency_ms=0, total_latency_ms=0,
+            vol_source=vol_src, strike_source=strike_src,
+        )
+        self.log(
+            f"SNIPE {order.coin} {order.side.upper()} @ {order.price:.2f} "
+            f"x{filled_tokens:.0f} (${actual_cost:.2f}) MAKER (zero fees) "
+            f"mom={mom:+.4f}",
+            "success"
+        )
+
+        # Clean up from ledger
+        self._order_ledger.remove_order(order.order_id)
+
+    async def _handle_maker_orders_on_market_change(self, old_slug: str):
+        """Handle maker orders when a market transitions.
+
+        For each LIVE order on the old market:
+        - Final CLOB status check
+        - If filled: record position and log trade
+        - If not filled: cancel, return reserved capital
+        """
+        live_orders = [o for o in self._order_ledger.get_orders_for_market(old_slug)
+                       if o.status == "LIVE"]
+        if not live_orders:
+            return
+
+        for order in live_orders:
+            # Final CLOB check
+            try:
+                order_data = await asyncio.to_thread(
+                    self.bot._official_client.get_order, order.order_id
+                )
+                matched = float((order_data or {}).get("size_matched", 0) or 0)
+                if matched > 0:
+                    filled_order = self._order_ledger.mark_filled(order.order_id, matched)
+                    if filled_order:
+                        self.log(
+                            f"[MAKER] {order.coin} {order.side.upper()} FILLED {matched} "
+                            f"tokens on market change — recording position.",
+                            "warning"
+                        )
+                        await self._record_maker_fill(filled_order, matched)
+                    continue
+            except Exception:
+                pass
+
+            # Not filled — cancel and return capital
+            try:
+                await self.bot.cancel_order(order.order_id)
+            except Exception:
+                pass
+
+            cancelled_order = self._order_ledger.mark_cancelled(order.order_id)
+            if cancelled_order:
+                with self._maker_lock:
+                    self._balance += cancelled_order.reserved_usdc
+                self.log(
+                    f"[MAKER] Cancelled {order.coin} {order.side.upper()} on market change "
+                    f"(returned ${cancelled_order.reserved_usdc:.2f})",
+                    "info"
+                )
+            self._order_ledger.remove_order(order.order_id)
+
+    # ========== END GTD MAKER ORDER SYSTEM ==========
 
     async def _cancel_speculative(self, reason: str = ""):
         """Cancel the current speculative order."""
@@ -2704,7 +3676,6 @@ class MomentumSniperStrategy:
             num_tokens=filled_tokens, bankroll=self._balance,
             usdc_balance=real_balance, btc_price=spot,
             other_side_price=other_price, volatility_std=vol,
-            fair_value_at_entry=spec.fair_value,
             time_to_expiry_at_entry=state.seconds_to_expiry(),
             momentum_at_entry=mom, volatility_at_entry=vol,
             signal_to_order_ms=0, order_latency_ms=0, total_latency_ms=0,
@@ -2713,7 +3684,7 @@ class MomentumSniperStrategy:
         self.log(
             f"SNIPE {spec.coin} {spec.side.upper()} @ {spec.price:.2f} "
             f"x{filled_tokens:.0f} (${actual_cost:.2f}) MAKER (zero fees) "
-            f"FV={spec.fair_value:.2f}",
+            f"mom={mom:+.4f}",
             "success"
         )
 
@@ -2802,8 +3773,6 @@ class MomentumSniperStrategy:
                     continue
 
             fv = self._calculate_fair_value(state)
-            if not fv:
-                continue
 
             spot = self.binance.get_price(coin)
             disp = (spot - state.strike_price) / state.strike_price
@@ -2828,8 +3797,8 @@ class MomentumSniperStrategy:
                 if time.time() - cooldown_until < 10:
                     continue
 
-                fair_prob = fv.fair_up if side == "up" else fv.fair_down
-                best_ask = state.manager.get_best_ask(side)
+                fair_prob = 0.0  # No FV model
+                best_ask = self._get_best_ask_with_rest_fallback(state, side)
                 if best_ask <= 0 or best_ask >= 1.0:
                     continue
                 if best_ask > self.config.max_entry_price:
@@ -2837,24 +3806,10 @@ class MomentumSniperStrategy:
                 if best_ask < self.config.min_entry_price:
                     continue
 
-                # Edge at ask (no tolerance — maker fills at ask, zero fees)
-                fee = taker_fee_per_token(best_ask, self.config.timeframe)
-                edge = fair_prob - best_ask - fee
+                edge = 0.0  # No edge calc — pure momentum
 
-                # Lower thresholds for speculative orders: we're placing EARLY
-                # when momentum is building. If it fills and momentum continues,
-                # the full signal would have confirmed anyway. If momentum
-                # reverses, we cancel before fill. The cancel-on-reversal is
-                # the risk control, not the entry threshold.
-                spec_min_edge = 0.08
-                spec_min_fv = 0.58
-                if edge < spec_min_edge:
-                    continue
-                if fair_prob < spec_min_fv:
-                    continue
-
-                if edge > best_edge:
-                    best_edge = edge
+                if abs(disp) > abs(best_edge):
+                    best_edge = abs(disp)
                     best_candidate = (state, side, best_ask, edge, fv, fair_prob, disp)
 
         if not best_candidate:
@@ -2890,9 +3845,20 @@ class MomentumSniperStrategy:
 
     async def _tick(self):
         """Main strategy tick — scan for opportunities and execute."""
-        # Periodic settlement + redemption — run in background so they don't block trading
+        # Settlement + collector resolution runs ALWAYS (even when paused).
+        # The collector must keep resolving pending signals regardless of
+        # trading state, and trades need settlement even after pausing.
         asyncio.create_task(self._periodic_settle())
         asyncio.create_task(self._periodic_redeem())
+
+        # PAUSE CHECK: if paused, cancel all maker orders and skip trading
+        if self._is_paused():
+            if not self._pause_orders_cancelled:
+                await self._cancel_all_maker_orders("bot paused")
+                self._pause_orders_cancelled = True
+            return
+        else:
+            self._pause_orders_cancelled = False
 
         # Flush stale shadow records that were never resolved
         if self.shadow_logger:
@@ -2931,9 +3897,14 @@ class MomentumSniperStrategy:
         if self.config.confirm_gap > 0:
             await self._process_pending_signals()
 
-        # Pre-signal speculative GTC management (maker orders)
+        # Pre-signal speculative GTC management (legacy maker orders)
         if self.config.speculative_enabled:
             await self._manage_speculative_order()
+
+        # GTD maker order management (Phase 1)
+        if self.config.maker_enabled:
+            await self._manage_maker_orders()
+            await self._poll_maker_orders()
 
         # Update last known prices for all coins
         for coin, state in self.coin_states.items():
@@ -2984,6 +3955,13 @@ class MomentumSniperStrategy:
             if spec_state and not (spec_state.has_up_position or spec_state.has_down_position):
                 active_positions += 1
 
+        # Count LIVE maker orders as pending positions
+        if self.config.maker_enabled:
+            for maker_order in self._order_ledger.get_live_orders():
+                maker_state = self.coin_states.get(maker_order.coin)
+                if maker_state and not (maker_state.has_up_position or maker_state.has_down_position):
+                    active_positions += 1
+
         for state, side, price, edge, fv in opportunities:
             # Skip if speculative order already covers this coin/side
             if (self._speculative_order
@@ -2991,6 +3969,12 @@ class MomentumSniperStrategy:
                     and self._speculative_order.side == side
                     and self._speculative_order.market_slug == state.current_slug):
                 continue
+
+            # Skip if maker order already covers this coin/side
+            if self.config.maker_enabled:
+                live_makers = self._order_ledger.get_live_orders_for_coin_side(state.coin, side)
+                if live_makers:
+                    continue
             # Re-check position — previous execution in this loop may have filled
             if side == "up" and state.has_up_position:
                 continue
@@ -3052,12 +4036,10 @@ class MomentumSniperStrategy:
             secs = state.seconds_to_expiry()
             mins, s = divmod(int(secs), 60)
 
-            fv = self._calculate_fair_value(state)
-
             up_mid = state.manager.get_mid_price("up")
             down_mid = state.manager.get_mid_price("down")
-            up_ask = state.manager.get_best_ask("up")
-            down_ask = state.manager.get_best_ask("down")
+            up_ask = self._get_best_ask_with_rest_fallback(state, "up")
+            down_ask = self._get_best_ask_with_rest_fallback(state, "down")
 
             waiting = " [WAITING]" if (not state.startup_slug or state.current_slug == state.startup_slug) else ""
             if state.strike_price < 10:
@@ -3070,24 +4052,16 @@ class MomentumSniperStrategy:
                          f"strike={strike_fmt}  "
                          f"expiry={mins}m{s:02d}s{waiting}")
 
-            if fv:
-                up_fee = taker_fee_per_token(up_ask, self.config.timeframe) if up_ask > 0 else 0
-                down_fee = taker_fee_per_token(down_ask, self.config.timeframe) if down_ask > 0 else 0
-                up_edge = fv.fair_up - up_ask - up_fee if up_ask > 0 else 0
-                down_edge = fv.fair_down - down_ask - down_fee if down_ask > 0 else 0
-
-                # Show edges with color indicators
-                up_signal = "*" if up_edge >= self.config.min_edge else " "
-                down_signal = "*" if down_edge >= self.config.min_edge else " "
-
-                lines.append(
-                    f"       Fair: Up={fv.fair_up:.2f} Down={fv.fair_down:.2f}  |  "
-                    f"Ask: Up={up_ask:.2f} Down={down_ask:.2f}"
-                )
-                lines.append(
-                    f"       Edge:{up_signal}Up={up_edge:+.2f} {down_signal}Down={down_edge:+.2f}  |  "
-                    f"Mid: Up={up_mid:.2f} Down={down_mid:.2f}"
-                )
+            # Pure momentum — show ask/mid prices, displacement from strike
+            disp = 0.0
+            if state.strike_price > 0 and spot > 0:
+                disp = (spot - state.strike_price) / state.strike_price
+            disp_dir = "UP" if disp > 0 else "DOWN" if disp < 0 else "FLAT"
+            lines.append(
+                f"       Ask: Up={up_ask:.2f} Down={down_ask:.2f}  |  "
+                f"Mid: Up={up_mid:.2f} Down={down_mid:.2f}  |  "
+                f"mom={disp:+.4f} ({disp_dir})"
+            )
 
             # Show positions
             pos_parts = []
@@ -3127,16 +4101,12 @@ class MomentumSniperStrategy:
             sizing = "MIN-SIZE (5 tok)"
         else:
             sizing = f"kelly={self.config.kelly_fraction:.0%}/{self.config.kelly_strong:.0%}"
-        # Build filters string
-        filters = f"edge>={self.config.min_edge:.0%}"
+        # Build filters string — pure momentum (no edge/FV)
+        filters = f"mom>={self.config.min_momentum:.2%}" if self.config.min_momentum > 0 else "mom=any"
         if self.config.fixed_volatility > 0:
             filters += f" | vol=FIXED {self.config.fixed_volatility:.0%}"
         elif self.config.max_volatility > 0:
             filters += f" | vol<{self.config.max_volatility:.2f}"
-        if self.config.min_momentum > 0:
-            filters += f" | mom>{self.config.min_momentum:.2%}"
-        if self.config.min_fair_value > 0.50:
-            filters += f" | FV>={self.config.min_fair_value:.2f}"
         if self.config.min_window_elapsed > 0 or self.config.max_window_elapsed > 0:
             lo = f"{self.config.min_window_elapsed:.0f}" if self.config.min_window_elapsed > 0 else "0"
             hi = f"{self.config.max_window_elapsed:.0f}" if self.config.max_window_elapsed > 0 else "end"

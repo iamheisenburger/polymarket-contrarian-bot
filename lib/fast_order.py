@@ -21,10 +21,17 @@ import logging
 import queue
 import time
 import threading
+from math import floor, ceil
+from decimal import Decimal
 from typing import Optional, Callable
 
 import httpx
 from eth_account import Account
+
+try:
+    from py_order_utils.model import OrderData, BUY, SELL, POLY_GNOSIS_SAFE
+except ImportError:
+    OrderData = BUY = SELL = POLY_GNOSIS_SAFE = None
 
 logger = logging.getLogger(__name__)
 
@@ -216,8 +223,6 @@ class FastOrderClient:
     @staticmethod
     def _get_amounts(side: str, size: float, price: float):
         """Calculate maker/taker amounts — matches SDK's exact rounding."""
-        from math import floor, ceil
-        from decimal import Decimal
 
         def _round_normal(x, d):
             return round(x * (10**d)) / (10**d)
@@ -256,7 +261,6 @@ class FastOrderClient:
         """Sign an order using py_order_utils."""
         if not self._order_builder:
             raise RuntimeError("Order builder not available")
-        from py_order_utils.model import OrderData, BUY, SELL, POLY_GNOSIS_SAFE
         data = OrderData(
             maker=self._safe_address,
             taker="0x0000000000000000000000000000000000000000",
@@ -297,6 +301,7 @@ class FastOrderClient:
     def _place_order_sync(
         self, token_id: str, price: float, size: float,
         side: str, order_type: str, fee_rate_bps: int,
+        expiration: int = 0,
     ) -> dict:
         """Synchronous order: sign → HMAC → POST. ~27ms on warm connection."""
         t0 = time.monotonic()
@@ -306,6 +311,7 @@ class FastOrderClient:
             signed = self._sign_order(
                 token_id, maker_amount, taker_amount,
                 side, fee_rate_bps=fee_rate_bps,
+                expiration=expiration,
             )
         except Exception as e:
             logger.error(f"FastOrder signing failed: {e}")
@@ -313,11 +319,14 @@ class FastOrderClient:
 
         t_sign = time.monotonic()
 
+        # GTD orders are maker-only (postOnly=True, zero taker fees)
+        is_maker_order = order_type.upper() in ("GTD", "GTC")
+
         body = {
             "order": signed.dict(),
             "owner": self._l2_api_key,
             "orderType": order_type.upper(),
-            "postOnly": False,
+            "postOnly": is_maker_order,
         }
         body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         headers = self._build_headers("POST", "/order", body_str)

@@ -42,7 +42,6 @@ class SignalRecord:
     spot_price: float
     strike_price: float
     strike_source: str
-    fair_value: float
     best_ask: float
     edge: float
     momentum: float
@@ -57,8 +56,6 @@ class SignalRecord:
     passed_price_filter: bool = False
     passed_momentum_filter: bool = False
     passed_tte_filter: bool = False
-    passed_fv_filter: bool = False
-    passed_vatic_filter: bool = False
     passed_trend_filter: bool = False
 
     # Outcome (filled in later by resolve_outcome)
@@ -74,11 +71,11 @@ class SignalRecord:
 CSV_HEADERS = [
     "timestamp", "coin", "market_slug", "side",
     "spot_price", "strike_price", "strike_source",
-    "fair_value", "best_ask", "edge",
+    "best_ask", "edge",
     "momentum", "volatility", "vol_source",
     "time_to_expiry", "ema_trend", "entry_price",
     "passed_edge_filter", "passed_price_filter", "passed_momentum_filter",
-    "passed_tte_filter", "passed_fv_filter", "passed_vatic_filter",
+    "passed_tte_filter",
     "passed_trend_filter",
     "outcome", "pnl",
 ]
@@ -138,7 +135,6 @@ class SignalLogger:
                     f"{record.spot_price:.2f}",
                     f"{record.strike_price:.2f}",
                     record.strike_source,
-                    f"{record.fair_value:.6f}",
                     f"{record.best_ask:.4f}",
                     f"{record.edge:.4f}",
                     f"{record.momentum:.8f}",
@@ -151,8 +147,6 @@ class SignalLogger:
                     int(record.passed_price_filter),
                     int(record.passed_momentum_filter),
                     int(record.passed_tte_filter),
-                    int(record.passed_fv_filter),
-                    int(record.passed_vatic_filter),
                     int(record.passed_trend_filter),
                     record.outcome,
                     f"{record.pnl:.2f}",

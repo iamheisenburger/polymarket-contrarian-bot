@@ -399,6 +399,12 @@ class ClobClient(ApiClient):
             params={"token_id": token_id}
         )
 
+    def get_order_books_batch(self, token_ids: list) -> list:
+        """Get order books for multiple tokens in one POST /books call."""
+        if not token_ids:
+            return []
+        return self._request("POST", "/books", json_data=token_ids)
+
     def get_market_price(self, token_id: str) -> Dict[str, Any]:
         """
         Get current market price for a token.

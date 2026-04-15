@@ -254,11 +254,11 @@ class BinancePriceFeed:
 
         while self._running:
             try:
-                # Build combined stream URL
-                streams = [f"{COIN_SYMBOLS[c]}@aggTrade" for c in self.coins]
-                url = f"{BINANCE_WS_URL}/{'/'.join(streams)}"
-                if len(streams) > 1:
-                    url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+                # Build combined stream URL — aggTrade + bookTicker for faster detection
+                agg_streams = [f"{COIN_SYMBOLS[c]}@aggTrade" for c in self.coins]
+                book_streams = [f"{COIN_SYMBOLS[c]}@bookTicker" for c in self.coins]
+                streams = agg_streams + book_streams
+                url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
 
                 logger.info(f"BinancePriceFeed connecting: {self.coins}")
 
@@ -266,10 +266,19 @@ class BinancePriceFeed:
                     self._ws = ws
                     logger.info("BinancePriceFeed connected")
 
+                    _msg_count = 0
                     async for msg in ws:
                         if not self._running:
                             break
                         self._handle_message(msg)
+                        # Yield to event loop every 50 messages to prevent
+                        # starvation of Polymarket WS tasks.  Without this,
+                        # the high-frequency aggTrade stream keeps the
+                        # websockets recv buffer non-empty and `await recv()`
+                        # resolves synchronously, so this task never yields.
+                        _msg_count += 1
+                        if _msg_count % 50 == 0:
+                            await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break
@@ -281,7 +290,7 @@ class BinancePriceFeed:
         self._ws = None
 
     def _handle_message(self, raw: str):
-        """Process incoming WebSocket message."""
+        """Process incoming WebSocket message (aggTrade + bookTicker)."""
         try:
             data = json.loads(raw)
 
@@ -289,32 +298,59 @@ class BinancePriceFeed:
             if "stream" in data:
                 data = data["data"]
 
-            if data.get("e") != "aggTrade":
-                return
+            event_type = data.get("e", "")
 
-            symbol = data["s"].lower()  # e.g., "btcusdt"
-            price = float(data["p"])
-            ts = data["T"] / 1000.0  # Convert ms to seconds
+            if event_type == "aggTrade":
+                # Trade executed — update price and volatility sampling
+                symbol = data["s"].lower()
+                price = float(data["p"])
+                ts = data["T"] / 1000.0
 
-            # Find which coin this is
-            for coin, sym in COIN_SYMBOLS.items():
-                if sym == symbol and coin in self._state:
-                    state = self._state[coin]
-                    state.price = price
-                    state.last_update = ts
+                for coin, sym in COIN_SYMBOLS.items():
+                    if sym == symbol and coin in self._state:
+                        state = self._state[coin]
+                        state.price = price
+                        state.last_update = ts
 
-                    # Sample for volatility calculation
-                    if ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
-                        state.history.append(PricePoint(price=price, timestamp=ts))
-                        self._last_sample[coin] = ts
+                        # Volatility sampling (only on trades, not book changes)
+                        if ts - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
+                            state.history.append(PricePoint(price=price, timestamp=ts))
+                            self._last_sample[coin] = ts
 
-                    # Fire price callbacks (for instant signal detection)
-                    for cb in self._price_callbacks:
-                        try:
-                            cb(coin, price)
-                        except Exception:
-                            pass
-                    break
+                        # Fire callbacks
+                        for cb in self._price_callbacks:
+                            try:
+                                cb(coin, price)
+                            except Exception:
+                                pass
+                        break
+
+            elif "b" in data and "a" in data and "s" in data:
+                # bookTicker — faster price updates from order book changes
+                symbol = data["s"].lower()
+                bid = float(data["b"])
+                ask = float(data["a"])
+                if bid <= 0 or ask <= 0:
+                    return
+                mid = (bid + ask) / 2
+
+                for coin, sym in COIN_SYMBOLS.items():
+                    if sym == symbol and coin in self._state:
+                        state = self._state[coin]
+                        # Only update price if bookTicker mid differs meaningfully
+                        # This avoids noisy micro-updates that don't cross momentum threshold
+                        if state.price > 0 and abs(mid - state.price) / state.price < 0.00001:
+                            break  # less than 0.001% change, skip
+                        state.price = mid
+                        state.last_update = time.time()
+
+                        # Fire callbacks (same as aggTrade — triggers momentum check)
+                        for cb in self._price_callbacks:
+                            try:
+                                cb(coin, mid)
+                            except Exception:
+                                pass
+                        break
 
         except (json.JSONDecodeError, KeyError, ValueError):
             pass

@@ -195,6 +195,7 @@ class MarketWebSocket:
         reconnect_interval: float = 5.0,
         ping_interval: float = 20.0,
         ping_timeout: float = 10.0,
+        msg_skip_rate: int = 10,
     ):
         """
         Initialize WebSocket client.
@@ -204,11 +205,13 @@ class MarketWebSocket:
             reconnect_interval: Seconds between reconnection attempts
             ping_interval: Seconds between ping messages
             ping_timeout: Seconds to wait for pong response
+            msg_skip_rate: Process 1 in N messages (1=all, 10=default)
         """
         self.url = url
         self.reconnect_interval = reconnect_interval
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
+        self.msg_skip_rate = msg_skip_rate
 
         self._ws_connect, self._connection_closed = _load_websockets()
 
@@ -520,6 +523,22 @@ class MarketWebSocket:
                 # Reset empty counter on successful parse
                 empty_count = 0
 
+                # Always process book events (orderbook snapshots) — these are
+                # critical for price visibility. Only rate-limit price_change events.
+                def _should_process(msg_data):
+                    if isinstance(msg_data, list):
+                        return True  # always process arrays (may contain book events)
+                    et = msg_data.get("event_type", "")
+                    if et == "book":
+                        return True  # NEVER skip book snapshots
+                    if self.msg_skip_rate > 1 and msg_count % self.msg_skip_rate != 0:
+                        return False  # rate-limit price_change/trade events
+                    return True
+
+                if not _should_process(data):
+                    continue
+                await asyncio.sleep(0)
+
                 # Handle array of messages
                 if isinstance(data, list):
                     for item in data:
@@ -536,12 +555,10 @@ class MarketWebSocket:
             except self._connection_closed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 break
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse message: {e}")
-                empty_count += 1
-                if empty_count >= MAX_EMPTY_BEFORE_RECONNECT:
-                    logger.warning(f"Too many parse failures ({empty_count}), forcing reconnect")
-                    break
+            except json.JSONDecodeError:
+                # Non-JSON messages are normal on Polymarket (market transitions).
+                # Don't count toward empty_count — just skip silently.
+                continue
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 if self._on_error:
@@ -702,3 +719,249 @@ class OrderbookManager:
     async def close(self) -> None:
         """Close connection."""
         await self._ws.disconnect()
+
+
+# Callback types for User WebSocket
+TradeEventCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
+OrderEventCallback = Callable[[Dict[str, Any]], Union[None, Awaitable[None]]]
+
+
+class UserWebSocket:
+    """
+    Authenticated WebSocket client for Polymarket user events.
+
+    Receives real-time notifications when:
+    - Our maker orders get filled (trade events with status MATCHED/MINED/CONFIRMED)
+    - Our orders are placed, updated, or cancelled (order events)
+
+    This provides sub-100ms fill detection vs 5-second CLOB polling.
+
+    Example:
+        ws = UserWebSocket(api_key="...", api_secret="...", api_passphrase="...")
+
+        @ws.on_trade
+        async def handle_fill(event):
+            print(f"Filled: {event['size']} @ {event['price']}")
+
+        await ws.start(condition_ids=["0xabc..."])
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        api_passphrase: str,
+        reconnect_interval: float = 5.0,
+        ping_interval: float = 10.0,
+        ping_timeout: float = 10.0,
+    ):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
+        self.reconnect_interval = reconnect_interval
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+
+        self._ws_connect, self._connection_closed = _load_websockets()
+
+        self._ws = None
+        self._running = False
+        self._subscribed_markets: Set[str] = set()
+
+        # Callbacks
+        self._on_trade: Optional[TradeEventCallback] = None
+        self._on_order: Optional[OrderEventCallback] = None
+        self._on_error: Optional[ErrorCallback] = None
+
+        # Stats
+        self._msg_count = 0
+        self._fill_count = 0
+
+    @property
+    def is_connected(self) -> bool:
+        if self._ws is None:
+            return False
+        try:
+            from websockets.protocol import State
+            return self._ws.state == State.OPEN
+        except (ImportError, AttributeError):
+            try:
+                return self._ws.open
+            except AttributeError:
+                return False
+
+    def on_trade(self, callback: TradeEventCallback) -> TradeEventCallback:
+        """Set callback for trade events (fills)."""
+        self._on_trade = callback
+        return callback
+
+    def on_order(self, callback: OrderEventCallback) -> OrderEventCallback:
+        """Set callback for order events (placement/update/cancel)."""
+        self._on_order = callback
+        return callback
+
+    def on_error(self, callback: ErrorCallback) -> ErrorCallback:
+        self._on_error = callback
+        return callback
+
+    async def connect(self) -> bool:
+        try:
+            if self._ws_connect is None:
+                raise RuntimeError("websockets is not installed")
+            self._ws = await self._ws_connect(
+                WSS_USER_URL,
+                ping_interval=self.ping_interval,
+                ping_timeout=self.ping_timeout,
+            )
+            logger.info("User WebSocket connected")
+            return True
+        except Exception as e:
+            logger.error(f"User WebSocket connection failed: {e}")
+            if self._on_error:
+                self._on_error(e)
+            return False
+
+    async def disconnect(self):
+        self._running = False
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+            logger.info("User WebSocket disconnected")
+
+    async def subscribe(self, condition_ids: List[str]) -> bool:
+        """Subscribe to user events for given markets (condition IDs)."""
+        if not self.is_connected:
+            return False
+
+        self._subscribed_markets.update(condition_ids)
+
+        sub_msg = {
+            "auth": {
+                "apiKey": self.api_key,
+                "secret": self.api_secret,
+                "passphrase": self.api_passphrase,
+            },
+            "markets": list(self._subscribed_markets),
+            "type": "USER",
+        }
+
+        try:
+            await self._ws.send(json.dumps(sub_msg))
+            logger.info(f"User WS subscribed to {len(condition_ids)} markets")
+            return True
+        except Exception as e:
+            logger.error(f"User WS subscribe failed: {e}")
+            return False
+
+    async def subscribe_more(self, condition_ids: List[str]) -> bool:
+        """Subscribe to additional markets without replacing existing."""
+        if not self.is_connected or not condition_ids:
+            return False
+
+        self._subscribed_markets.update(condition_ids)
+
+        sub_msg = {
+            "markets": condition_ids,
+            "operation": "subscribe",
+        }
+
+        try:
+            await self._ws.send(json.dumps(sub_msg))
+            logger.info(f"User WS subscribed to {len(condition_ids)} more markets")
+            return True
+        except Exception as e:
+            logger.error(f"User WS subscribe_more failed: {e}")
+            return False
+
+    async def _handle_message(self, data: Dict[str, Any]) -> None:
+        event_type = data.get("event_type", "")
+
+        if event_type == "trade":
+            self._fill_count += 1
+            status = data.get("status", "")
+            size = data.get("size", "0")
+            price = data.get("price", "0")
+            side = data.get("side", "")
+            logger.info(
+                f"[USER-WS] Trade: {side} {size}@{price} status={status} "
+                f"(fill #{self._fill_count})"
+            )
+            if self._on_trade:
+                try:
+                    result = self._on_trade(data)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.error(f"Error in trade callback: {e}")
+
+        elif event_type == "order":
+            order_type = data.get("type", "")
+            oid = data.get("id", "")
+            size_matched = data.get("size_matched", "0")
+            logger.info(
+                f"[USER-WS] Order: {order_type} oid={oid[:20]}... matched={size_matched}"
+            )
+            if self._on_order:
+                try:
+                    result = self._on_order(data)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.error(f"Error in order callback: {e}")
+
+    async def _run_loop(self) -> None:
+        while self._running and self.is_connected:
+            try:
+                message = await asyncio.wait_for(
+                    self._ws.recv(),
+                    timeout=self.ping_interval + 5
+                )
+
+                if not message or not message.strip():
+                    continue
+
+                self._msg_count += 1
+                data = json.loads(message)
+
+                if isinstance(data, list):
+                    for item in data:
+                        await self._handle_message(item)
+                else:
+                    await self._handle_message(data)
+
+            except asyncio.TimeoutError:
+                continue
+            except self._connection_closed:
+                logger.warning("User WebSocket connection closed")
+                break
+            except json.JSONDecodeError:
+                continue
+            except Exception as e:
+                logger.error(f"User WS error: {e}")
+                if self._on_error:
+                    self._on_error(e)
+
+    async def run(self, auto_reconnect: bool = True) -> None:
+        self._running = True
+        while self._running:
+            if not await self.connect():
+                if auto_reconnect:
+                    await asyncio.sleep(self.reconnect_interval)
+                    continue
+                break
+
+            if self._subscribed_markets:
+                await self.subscribe(list(self._subscribed_markets))
+
+            await self._run_loop()
+
+            if not self._running:
+                break
+            if auto_reconnect:
+                logger.info(f"User WS reconnecting in {self.reconnect_interval}s...")
+                await asyncio.sleep(self.reconnect_interval)
+            else:
+                break
+
+    def stop(self):
+        self._running = False

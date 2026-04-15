@@ -43,6 +43,8 @@ if sys.platform == "win32":
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 logging.getLogger("src.bot").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
+# Enable FastOrder timing logs (sign/net breakdown)
+logging.getLogger("lib.fast_order").setLevel(logging.INFO)
 
 # Auto-load .env
 from dotenv import load_dotenv
@@ -121,6 +123,23 @@ def main():
     parser.add_argument(
         "--spec-momentum", type=float, default=0.0003,
         help="Momentum threshold for speculative GTC placement (default: 0.0003, lower than full signal 0.0005)"
+    )
+    parser.add_argument(
+        "--maker-enabled", action="store_true",
+        help="Enable GTD maker order system. Places resting orders below the ask "
+             "when pre-momentum is detected. Zero taker fees. (default: off)"
+    )
+    parser.add_argument(
+        "--max-maker-orders", type=int, default=3,
+        help="Max simultaneous resting maker orders (default: 3)"
+    )
+    parser.add_argument(
+        "--maker-pre-momentum", type=float, default=0.0005,
+        help="Momentum threshold to trigger maker order placement (default: 0.0005)"
+    )
+    parser.add_argument(
+        "--maker-sustain-seconds", type=float, default=5.0,
+        help="Seconds momentum must stay above threshold before placing maker order (default: 5.0)"
     )
     parser.add_argument(
         "--observe", action="store_true",
@@ -392,6 +411,10 @@ def main():
         signal_log_dir=args.signal_log_dir,
         shadow_log=args.shadow_log,
         enable_circuit_breaker=args.enable_circuit_breaker,
+        maker_enabled=args.maker_enabled,
+        max_maker_orders=args.max_maker_orders,
+        maker_pre_momentum=args.maker_pre_momentum,
+        maker_sustain_seconds=args.maker_sustain_seconds,
     )
 
     # Print config

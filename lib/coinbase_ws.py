@@ -31,8 +31,15 @@ logger = logging.getLogger(__name__)
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
 # Coin to Coinbase product ID mapping
+# ALL coins available on Coinbase — used as primary signal source (0.8ms latency vs 102ms Binance)
 COINBASE_SYMBOLS = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
+    "SOL": "SOL-USD",
+    "XRP": "XRP-USD",
+    "DOGE": "DOGE-USD",
     "HYPE": "HYPE-USD",
+    # BNB not on Coinbase — stays on Binance only
 }
 
 # Reverse mapping
@@ -267,10 +274,14 @@ class CoinbasePriceFeed:
                     })
                     await ws.send(subscribe_msg)
 
+                    _msg_count = 0
                     async for msg in ws:
                         if not self._running:
                             break
                         self._handle_message(msg)
+                        _msg_count += 1
+                        if _msg_count % 50 == 0:
+                            await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break
