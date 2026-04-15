@@ -1098,9 +1098,9 @@ class MomentumSniperStrategy:
 
                 side = mom_dir  # trade in momentum direction
 
-                if side == "up" and state.has_up_position:
-                    return
-                if side == "down" and state.has_down_position:
+                # Block if we already have a position on EITHER side
+                # (prevents hedging — trading UP then DOWN in same window)
+                if state.has_up_position or state.has_down_position:
                     return
 
                 best_ask = self._get_best_ask_with_rest_fallback(state, side)
@@ -1128,6 +1128,14 @@ class MomentumSniperStrategy:
                     self._snipe_in_flight.discard(snipe_key)
                     return
 
+                # Set position sentinel BEFORE queuing — prevents race where
+                # a second tick fires the opposite side before the signal
+                # thread processes the first. This is in the callback thread.
+                if side == "up":
+                    state.up_tokens = 0.01
+                else:
+                    state.down_tokens = 0.01
+
                 signal_time = time.time()
 
                 if self._fast_order:
@@ -1138,16 +1146,17 @@ class MomentumSniperStrategy:
                             buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
                                             self.config.max_entry_price)
                             if buy_price < self.config.min_entry_price or self._balance < 1.0:
+                                if side == "up": state.up_tokens = 0
+                                else: state.down_tokens = 0
                                 return
 
                             token_id = state.manager.token_ids.get(side)
                             if not token_id:
+                                if side == "up": state.up_tokens = 0
+                                else: state.down_tokens = 0
                                 return
 
-                            if side == "up":
-                                state.up_tokens = 0.01
-                            else:
-                                state.down_tokens = 0.01
+                            # Sentinel already set in callback thread above
 
                             result = self._fast_order._place_order_sync(
                                 token_id, buy_price, 5.0, "BUY", "FAK", 1000,
@@ -2209,9 +2218,9 @@ class MomentumSniperStrategy:
                             continue  # Price above strike — don't buy Down
 
                         # INTEGRATED COLLECTOR — record at the EXACT trading
-                        # decision point. This is the same spot price and
-                        # displacement that passed the momentum check above.
-                        # Guarantees: if the bot trades it, this records it.
+                        # decision point. Uses a SEPARATE dedup key ("trade:")
+                        # so callback recordings can't block this. Guarantees:
+                        # if the bot trades it, the collector records it.
                         _abs_disp = abs(displacement)
                         _mom_dir = "up" if displacement > 0 else "down"
                         _opp_dir = "down" if _mom_dir == "up" else "up"
@@ -2219,7 +2228,8 @@ class MomentumSniperStrategy:
                         _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
                         _elapsed = max(0, _duration - _tte)
                         for _cs in [_mom_dir, _opp_dir]:
-                            _ck = (state.current_slug, _cs)
+                            # Use "trade:" prefix to avoid collision with callback dedup
+                            _ck = ("trade:" + state.current_slug, _cs)
                             if _ck not in self._collector_crossed:
                                 self._collector_crossed[_ck] = set()
                             for _ct in self._collector_thresholds:
@@ -3085,9 +3095,10 @@ class MomentumSniperStrategy:
         if not state:
             return
 
-        # Clear integrated collector dedup for old market
+        # Clear integrated collector dedup for old market (both callback and trade paths)
         for side in ("up", "down"):
             self._collector_crossed.pop((old_slug, side), None)
+            self._collector_crossed.pop(("trade:" + old_slug, side), None)
 
         # Reset maker sustain timers for this coin on market change
         self._maker_momentum_first_seen.pop(f"{coin}:up", None)

@@ -2,6 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⛔️ HARD RULE — NEVER DELETE DATA FILES
+
+**This is a non-negotiable user constraint.** Data files (CSVs, trade logs, collector outputs) must NEVER be deleted, wiped, or overwritten. Previous sessions lost irrecoverable data by using `rm -f` on collector CSVs and corrupted trade logs with bad string replacements.
+
+If you find yourself about to:
+- Run `rm -f` on any CSV or log file → **STOP**
+- Put `rm -f *.csv` in a deploy command → **STOP**
+- Overwrite a file without backing it up first → **STOP**
+- Use string replacement on a CSV without `cp file.csv file.csv.bak` first → **STOP**
+- Wipe integrated collector data "for a clean start" → **STOP AND ASK THE USER**
+
+Data files APPEND on restart. They are NEVER reset without explicit user permission.
+
+## ⛔️ HARD RULE — DEPLOY SAFETY
+
+- **KILL the bot BEFORE deploying code.** Never deploy while the bot is live.
+- **Check for watchdog/cron** (`crontab -l`, `pgrep -f watchdog`) that auto-restart the bot.
+- **start_v30.sh must NEVER remove the pause flag.** It must check for `.bot_paused` and exit if present.
+- **Never deploy untested code to a live bot.** Test race conditions and edge cases first.
+- **Verify the bot is dead** (`ps aux | grep run_sniper`) after every kill command.
+- **DO NOT start the bot after deploying.** Wait for explicit user permission.
+
 ## ⛔️ HARD RULE — NO FAIR VALUE, NO BLACK-SCHOLES, NO VATIC
 
 **This is a non-negotiable user constraint repeated across many sessions.** Fair value calculation, Black-Scholes pricing, and Vatic strike fetching have been explicitly removed from the system. They must NOT be reintroduced under any circumstance.
