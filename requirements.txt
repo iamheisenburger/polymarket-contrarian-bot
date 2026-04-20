@@ -22,6 +22,11 @@ requests>=2.28.0               # API calls
 # WebSocket for real-time data
 websockets>=12.0               # WebSocket client for market data
 
+# Performance: async event loop, fast JSON, vectorized analysis
+uvloop>=0.19.0                 # Drop-in asyncio loop, ~2-4x faster than default
+orjson>=3.9.0                  # Fast JSON parser for WS message ingest
+numpy>=1.24.0                  # Vectorized analysis on IC / collector data
+
 # =============================================================================
 # Polymarket API Clients (Optional - for advanced usage)
 # =============================================================================
