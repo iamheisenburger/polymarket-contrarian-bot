@@ -1597,6 +1597,7 @@ class MomentumSniperStrategy:
                             result = None
                             _path = "full-sign"
                             _ladder_size = 0
+                            _tid_match = "n/a"
                             presigned_cache = getattr(self, '_presigned_cache', {})
                             ladder = presigned_cache.get((state.coin, side))
                             if ladder:
@@ -1604,6 +1605,14 @@ class MomentumSniperStrategy:
                                 price_key = int(buy_price * 100)
                                 body_str = ladder.get(price_key)
                                 if body_str:
+                                    # Verify presigned body's tokenId matches current market
+                                    try:
+                                        import json as _json
+                                        _body = _json.loads(body_str)
+                                        _presigned_tid = _body.get("order", {}).get("tokenId", "")
+                                        _tid_match = "match" if _presigned_tid == token_id else f"STALE (cached={_presigned_tid[:12]}... current={token_id[:12]}...)"
+                                    except Exception:
+                                        _tid_match = "parse-fail"
                                     result = self._fast_order.post_presigned_order(body_str)
                                     if result is not None:
                                         _path = "presigned"
@@ -1621,7 +1630,7 @@ class MomentumSniperStrategy:
 
                             self._event_logger.info(
                                 f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
-                                f"path={_path} ladder={_ladder_size} "
+                                f"path={_path} ladder={_ladder_size} tid={_tid_match} "
                                 f"id={result.get('orderID','')[:16] or 'none'} "
                                 f"filled={taking:.1f} lat={total_lat:.0f}ms"
                                 f"{' ERROR: ' + result.get('error','')[:60] if has_error else ''}"
@@ -1856,6 +1865,7 @@ class MomentumSniperStrategy:
                         result = None
                         _path = "full-sign"
                         _ladder_size = 0
+                        _tid_match = "n/a"
                         presigned_cache = getattr(self, '_presigned_cache', {})
                         ladder = presigned_cache.get((state.coin, side))
                         if ladder:
@@ -1863,6 +1873,14 @@ class MomentumSniperStrategy:
                             price_key = int(buy_price * 100)
                             body_str = ladder.get(price_key)
                             if body_str:
+                                # Verify presigned body's tokenId matches current market
+                                try:
+                                    import json as _json
+                                    _body = _json.loads(body_str)
+                                    _presigned_tid = _body.get("order", {}).get("tokenId", "")
+                                    _tid_match = "match" if _presigned_tid == token_id else f"STALE (cached={_presigned_tid[:12]}... current={token_id[:12]}...)"
+                                except Exception:
+                                    _tid_match = "parse-fail"
                                 result = self._fast_order.post_presigned_order(body_str)
                                 if result is not None:
                                     _path = "presigned"
@@ -1886,7 +1904,7 @@ class MomentumSniperStrategy:
 
                         self._event_logger.info(
                             f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
-                            f"path={_path} ladder={_ladder_size} "
+                            f"path={_path} ladder={_ladder_size} tid={_tid_match} "
                             f"id={result.get('orderID','')[:16] or 'none'} "
                             f"filled={taking:.1f} lat={total_lat:.0f}ms "
                             f"qwait={_queue_wait:.0f}ms pre={_pre_order_ms:.0f}ms order={_order_ms:.0f}ms"
