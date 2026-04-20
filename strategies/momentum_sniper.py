@@ -961,6 +961,16 @@ class MomentumSniperStrategy:
                     extra_feeds.append(OKXSpotPriceFeed(coins=o_coins))
             except Exception as e:
                 logger.warning(f"OKXSpotPriceFeed unavailable: {e}")
+            try:
+                # Pyth Network Hermes: publishes directly from tier-1 MMs
+                # (Jane Street, Jump, DRW, Wintermute). Can beat CEX WS in some
+                # scenarios. Added as a 5th first-tick-wins source.
+                from lib.pyth_ws import PythPriceFeed, PYTH_IDS
+                p_coins = [c for c in config.coins if c in PYTH_IDS]
+                if p_coins:
+                    extra_feeds.append(PythPriceFeed(coins=p_coins))
+            except Exception as e:
+                logger.warning(f"PythPriceFeed unavailable: {e}")
 
         # If only Coinbase coins (e.g. only HYPE), coinbase IS the primary
         if primary_feed is None and coinbase_feed is not None:
@@ -1063,6 +1073,21 @@ class MomentumSniperStrategy:
                 self._funding_feed = BybitPerpsPriceFeed(coins=_f_coins)
         except Exception as e:
             logger.warning(f"Funding feed (BybitPerpsPriceFeed) unavailable: {e}")
+
+        # Bybit liquidation stream (Apr-2026, speed edge).
+        # Liqs CAUSE moves — detecting them in real-time gives ~50-200ms lead
+        # before the price impact reaches our spot feeds. Telemetry only for
+        # now; promote to gate after correlating with fill outcomes.
+        self._liq_tracker = None
+        try:
+            from lib.bybit_liquidation_ws import BybitLiquidationTracker, BYBIT_LIQ_SYMBOLS
+            _liq_coins = [c for c in config.coins if c in BYBIT_LIQ_SYMBOLS]
+            if _liq_coins:
+                self._liq_tracker = BybitLiquidationTracker(
+                    coins=_liq_coins, lookback_seconds=30.0
+                )
+        except Exception as e:
+            logger.warning(f"BybitLiquidationTracker unavailable: {e}")
 
         # Fast order client — bypasses SDK for ~100-200ms savings per order
         self._fast_order = None
@@ -1335,6 +1360,15 @@ class MomentumSniperStrategy:
             except Exception as e:
                 self.log(f"Funding feed start failed: {e}", "warning")
                 self._funding_feed = None
+
+        # Start Bybit liquidation stream tracker
+        if self._liq_tracker is not None:
+            try:
+                await self._liq_tracker.start()
+                self.log(f"Bybit liquidation tracker started: {self._liq_tracker.coins}", "success")
+            except Exception as e:
+                self.log(f"Liquidation tracker start failed: {e}", "warning")
+                self._liq_tracker = None
 
         for coin in self.config.coins:
             price = self.binance.get_price(coin)
@@ -1638,8 +1672,6 @@ class MomentumSniperStrategy:
                     )
 
                 # Funding-rate telemetry: crowded-trade / mean-reversion indicator.
-                # Hypothesis: heavily positive funding + UP fire = crowded longs =
-                # higher reversal risk. Similar for negative + DOWN.
                 if self._funding_feed is not None:
                     _fund = self._funding_feed.get_funding_rate(coin)
                     _fund_agrees_risk = ((_fund > 0.0001 and side == "up") or
@@ -1647,6 +1679,48 @@ class MomentumSniperStrategy:
                     self._event_logger.info(
                         f"[FUNDING] {coin} {side} rate={_fund:+.5f} "
                         f"crowded_same_side={_fund_agrees_risk} (telemetry only)"
+                    )
+
+                # Liquidation telemetry (Bybit linear perps, last 30s).
+                # Hypothesis: big cascading liqs in our direction = amplified
+                # momentum = thicker taker flow on our side = better fill rate.
+                if self._liq_tracker is not None:
+                    _liq_n = self._liq_tracker.get_recent_notional(coin)
+                    _liq_imb = self._liq_tracker.get_side_imbalance(coin)
+                    _liq_count = self._liq_tracker.get_event_count(coin)
+                    # Alignment: on UP side, short-liqs (Buy events, imb > 0)
+                    # are with us. On DOWN side, long-liqs (Sell events, imb < 0).
+                    _liq_agrees = ((_liq_imb > 0.2 and side == "up") or
+                                   (_liq_imb < -0.2 and side == "down"))
+                    self._event_logger.info(
+                        f"[LIQ] {coin} {side} 30s_notional=${_liq_n:.0f} "
+                        f"side_imb={_liq_imb:+.2f} events={_liq_count} "
+                        f"agrees={_liq_agrees} (telemetry only)"
+                    )
+
+                # Alt-lead-BTC telemetry (only for BTC fires).
+                # IC showed ETH/SOL/XRP/DOGE lead BTC by 8-20s on threshold
+                # crossings. Here we check: did an alt cross 0.0005 same-side
+                # in the prior 30s? If yes, BTC fire has "alt-confirmed" flag.
+                if coin == "BTC":
+                    _now = time.time()
+                    _alt_led = False
+                    _alt_leader = None
+                    for _alt in ("ETH", "SOL", "XRP", "DOGE"):
+                        _k = None
+                        # Search mtf_cross_ts for any alt entry matching same side
+                        # within 30s prior to now. We don't know the alt's slug
+                        # so scan keys ending in (alt, side).
+                        for (_s, _c, _sd), _ts in self._mtf_cross_ts.items():
+                            if _c == _alt and _sd == side and 0 < (_now - _ts) <= 30.0:
+                                _alt_led = True
+                                _alt_leader = _alt
+                                break
+                        if _alt_led:
+                            break
+                    self._event_logger.info(
+                        f"[ALT-LEAD] BTC {side} alt_led={_alt_led} "
+                        f"leader={_alt_leader or 'none'} (telemetry only)"
                     )
 
                 # Spread-dynamics telemetry (informational only, no gating)
@@ -1950,6 +2024,37 @@ class MomentumSniperStrategy:
                 self._event_logger.info(
                     f"[FUNDING] {coin} {side} rate={_fund:+.5f} "
                     f"crowded_same_side={_fund_agrees_risk} (telemetry only, tick-loop)"
+                )
+
+            # Liquidation telemetry
+            if self._liq_tracker is not None:
+                _liq_n = self._liq_tracker.get_recent_notional(coin)
+                _liq_imb = self._liq_tracker.get_side_imbalance(coin)
+                _liq_count = self._liq_tracker.get_event_count(coin)
+                _liq_agrees = ((_liq_imb > 0.2 and side == "up") or
+                               (_liq_imb < -0.2 and side == "down"))
+                self._event_logger.info(
+                    f"[LIQ] {coin} {side} 30s_notional=${_liq_n:.0f} "
+                    f"side_imb={_liq_imb:+.2f} events={_liq_count} "
+                    f"agrees={_liq_agrees} (telemetry only, tick-loop)"
+                )
+
+            # Alt-lead-BTC telemetry (only for BTC fires)
+            if coin == "BTC":
+                _now = time.time()
+                _alt_led = False
+                _alt_leader = None
+                for _alt in ("ETH", "SOL", "XRP", "DOGE"):
+                    for (_s, _c, _sd), _ts in self._mtf_cross_ts.items():
+                        if _c == _alt and _sd == side and 0 < (_now - _ts) <= 30.0:
+                            _alt_led = True
+                            _alt_leader = _alt
+                            break
+                    if _alt_led:
+                        break
+                self._event_logger.info(
+                    f"[ALT-LEAD] BTC {side} alt_led={_alt_led} "
+                    f"leader={_alt_leader or 'none'} (telemetry only, tick-loop)"
                 )
 
             # Spread-dynamics telemetry (informational only, no gating)
@@ -5827,6 +5932,12 @@ class MomentumSniperStrategy:
         if self._funding_feed is not None:
             try:
                 await self._funding_feed.stop()
+            except Exception:
+                pass
+        # Stop liquidation tracker
+        if self._liq_tracker is not None:
+            try:
+                await self._liq_tracker.stop()
             except Exception:
                 pass
 
