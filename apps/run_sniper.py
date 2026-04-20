@@ -30,6 +30,16 @@ import argparse
 import logging
 from pathlib import Path
 
+# uvloop: drop-in replacement for asyncio's default event loop (~2-4x faster
+# on WS ingest + timer-heavy workloads). Install policy BEFORE any asyncio
+# context is created so the main loop picks it up.
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    _UVLOOP_ACTIVE = True
+except ImportError:
+    _UVLOOP_ACTIVE = False
+
 # Fix Windows console encoding
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -622,6 +632,8 @@ def main():
         print()
 
     strategy = MomentumSniperStrategy(bot=bot, config=strategy_config)
+
+    print(f"  Event loop: {'uvloop' if _UVLOOP_ACTIVE else 'asyncio (default)'}")
 
     try:
         asyncio.run(strategy.run())
