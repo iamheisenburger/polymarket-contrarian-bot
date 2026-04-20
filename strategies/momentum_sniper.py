@@ -1537,13 +1537,18 @@ class MomentumSniperStrategy:
 
                             # Try pre-signed order first (~23ms) then fall back to full sign (~280ms)
                             result = None
+                            _path = "full-sign"
+                            _ladder_size = 0
                             presigned_cache = getattr(self, '_presigned_cache', {})
                             ladder = presigned_cache.get((state.coin, side))
                             if ladder:
+                                _ladder_size = len(ladder)
                                 price_key = int(buy_price * 100)
                                 body_str = ladder.get(price_key)
                                 if body_str:
                                     result = self._fast_order.post_presigned_order(body_str)
+                                    if result is not None:
+                                        _path = "presigned"
 
                             # Fall back to full sign if no pre-signed match
                             if result is None:
@@ -1558,6 +1563,7 @@ class MomentumSniperStrategy:
 
                             self._event_logger.info(
                                 f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
+                                f"path={_path} ladder={_ladder_size} "
                                 f"id={result.get('orderID','')[:16] or 'none'} "
                                 f"filled={taking:.1f} lat={total_lat:.0f}ms"
                                 f"{' ERROR: ' + result.get('error','')[:60] if has_error else ''}"
@@ -1771,13 +1777,18 @@ class MomentumSniperStrategy:
                         # transition with every $0.01 from min to max entry price.
                         _t_pre_order = time.time()
                         result = None
+                        _path = "full-sign"
+                        _ladder_size = 0
                         presigned_cache = getattr(self, '_presigned_cache', {})
                         ladder = presigned_cache.get((state.coin, side))
                         if ladder:
+                            _ladder_size = len(ladder)
                             price_key = int(buy_price * 100)
                             body_str = ladder.get(price_key)
                             if body_str:
                                 result = self._fast_order.post_presigned_order(body_str)
+                                if result is not None:
+                                    _path = "presigned"
 
                         # Fall back to full sign if no pre-signed match
                         if result is None:
@@ -1798,6 +1809,7 @@ class MomentumSniperStrategy:
 
                         self._event_logger.info(
                             f"[FAST-FIRE] {state.coin} {side} success={fast_success} "
+                            f"path={_path} ladder={_ladder_size} "
                             f"id={result.get('orderID','')[:16] or 'none'} "
                             f"filled={taking:.1f} lat={total_lat:.0f}ms "
                             f"qwait={_queue_wait:.0f}ms pre={_pre_order_ms:.0f}ms order={_order_ms:.0f}ms"
