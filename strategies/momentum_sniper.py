@@ -1051,6 +1051,19 @@ class MomentumSniperStrategy:
         except Exception as e:
             logger.warning(f"SpreadDynamicsTracker unavailable: {e}")
 
+        # Bybit perp feed for funding-rate telemetry (NOT used as spot input —
+        # perps lag spot at tick level, see feedback_perps_dont_lead_spot.md).
+        # We only extract funding_rate from the ticker stream to log as a
+        # crowded-trade / mean-reversion signal at every fire attempt.
+        self._funding_feed = None
+        try:
+            from lib.bybit_perp_ws import BybitPerpsPriceFeed, BYBIT_PERP_SYMBOLS
+            _f_coins = [c for c in config.coins if c in BYBIT_PERP_SYMBOLS]
+            if _f_coins:
+                self._funding_feed = BybitPerpsPriceFeed(coins=_f_coins)
+        except Exception as e:
+            logger.warning(f"Funding feed (BybitPerpsPriceFeed) unavailable: {e}")
+
         # Fast order client — bypasses SDK for ~100-200ms savings per order
         self._fast_order = None
         try:
@@ -1313,6 +1326,15 @@ class MomentumSniperStrategy:
         if not await self.binance.start():
             self.log("Failed to start price feed", "error")
             return False
+
+        # Start Bybit perp ticker feed for funding-rate telemetry (not signal aggregation)
+        if self._funding_feed is not None:
+            try:
+                await self._funding_feed.start()
+                self.log(f"Bybit perp funding feed started: {self._funding_feed.coins}", "success")
+            except Exception as e:
+                self.log(f"Funding feed start failed: {e}", "warning")
+                self._funding_feed = None
 
         for coin in self.config.coins:
             price = self.binance.get_price(coin)
@@ -1615,6 +1637,18 @@ class MomentumSniperStrategy:
                         f"[VOLUME] {coin} {side} 10s_vol={_trade_vol:.2f} (telemetry only)"
                     )
 
+                # Funding-rate telemetry: crowded-trade / mean-reversion indicator.
+                # Hypothesis: heavily positive funding + UP fire = crowded longs =
+                # higher reversal risk. Similar for negative + DOWN.
+                if self._funding_feed is not None:
+                    _fund = self._funding_feed.get_funding_rate(coin)
+                    _fund_agrees_risk = ((_fund > 0.0001 and side == "up") or
+                                         (_fund < -0.0001 and side == "down"))
+                    self._event_logger.info(
+                        f"[FUNDING] {coin} {side} rate={_fund:+.5f} "
+                        f"crowded_same_side={_fund_agrees_risk} (telemetry only)"
+                    )
+
                 # Spread-dynamics telemetry (informational only, no gating)
                 if self._spread_tracker:
                     _sd_label, _sd_slope, _sd_n = self._spread_tracker.get_direction(coin, side)
@@ -1906,6 +1940,16 @@ class MomentumSniperStrategy:
                 _trade_vol = self._aggression_tracker.get_volume(coin)
                 self._event_logger.info(
                     f"[VOLUME] {coin} {side} 10s_vol={_trade_vol:.2f} (telemetry only, tick-loop)"
+                )
+
+            # Funding-rate telemetry
+            if self._funding_feed is not None:
+                _fund = self._funding_feed.get_funding_rate(coin)
+                _fund_agrees_risk = ((_fund > 0.0001 and side == "up") or
+                                     (_fund < -0.0001 and side == "down"))
+                self._event_logger.info(
+                    f"[FUNDING] {coin} {side} rate={_fund:+.5f} "
+                    f"crowded_same_side={_fund_agrees_risk} (telemetry only, tick-loop)"
                 )
 
             # Spread-dynamics telemetry (informational only, no gating)
@@ -5779,6 +5823,12 @@ class MomentumSniperStrategy:
 
         # Stop Binance feed
         await self.binance.stop()
+        # Stop funding feed
+        if self._funding_feed is not None:
+            try:
+                await self._funding_feed.stop()
+            except Exception:
+                pass
 
     def _print_summary(self):
         """Print session summary."""

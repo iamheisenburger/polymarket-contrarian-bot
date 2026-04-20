@@ -55,6 +55,10 @@ class CoinState:
     history: Deque[PricePoint] = field(default_factory=lambda: deque(maxlen=600))
     _cached_vol: float = 0.50
     _vol_calc_time: float = 0.0
+    # Funding rate from Bybit ticker (per 8h). Positive = longs paying shorts =
+    # crowded long = potential mean-reversion / top risk. Negative = inverse.
+    funding_rate: float = 0.0
+    funding_update_ts: float = 0.0
 
 
 class BybitPerpsPriceFeed:
@@ -114,6 +118,12 @@ class BybitPerpsPriceFeed:
             state._cached_vol = self._calculate_volatility(coin)
             state._vol_calc_time = now
         return state._cached_vol
+
+    def get_funding_rate(self, coin: str) -> float:
+        """Return most recent funding rate for a coin (fraction per 8h interval).
+        0.0 if unknown. Positive = longs paying shorts, negative = inverse."""
+        state = self._state.get(coin.upper())
+        return state.funding_rate if state else 0.0
 
     def get_momentum(self, coin: str, lookback_seconds: float = 30.0) -> float:
         coin = coin.upper()
@@ -262,6 +272,15 @@ class BybitPerpsPriceFeed:
                 if now - self._last_sample.get(coin, 0) >= self.vol_sample_interval:
                     state.history.append(PricePoint(price=price, timestamp=now))
                     self._last_sample[coin] = now
+                # Funding rate: Bybit publishes current funding in linear perp ticker
+                fr_str = entry.get("fundingRate")
+                if fr_str is not None:
+                    try:
+                        fr = float(fr_str)
+                        state.funding_rate = fr
+                        state.funding_update_ts = now
+                    except (TypeError, ValueError):
+                        pass
                 for cb in self._price_callbacks:
                     try:
                         cb(coin, price)
