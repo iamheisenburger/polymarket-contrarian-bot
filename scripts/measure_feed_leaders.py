@@ -45,6 +45,7 @@ async def main():
     from lib.bybit_spot_ws import BybitSpotPriceFeed
     from lib.bybit_perp_ws import BybitPerpsPriceFeed
     from lib.okx_spot_ws import OKXSpotPriceFeed
+    from lib.pyth_ws import PythPriceFeed
 
     # Coins covered by most exchanges (drop HYPE — only Coinbase has it)
     coins = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]
@@ -55,6 +56,7 @@ async def main():
         "bybit_s":   BybitSpotPriceFeed(coins=coins),
         "bybit_p":   BybitPerpsPriceFeed(coins=coins),
         "okx_s":     OKXSpotPriceFeed(coins=coins),
+        "pyth":      PythPriceFeed(coins=coins),
     }
 
     # ticks[(exchange, coin)] = list of (timestamp_ns, price)
