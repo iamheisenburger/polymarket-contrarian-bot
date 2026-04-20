@@ -1595,6 +1595,26 @@ class MomentumSniperStrategy:
                         f"[BTC-CONFIRM] {coin} {side} confirmed={_btc_confirm} (telemetry only)"
                     )
 
+                # Volatility regime telemetry: realized vs implied divergence.
+                # Hypothesis: realized > implied = unexpected move = stronger signal.
+                # implied > realized = expected quiet = weak signal quality.
+                _rv = self.binance.get_volatility(coin) or 0.0
+                _iv = None
+                if self._deribit_feed:
+                    _iv = self._deribit_feed.get_implied_vol(coin)
+                _div_str = f"iv={_iv:.3f} iv-rv={(_iv-_rv):+.3f}" if _iv is not None else "iv=N/A"
+                self._event_logger.info(
+                    f"[VOL-REGIME] {coin} {side} rv={_rv:.3f} {_div_str} (telemetry only)"
+                )
+
+                # Trade volume telemetry: recent Binance aggTrade volume (10s window).
+                # Hypothesis: high volume = thicker books = more fills, less AS.
+                if self._aggression_tracker:
+                    _trade_vol = self._aggression_tracker.get_volume(coin)
+                    self._event_logger.info(
+                        f"[VOLUME] {coin} {side} 10s_vol={_trade_vol:.2f} (telemetry only)"
+                    )
+
                 # Spread-dynamics telemetry (informational only, no gating)
                 if self._spread_tracker:
                     _sd_label, _sd_slope, _sd_n = self._spread_tracker.get_direction(coin, side)
@@ -1869,6 +1889,23 @@ class MomentumSniperStrategy:
                     _btc_confirm = _btc_same_side
                 self._event_logger.info(
                     f"[BTC-CONFIRM] {coin} {side} confirmed={_btc_confirm} (telemetry only, tick-loop)"
+                )
+
+            # Volatility regime telemetry
+            _rv = self.binance.get_volatility(coin) or 0.0
+            _iv = None
+            if self._deribit_feed:
+                _iv = self._deribit_feed.get_implied_vol(coin)
+            _div_str = f"iv={_iv:.3f} iv-rv={(_iv-_rv):+.3f}" if _iv is not None else "iv=N/A"
+            self._event_logger.info(
+                f"[VOL-REGIME] {coin} {side} rv={_rv:.3f} {_div_str} (telemetry only, tick-loop)"
+            )
+
+            # Trade volume telemetry (recent Binance aggTrade volume, 10s)
+            if self._aggression_tracker:
+                _trade_vol = self._aggression_tracker.get_volume(coin)
+                self._event_logger.info(
+                    f"[VOLUME] {coin} {side} 10s_vol={_trade_vol:.2f} (telemetry only, tick-loop)"
                 )
 
             # Spread-dynamics telemetry (informational only, no gating)
