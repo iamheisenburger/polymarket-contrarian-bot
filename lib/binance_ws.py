@@ -18,6 +18,7 @@ Usage:
 
 import asyncio
 import json
+import orjson  # fast JSON parse on WS hot path
 import math
 import time
 import logging
@@ -292,7 +293,7 @@ class BinancePriceFeed:
     def _handle_message(self, raw: str):
         """Process incoming WebSocket message (aggTrade + bookTicker)."""
         try:
-            data = json.loads(raw)
+            data = orjson.loads(raw)
 
             # Combined stream format wraps data
             if "stream" in data:
