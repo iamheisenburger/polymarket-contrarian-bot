@@ -940,18 +940,13 @@ class MomentumSniperStrategy:
         coinbase_feed = CoinbasePriceFeed(coins=coinbase_coins) if coinbase_coins else None
 
         # Extra exchange feeds for first-tick aggregation (Apr-2026).
-        # Enabled via config.multi_exchange. When on, Kraken and Bybit-Spot
-        # subscribe to every supported coin; the MultiPriceFeed picks whichever
+        # Enabled via config.multi_exchange. MultiPriceFeed picks whichever
         # exchange delivers the freshest tick per get_price call.
+        #
+        # Kraken DROPPED — prior measurement showed 0.5% first-tick share
+        # (dead weight, see measure_feed_leaders results).
         extra_feeds: list = []
         if getattr(config, "multi_exchange", False):
-            try:
-                from lib.kraken_ws import KrakenPriceFeed, KRAKEN_SYMBOLS
-                k_coins = [c for c in config.coins if c in KRAKEN_SYMBOLS]
-                if k_coins:
-                    extra_feeds.append(KrakenPriceFeed(coins=k_coins))
-            except Exception as e:
-                logger.warning(f"KrakenPriceFeed unavailable: {e}")
             try:
                 from lib.bybit_spot_ws import BybitSpotPriceFeed, BYBIT_SPOT_SYMBOLS
                 b_coins = [c for c in config.coins if c in BYBIT_SPOT_SYMBOLS]
@@ -959,6 +954,13 @@ class MomentumSniperStrategy:
                     extra_feeds.append(BybitSpotPriceFeed(coins=b_coins))
             except Exception as e:
                 logger.warning(f"BybitSpotPriceFeed unavailable: {e}")
+            try:
+                from lib.okx_spot_ws import OKXSpotPriceFeed, OKX_SPOT_SYMBOLS
+                o_coins = [c for c in config.coins if c in OKX_SPOT_SYMBOLS]
+                if o_coins:
+                    extra_feeds.append(OKXSpotPriceFeed(coins=o_coins))
+            except Exception as e:
+                logger.warning(f"OKXSpotPriceFeed unavailable: {e}")
 
         # If only Coinbase coins (e.g. only HYPE), coinbase IS the primary
         if primary_feed is None and coinbase_feed is not None:
