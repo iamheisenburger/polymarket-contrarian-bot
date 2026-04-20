@@ -1182,6 +1182,13 @@ class MomentumSniperStrategy:
         self._collector_crossed: Dict[tuple, set] = {}  # (slug, side) -> set of crossed thresholds
         self._collector_pending: list = []  # pending signals awaiting resolution
         self._collector_thresholds = [0.0003, 0.0005, 0.0007, 0.001, 0.0012, 0.0015, 0.002, 0.003, 0.005]
+        # Multi-timeframe alignment: earliest wall-clock time the 0.0005 momentum
+        # threshold was crossed per (slug, coin, side). Used by the MTF gate:
+        # only fire when momentum has been building for >=5s (avoids one-tick spikes).
+        # Validated on IC data: 0.002 fires with MTF-aligned = 96% WR (n=290) vs
+        # 88% WR when not-aligned (n=94). +7.56pp WR lift, 76% volume retained.
+        self._mtf_cross_ts: Dict[tuple, float] = {}  # (slug, coin, side) -> ts
+        self._mtf_min_age_seconds: float = 5.0
         self._coll_debug_logged: set = set()  # dedup for COLL-DBG logging
         self._collector_csv = config.log_file.replace(".csv", ".collector.csv") if config.log_file else "data/live_collector.csv"
         self._collector_resolved = 0
@@ -1424,6 +1431,12 @@ class MomentumSniperStrategy:
                     cb = _cached_bids[cs]
                     for ct in new_thresholds:
                         self._collector_crossed[ck].add(ct)
+                        # Multi-timeframe alignment: record earliest 0.0005 cross
+                        # for this (slug, coin, side). Used by the MTF fire gate.
+                        if ct == 0.0005:
+                            mtf_key = (state.current_slug, state.coin, cs)
+                            if mtf_key not in self._mtf_cross_ts:
+                                self._mtf_cross_ts[mtf_key] = time.time()
                         self._collector_pending.append({
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "slug": state.current_slug,
@@ -1526,6 +1539,23 @@ class MomentumSniperStrategy:
                     self._snipe_in_flight.discard(snipe_key)
                     return
 
+                # Multi-timeframe alignment gate (Apr-2026, IC-validated +7.56pp WR).
+                # Only fire if 0.0005 momentum was crossed >=5s before now. That ensures
+                # momentum is BUILDING, not a one-tick spike that will revert.
+                _mtf_key = (state.current_slug, state.coin, side)
+                _mtf_first_ts = self._mtf_cross_ts.get(_mtf_key)
+                _mtf_age = (time.time() - _mtf_first_ts) if _mtf_first_ts else 0.0
+                if _mtf_first_ts is None or _mtf_age < self._mtf_min_age_seconds:
+                    self._event_logger.info(
+                        f"[MTF-SKIP] {coin} {side} age={_mtf_age:.1f}s "
+                        f"< min={self._mtf_min_age_seconds:.0f}s — momentum not sustained"
+                    )
+                    self._snipe_in_flight.discard(snipe_key)
+                    return
+                self._event_logger.info(
+                    f"[MTF-OK] {coin} {side} 0.0005-cross-age={_mtf_age:.1f}s"
+                )
+
                 # Book-imbalance confirmation gate (Apr-2026).
                 _imb_ok, _imb_ratio, _imb_reason = self._check_book_imbalance(state, side)
                 if not _imb_ok:
@@ -1548,6 +1578,21 @@ class MomentumSniperStrategy:
                     self._event_logger.info(
                         f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
                         f"agrees={_aggr_agrees} (telemetry only)"
+                    )
+
+                # BTC cross-coin confirmation telemetry (IC shows +4.55pp altcoin WR
+                # lift when BTC has same-side momentum within 20s — track but don't gate).
+                if coin != "BTC":
+                    _btc_state = self.coin_states.get("BTC")
+                    _btc_confirm = False
+                    if _btc_state and _btc_state.strike_price > 0:
+                        _btc_spot = self.binance.get_price("BTC")
+                        _btc_disp = (_btc_spot - _btc_state.strike_price) / _btc_state.strike_price
+                        _btc_same_side = ((_btc_disp > 0.0005 and side == "up") or
+                                          (_btc_disp < -0.0005 and side == "down"))
+                        _btc_confirm = _btc_same_side
+                    self._event_logger.info(
+                        f"[BTC-CONFIRM] {coin} {side} confirmed={_btc_confirm} (telemetry only)"
                     )
 
                 # Spread-dynamics telemetry (informational only, no gating)
@@ -1775,6 +1820,20 @@ class MomentumSniperStrategy:
                 if _edge_tl < self.config.min_edge_pct:
                     return
 
+            # Multi-timeframe alignment gate (Apr-2026, IC-validated +7.56pp WR).
+            _mtf_key = (state.current_slug, state.coin, side)
+            _mtf_first_ts = self._mtf_cross_ts.get(_mtf_key)
+            _mtf_age = (time.time() - _mtf_first_ts) if _mtf_first_ts else 0.0
+            if _mtf_first_ts is None or _mtf_age < self._mtf_min_age_seconds:
+                self._event_logger.info(
+                    f"[MTF-SKIP] {coin} {side} age={_mtf_age:.1f}s "
+                    f"< min={self._mtf_min_age_seconds:.0f}s — momentum not sustained (tick-loop)"
+                )
+                return
+            self._event_logger.info(
+                f"[MTF-OK] {coin} {side} 0.0005-cross-age={_mtf_age:.1f}s (tick-loop)"
+            )
+
             # Book-imbalance confirmation gate (Apr-2026 — tick-loop path).
             _imb_ok, _imb_ratio, _imb_reason = self._check_book_imbalance(state, side)
             if not _imb_ok:
@@ -1796,6 +1855,20 @@ class MomentumSniperStrategy:
                 self._event_logger.info(
                     f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
                     f"agrees={_aggr_agrees} (telemetry only, tick-loop)"
+                )
+
+            # BTC cross-coin confirmation telemetry (IC: +4.55pp altcoin WR when aligned)
+            if coin != "BTC":
+                _btc_state = self.coin_states.get("BTC")
+                _btc_confirm = False
+                if _btc_state and _btc_state.strike_price > 0:
+                    _btc_spot = self.binance.get_price("BTC")
+                    _btc_disp = (_btc_spot - _btc_state.strike_price) / _btc_state.strike_price
+                    _btc_same_side = ((_btc_disp > 0.0005 and side == "up") or
+                                      (_btc_disp < -0.0005 and side == "down"))
+                    _btc_confirm = _btc_same_side
+                self._event_logger.info(
+                    f"[BTC-CONFIRM] {coin} {side} confirmed={_btc_confirm} (telemetry only, tick-loop)"
                 )
 
             # Spread-dynamics telemetry (informational only, no gating)
@@ -3892,6 +3965,8 @@ class MomentumSniperStrategy:
         for side in ("up", "down"):
             self._collector_crossed.pop((old_slug, side), None)
             self._collector_crossed.pop(("trade:" + old_slug, side), None)
+            # Multi-timeframe alignment: clear stale cross timestamps
+            self._mtf_cross_ts.pop((old_slug, coin, side), None)
 
         # Reset maker sustain timers for this coin on market change
         self._maker_momentum_first_seen.pop(f"{coin}:up", None)
