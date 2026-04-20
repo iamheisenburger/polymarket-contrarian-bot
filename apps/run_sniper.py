@@ -280,9 +280,11 @@ def main():
              "0 = disabled (submit at exact ask)."
     )
     parser.add_argument(
-        "--max-spread", type=float, default=0.03,
-        help="Maximum bid-ask spread to allow trading (default: 0.03). "
-             "Tight spreads indicate maker confidence in the price."
+        "--max-spread", type=float, default=0.05,
+        help="Maximum bid-ask spread to allow trading (default: 0.05). "
+             "Measured skip rate at collector data (92k rows): 0.03=33%% of "
+             "T5-filter signals skipped, 0.05=22%%. Lower = more selective. "
+             "0.0 disables the gate."
     )
     parser.add_argument(
         "--btc-block-entry", type=float, default=0.0,

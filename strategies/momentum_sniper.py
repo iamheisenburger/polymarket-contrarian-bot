@@ -389,7 +389,7 @@ class SniperConfig:
     # Maximum spread (ask - bid) to allow trading. Tight spreads mean
     # makers are confident in the price. Wide spreads = uncertainty.
     # Data: spread <= $0.02 has 80% WR vs 67% for spread > $0.02.
-    max_spread: float = 0.03
+    max_spread: float = 0.05
 
     # BTC negative filter: block alt trades that disagree with BTC's
     # direction when BTC's ask is >= this value. 0 = disabled.
