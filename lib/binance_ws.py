@@ -107,6 +107,13 @@ class BinancePriceFeed:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._price_callbacks: list = []  # Called on every price update for instant signal detection
+        self._trade_callbacks: list = []  # Called on every aggTrade with (coin, side_hit, qty)
+
+    def on_trade(self, callback) -> None:
+        """Register callback fired on each aggTrade: callback(coin, side_hit, qty).
+        side_hit is "BID" if seller aggressively hit the bid (m=True), "ASK"
+        if buyer aggressively hit the ask (m=False). qty is base-asset quantity."""
+        self._trade_callbacks.append(callback)
 
     def on_price(self, callback) -> None:
         """Register a callback for every price update. callback(coin: str, price: float)."""
@@ -306,6 +313,15 @@ class BinancePriceFeed:
                 symbol = data["s"].lower()
                 price = float(data["p"])
                 ts = data["T"] / 1000.0
+                # Binance aggTrade: m=True means buyer is the market maker,
+                # i.e. the seller aggressively hit the BID (downward pressure).
+                # m=False means buyer was taker — hit the ASK (upward pressure).
+                buyer_is_maker = bool(data.get("m", False))
+                side_hit = "BID" if buyer_is_maker else "ASK"
+                try:
+                    qty = float(data.get("q", 0.0))
+                except (TypeError, ValueError):
+                    qty = 0.0
 
                 for coin, sym in COIN_SYMBOLS.items():
                     if sym == symbol and coin in self._state:
@@ -322,6 +338,11 @@ class BinancePriceFeed:
                         for cb in self._price_callbacks:
                             try:
                                 cb(coin, price)
+                            except Exception:
+                                pass
+                        for cb in self._trade_callbacks:
+                            try:
+                                cb(coin, side_hit, qty)
                             except Exception:
                                 pass
                         break

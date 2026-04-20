@@ -1023,6 +1023,21 @@ class MomentumSniperStrategy:
         except Exception:
             pass
 
+        # Trade-aggression tracker (Apr-2026, telemetry-only).
+        # Measures rolling ask-hit vs bid-hit volume ratio on Binance aggTrades.
+        # Logged [AGGR] at every fire attempt. Promote to gate ONLY after
+        # correlating with fill outcomes across 50+ fills.
+        self._aggression_tracker = None
+        try:
+            from lib.trade_aggression import TradeAggressionTracker
+            self._aggression_tracker = TradeAggressionTracker(lookback_seconds=10.0)
+            # Register on primary Binance feed if accessible through MultiPriceFeed
+            _primary = getattr(self.binance, "_primary", self.binance)
+            if hasattr(_primary, "on_trade"):
+                _primary.on_trade(self._aggression_tracker.on_trade)
+        except Exception as e:
+            logger.warning(f"TradeAggressionTracker unavailable: {e}")
+
         # Fast order client — bypasses SDK for ~100-200ms savings per order
         self._fast_order = None
         try:
@@ -1503,6 +1518,16 @@ class MomentumSniperStrategy:
                         f"[IMBAL-OK] {coin} {side} our_ratio={_imb_ratio:.2%}"
                     )
 
+                # Trade-aggression telemetry (informational only, no gating)
+                if self._aggression_tracker:
+                    _aggr = self._aggression_tracker.get_ratio(coin)
+                    _aggr_vol = self._aggression_tracker.get_volume(coin)
+                    _aggr_agrees = (_aggr > 0 and side == "up") or (_aggr < 0 and side == "down")
+                    self._event_logger.info(
+                        f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
+                        f"agrees={_aggr_agrees} (telemetry only)"
+                    )
+
                 # Set position sentinel BEFORE queuing — prevents race where
                 # a second tick fires the opposite side before the signal
                 # thread processes the first. This is in the callback thread.
@@ -1721,6 +1746,16 @@ class MomentumSniperStrategy:
             if _imb_reason == "agree":
                 self._event_logger.info(
                     f"[IMBAL-OK] {coin} {side} our_ratio={_imb_ratio:.2%} (tick-loop)"
+                )
+
+            # Trade-aggression telemetry (informational only, no gating)
+            if self._aggression_tracker:
+                _aggr = self._aggression_tracker.get_ratio(coin)
+                _aggr_vol = self._aggression_tracker.get_volume(coin)
+                _aggr_agrees = (_aggr > 0 and side == "up") or (_aggr < 0 and side == "down")
+                self._event_logger.info(
+                    f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
+                    f"agrees={_aggr_agrees} (telemetry only, tick-loop)"
                 )
 
             # Dedup: one signal per market/side in flight
