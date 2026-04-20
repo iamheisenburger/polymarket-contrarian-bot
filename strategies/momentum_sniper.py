@@ -1038,6 +1038,19 @@ class MomentumSniperStrategy:
         except Exception as e:
             logger.warning(f"TradeAggressionTracker unavailable: {e}")
 
+        # Spread-dynamics tracker (Apr-2026, telemetry-only).
+        # Rolling 10s history of Polymarket bid-ask spread per (coin, side).
+        # Logged [SPREAD-DYN] at every fire attempt. Sampled rate-limited
+        # on each price update in the callback.
+        self._spread_tracker = None
+        try:
+            from lib.spread_dynamics import SpreadDynamicsTracker
+            self._spread_tracker = SpreadDynamicsTracker(
+                lookback_seconds=10.0, min_sample_interval=0.5
+            )
+        except Exception as e:
+            logger.warning(f"SpreadDynamicsTracker unavailable: {e}")
+
         # Fast order client — bypasses SDK for ~100-200ms savings per order
         self._fast_order = None
         try:
@@ -1325,6 +1338,15 @@ class MomentumSniperStrategy:
                 disp = (price - state.strike_price) / state.strike_price
                 abs_disp = abs(disp)
 
+                # Rate-limited spread sampling for SpreadDynamicsTracker telemetry.
+                # Tracker self-rate-limits to 0.5s per (coin, side).
+                if self._spread_tracker and state.manager:
+                    for _sd_side in ("up", "down"):
+                        _sd_ask = state.manager.get_best_ask(_sd_side)
+                        _sd_bid = state.manager.get_best_bid(_sd_side)
+                        if _sd_ask > 0 and _sd_bid > 0 and _sd_ask >= _sd_bid:
+                            self._spread_tracker.sample(coin, _sd_side, _sd_ask - _sd_bid)
+
                 # Maker IC: runs at ALL momentum levels (needs early window data)
                 if self._shadow_maker:
                     tte_mic = state.seconds_to_expiry()
@@ -1526,6 +1548,15 @@ class MomentumSniperStrategy:
                     self._event_logger.info(
                         f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
                         f"agrees={_aggr_agrees} (telemetry only)"
+                    )
+
+                # Spread-dynamics telemetry (informational only, no gating)
+                if self._spread_tracker:
+                    _sd_label, _sd_slope, _sd_n = self._spread_tracker.get_direction(coin, side)
+                    _sd_cur = self._spread_tracker.get_current_spread(coin, side)
+                    self._event_logger.info(
+                        f"[SPREAD-DYN] {coin} {side} {_sd_label} slope={_sd_slope:+.4f}/s "
+                        f"cur={_sd_cur:.4f} n={_sd_n} (telemetry only)"
                     )
 
                 # Set position sentinel BEFORE queuing — prevents race where
@@ -1756,6 +1787,15 @@ class MomentumSniperStrategy:
                 self._event_logger.info(
                     f"[AGGR] {coin} {side} ratio={_aggr:+.3f} vol={_aggr_vol:.2f} "
                     f"agrees={_aggr_agrees} (telemetry only, tick-loop)"
+                )
+
+            # Spread-dynamics telemetry (informational only, no gating)
+            if self._spread_tracker:
+                _sd_label, _sd_slope, _sd_n = self._spread_tracker.get_direction(coin, side)
+                _sd_cur = self._spread_tracker.get_current_spread(coin, side)
+                self._event_logger.info(
+                    f"[SPREAD-DYN] {coin} {side} {_sd_label} slope={_sd_slope:+.4f}/s "
+                    f"cur={_sd_cur:.4f} n={_sd_n} (telemetry only, tick-loop)"
                 )
 
             # Dedup: one signal per market/side in flight
