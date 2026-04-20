@@ -102,7 +102,11 @@ def main():
     )
     parser.add_argument(
         "--min-size", action="store_true",
-        help="Conservative mode — always bet minimum 5 tokens per trade for data gathering"
+        help="Conservative mode — always bet fixed tokens per trade (default 5, set with --min-size-tokens)"
+    )
+    parser.add_argument(
+        "--min-size-tokens", type=float, default=5.0,
+        help="Tokens per trade in min-size mode (default: 5). Use 2 at low bankroll for survivability."
     )
     parser.add_argument(
         "--max-entry-price", type=float, default=0.85,
@@ -126,12 +130,11 @@ def main():
     )
     parser.add_argument(
         "--maker-enabled", action="store_true",
-        help="Enable GTD maker order system. Places resting orders below the ask "
-             "when pre-momentum is detected. Zero taker fees. (default: off)"
+        help="Enable GTD maker order system. Disables ALL FAK taker orders. (default: off)"
     )
     parser.add_argument(
-        "--max-maker-orders", type=int, default=3,
-        help="Max simultaneous resting maker orders (default: 3)"
+        "--max-maker-orders", type=int, default=6,
+        help="Max simultaneous resting maker orders (default: 6 = 3 coins × 2 sides)"
     )
     parser.add_argument(
         "--maker-pre-momentum", type=float, default=0.0005,
@@ -140,6 +143,52 @@ def main():
     parser.add_argument(
         "--maker-sustain-seconds", type=float, default=5.0,
         help="Seconds momentum must stay above threshold before placing maker order (default: 5.0)"
+    )
+    parser.add_argument(
+        "--maker-dual-mode", action="store_true",
+        help="Dual-GTD: rest on BOTH UP and DOWN sides at fixed price. "
+             "The fill is the signal — no direction prediction. (default: off)"
+    )
+    parser.add_argument(
+        "--maker-rest-price", type=float, default=0.55,
+        help="Fixed price to rest GTD orders at in dual mode (default: 0.55)"
+    )
+    parser.add_argument(
+        "--maker-dynamic-pricing", action="store_true",
+        help="Dynamic pricing: place at best_ask - 0.01 instead of fixed rest price. "
+             "Always rests, maximizes fill probability. (default: off)"
+    )
+    parser.add_argument(
+        "--maker-max-entry-price", type=float, default=0.65,
+        help="Cap for dynamic pricing — never enter above this price (default: 0.65)"
+    )
+    parser.add_argument(
+        "--maker-place-elapsed", type=float, default=120.0,
+        help="Seconds into window before placing dual-GTD orders (default: 120)"
+    )
+    parser.add_argument(
+        "--maker-cancel-momentum", type=float, default=0.0008,
+        help="Momentum threshold for reversal cancellation — higher than placement "
+             "to give CLOB cancel latency a buffer (default: 0.0008)"
+    )
+    parser.add_argument(
+        "--maker-max-queue-ahead", type=float, default=0.0,
+        help="Queue-aware placement gate. Skip placement if total bid depth at "
+             ">= rest_price exceeds N tokens (AS defense — heavy queue means "
+             "we'd only fill on deep dips). 0 disables. Suggested: 50–200."
+    )
+    parser.add_argument(
+        "--imbalance-min-ratio", type=float, default=0.0,
+        help="Book-imbalance confirmation gate (FAK). Skip fire if our side's "
+             "bid-depth ratio is < this value. 0 disables. 0.40 = only skip "
+             "when book strongly disagrees. 0.50 = require at least neutral. "
+             "0.55 = require mild agreement. Default 0 (off)."
+    )
+    parser.add_argument(
+        "--multi-exchange", action="store_true",
+        help="Subscribe to Kraken + Bybit-Spot in addition to primary feeds. "
+             "MultiPriceFeed picks freshest tick across exchanges (first-tick "
+             "wins) to reduce signal latency on directional moves."
     )
     parser.add_argument(
         "--observe", action="store_true",
@@ -229,6 +278,51 @@ def main():
         help="FOK price tolerance in dollars (default: 0.04 = 4 cents above ask). "
              "Reduces FOK rejections by sweeping deeper into the book. "
              "0 = disabled (submit at exact ask)."
+    )
+    parser.add_argument(
+        "--max-spread", type=float, default=0.03,
+        help="Maximum bid-ask spread to allow trading (default: 0.03). "
+             "Tight spreads indicate maker confidence in the price."
+    )
+    parser.add_argument(
+        "--btc-block-entry", type=float, default=0.0,
+        help="BTC negative filter: block alt trades that disagree with BTC's direction "
+             "when BTC's ask is >= this value. 0 = disabled. Recommended: 0.50."
+    )
+    parser.add_argument(
+        "--btc-block-momentum", type=float, default=0.0003,
+        help="BTC displacement threshold for block filter. BTC must have moved at least "
+             "this much from strike before filter activates. Default: 0.0003."
+    )
+    # Backtest-calibrated guardrails
+    # --- Edge Model ---
+    parser.add_argument(
+        "--edge-model", type=str, default="",
+        help="Path to IC CSV for empirical edge model (e.g. data/vps_ic_latest.csv). "
+             "When set, only trades when estimated live WR > entry price + min-edge-pct. "
+             "Empty = disabled (default)."
+    )
+    parser.add_argument(
+        "--min-edge-pct", type=float, default=0.0,
+        help="Minimum edge (fraction) to trade when edge model is active. "
+             "0.0 = any positive edge. 0.05 = require 5%% edge. Default: 0.0."
+    )
+
+    parser.add_argument(
+        "--guardrail-max-consec-losses", type=int, default=16,
+        help="Pause bot after N consecutive losses (default: 16, calibrated from backtest max of 14)"
+    )
+    parser.add_argument(
+        "--guardrail-max-window-loss", type=float, default=26.0,
+        help="Pause bot if single window loses more than $X (default: 26, backtest max was $21.90)"
+    )
+    parser.add_argument(
+        "--guardrail-max-drawdown-pct", type=float, default=40.0,
+        help="Pause bot if drawdown from session peak exceeds X%% (default: 40, backtest max was 39.1%%)"
+    )
+    parser.add_argument(
+        "--guardrail-balance-floor", type=float, default=5.0,
+        help="Pause bot if balance drops below $X (default: 5.0)"
     )
     parser.add_argument(
         "--fok-retry-steps", type=int, default=3,
@@ -378,6 +472,7 @@ def main():
         speculative_enabled=args.speculative,
         speculative_momentum=args.spec_momentum,
         min_size_mode=args.min_size,
+        min_size_tokens=args.min_size_tokens,
         kelly_coins=kelly_coins,
         blocked_hours=blocked_hours,
         max_volatility=args.max_vol,
@@ -396,6 +491,13 @@ def main():
         observe_only=args.observe,
         log_file=args.log_file,
         fok_tolerance=args.fok_tolerance,
+        max_spread=args.max_spread,
+        btc_block_entry=args.btc_block_entry,
+        btc_block_momentum=args.btc_block_momentum,
+        guardrail_max_consec_losses=args.guardrail_max_consec_losses,
+        guardrail_max_window_loss=args.guardrail_max_window_loss,
+        guardrail_max_drawdown_pct=args.guardrail_max_drawdown_pct,
+        guardrail_balance_floor=args.guardrail_balance_floor,
         fok_retry_steps=args.fok_retry_steps,
         enable_cusum=args.enable_cusum,
         cusum_threshold=args.cusum_threshold,
@@ -415,6 +517,17 @@ def main():
         max_maker_orders=args.max_maker_orders,
         maker_pre_momentum=args.maker_pre_momentum,
         maker_sustain_seconds=args.maker_sustain_seconds,
+        maker_dual_mode=args.maker_dual_mode,
+        maker_rest_price=args.maker_rest_price,
+        maker_dynamic_pricing=args.maker_dynamic_pricing,
+        maker_max_entry_price=args.maker_max_entry_price,
+        maker_place_elapsed=args.maker_place_elapsed,
+        maker_cancel_momentum=args.maker_cancel_momentum,
+        maker_max_queue_ahead=args.maker_max_queue_ahead,
+        imbalance_min_ratio=args.imbalance_min_ratio,
+        multi_exchange=args.multi_exchange,
+        edge_model_path=args.edge_model,
+        min_edge_pct=args.min_edge_pct,
     )
 
     # Print config
@@ -446,6 +559,11 @@ def main():
     print(f"  Side filter:    {side_display}")
     weekend_status = f"{Colors.GREEN}BLOCKED{Colors.RESET}" if args.block_weekends else "Trading"
     print(f"  Weekends:       {weekend_status}")
+    if args.edge_model:
+        print(f"  Edge model:     {Colors.CYAN}{args.edge_model}{Colors.RESET}")
+        print(f"  Min edge:       {args.min_edge_pct:.0%}")
+    else:
+        print(f"  Edge model:     OFF")
     print()
 
     # Fee info

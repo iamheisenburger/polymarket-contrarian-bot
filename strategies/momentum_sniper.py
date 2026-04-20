@@ -39,6 +39,7 @@ from datetime import datetime, timezone, timedelta
 
 from lib.binance_ws import BinancePriceFeed
 from lib.coinbase_ws import CoinbasePriceFeed, COINBASE_SYMBOLS
+from lib.edge_model import EdgeModel
 # fair_value / direct_fv REMOVED — bot is pure momentum + TTE + entry-price
 from lib.console import Colors, LogBuffer, log
 from lib.trade_logger import TradeLogger
@@ -46,7 +47,7 @@ from lib.signal_logger import SignalLogger, SignalRecord
 from lib.shadow_logger import ShadowLogger
 from lib.market_manager import MarketManager, MarketInfo
 from src.bot import TradingBot, OrderResult
-from src.websocket_client import MarketWebSocket, OrderbookSnapshot, UserWebSocket
+from src.websocket_client import MarketWebSocket, OrderbookSnapshot, OrderbookLevel, UserWebSocket
 from src.gamma_client import GammaClient
 
 # Coins that use Coinbase as primary price feed (~0.8ms latency).
@@ -56,60 +57,112 @@ COINBASE_COINS = set(COINBASE_SYMBOLS.keys())  # {BTC, ETH, SOL, XRP, DOGE, HYPE
 
 class MultiPriceFeed:
     """
-    Routes price queries to the correct source per coin.
+    Aggregates multiple per-exchange price feeds into one interface.
 
-    HYPE -> CoinbasePriceFeed (not on Binance)
-    Everything else -> BinancePriceFeed (or ChainlinkPriceFeed)
+    First-tick-wins semantics: get_price / get_age return the freshest
+    observation across all feeds that support a given coin. Lets us benefit
+    from whichever exchange ticks fastest on each individual move.
 
-    Exposes the same interface as BinancePriceFeed so the strategy
-    doesn't need any per-call routing logic.
+    Backward compatible with the (primary_feed, coinbase_feed) legacy init.
+    Extra feeds (Kraken, Bybit spot, etc.) can be attached via `extra_feeds`.
     """
 
-    def __init__(self, primary_feed, coinbase_feed=None):
+    def __init__(self, primary_feed, coinbase_feed=None, extra_feeds=None):
         """
         Args:
             primary_feed: BinancePriceFeed or ChainlinkPriceFeed for most coins
-            coinbase_feed: CoinbasePriceFeed for HYPE (None if HYPE not in coin list)
+            coinbase_feed: CoinbasePriceFeed for HYPE (and others if used)
+            extra_feeds: list of additional feeds (KrakenPriceFeed, BybitSpotPriceFeed, ...)
         """
         self._primary = primary_feed
         self._coinbase = coinbase_feed
+        self._feeds: list = [primary_feed]
+        if coinbase_feed is not None:
+            self._feeds.append(coinbase_feed)
+        if extra_feeds:
+            self._feeds.extend([f for f in extra_feeds if f is not None])
 
-    def _feed_for(self, coin: str):
-        """Return the correct feed for a given coin."""
-        if self._coinbase and coin.upper() in COINBASE_COINS:
-            return self._coinbase
-        return self._primary
+    def _feeds_for(self, coin: str) -> list:
+        """Return feeds that advertise data for this coin (has it in _state)."""
+        c = coin.upper()
+        out = []
+        for f in self._feeds:
+            state = getattr(f, "_state", None)
+            if state and c in state:
+                out.append(f)
+        return out
+
+    def _freshest(self, coin: str):
+        """Return (feed, last_update_ts) with newest observation for coin, or (None, 0)."""
+        best_feed = None
+        best_ts = 0.0
+        for f in self._feeds_for(coin):
+            state = f._state[coin.upper()]
+            if state.price > 0 and state.last_update > best_ts:
+                best_feed = f
+                best_ts = state.last_update
+        return best_feed, best_ts
 
     @property
     def connected(self) -> bool:
-        ok = self._primary.connected
-        if self._coinbase:
-            ok = ok and self._coinbase.connected
-        return ok
+        # Primary must be up. Aux feeds can fail gracefully (we just lose their tick).
+        return bool(self._primary.connected)
 
     def get_price(self, coin: str = "BTC") -> float:
-        return self._feed_for(coin).get_price(coin)
+        feed, _ = self._freshest(coin)
+        if feed is not None:
+            return feed.get_price(coin)
+        # Fallback to legacy routing if no feed has data yet (startup race).
+        if self._coinbase and coin.upper() in COINBASE_COINS:
+            return self._coinbase.get_price(coin)
+        return self._primary.get_price(coin)
 
     def get_age(self, coin: str = "BTC") -> float:
-        return self._feed_for(coin).get_age(coin)
+        # Return the SMALLEST age across feeds (newest data).
+        best_age = float("inf")
+        for f in self._feeds_for(coin):
+            age = f.get_age(coin)
+            if age < best_age:
+                best_age = age
+        return best_age
 
     def get_volatility(self, coin: str = "BTC") -> float:
-        return self._feed_for(coin).get_volatility(coin)
+        # Prefer the freshest feed's vol estimate.
+        feed, _ = self._freshest(coin)
+        if feed is not None:
+            return feed.get_volatility(coin)
+        if self._coinbase and coin.upper() in COINBASE_COINS:
+            return self._coinbase.get_volatility(coin)
+        return self._primary.get_volatility(coin)
 
     def get_momentum(self, coin: str, lookback_seconds: float = 30.0) -> float:
-        return self._feed_for(coin).get_momentum(coin, lookback_seconds)
+        # Use the freshest feed's price history for the momentum calc.
+        # Each feed maintains its own history via its own sampling; we pick
+        # whichever has the most recent tick.
+        feed, _ = self._freshest(coin)
+        if feed is not None:
+            return feed.get_momentum(coin, lookback_seconds)
+        if self._coinbase and coin.upper() in COINBASE_COINS:
+            return self._coinbase.get_momentum(coin, lookback_seconds)
+        return self._primary.get_momentum(coin, lookback_seconds)
 
     async def start(self) -> bool:
+        # Start the primary first (must succeed) then others in parallel.
         ok = await self._primary.start()
-        if self._coinbase:
-            ok2 = await self._coinbase.start()
-            ok = ok and ok2
+        aux = [f for f in self._feeds if f is not self._primary]
+        if aux:
+            import asyncio as _aio
+            results = await _aio.gather(*[f.start() for f in aux], return_exceptions=True)
+            for f, r in zip(aux, results):
+                if isinstance(r, Exception):
+                    logger.warning(f"aux feed {type(f).__name__} failed to start: {r}")
         return ok
 
     async def stop(self):
-        await self._primary.stop()
-        if self._coinbase:
-            await self._coinbase.stop()
+        import asyncio as _aio
+        await _aio.gather(
+            *[f.stop() for f in self._feeds], return_exceptions=True
+        )
 
 
 # Taker fee rates per timeframe.
@@ -152,10 +205,14 @@ class SniperConfig:
     max_bet_usdc: float = 100.0     # Cap per trade (absolute)
     max_bet_fraction: float = 0.15  # Max fraction of bankroll per trade (15%)
 
-    # Conservative mode: always bet minimum (5 tokens) to gather data.
+    # Conservative mode: always bet fixed number of tokens per trade.
     # Use this when bankroll is small and you need statistical significance
     # before committing to full Kelly sizing.
     min_size_mode: bool = False
+
+    # Number of tokens per trade in min_size_mode. Default 5.
+    # At low bankroll, use 2-3 for survivability (2 tokens at $0.70 = $1.40/trade).
+    min_size_tokens: float = 5.0
 
     # Per-coin Kelly override: when min_size_mode is True, coins listed here
     # use Kelly sizing instead of min-size. Coins NOT listed stay at min-size.
@@ -180,6 +237,22 @@ class SniperConfig:
     # over the lookback period. 0.0005 = 0.05%. Set to 0.0 to disable.
     min_momentum: float = 0.0005
 
+    # Multi-exchange first-tick aggregation (added Apr-2026).
+    # When True, subscribes to Kraken + Bybit Spot in addition to the primary
+    # Binance/Coinbase feeds. MultiPriceFeed returns the freshest tick across
+    # all feeds, letting us react on whichever exchange ticks first.
+    multi_exchange: bool = False
+
+    # Book-imbalance confirmation gate (added Apr-2026).
+    # When firing FAK, check Polymarket bid-depth on our side vs opposite.
+    # our_ratio = our_side_bid_depth / (our_side_bid_depth + opposite_side_bid_depth)
+    # If our_ratio < imbalance_min_ratio → skip fire (book strongly disagrees).
+    # 0.0 = disabled (default OFF for safety; use --imbalance-min-ratio to enable).
+    # 0.40 = skip only when our side has < 40% of combined bid depth (permissive).
+    # 0.50 = skip unless book is at least neutral toward our side.
+    # 0.55 = require mild book agreement.
+    imbalance_min_ratio: float = 0.0
+
     # Pre-signal speculative GTC: place maker orders before signal fully confirms.
     # When momentum crosses speculative_momentum (lower than min_momentum), a GTC
     # rests on the book. If signal confirms, we're already in (zero fees, no race).
@@ -187,14 +260,27 @@ class SniperConfig:
     speculative_enabled: bool = False
     speculative_momentum: float = 0.0003  # Pre-signal momentum threshold
 
-    # GTD maker order system: place resting orders when pre-momentum detected.
-    # Master switch (off by default). When enabled, places GTD maker orders
-    # at favorable prices below the ask when early momentum is detected.
+    # GTD maker order system.
+    # Master switch (off by default). When enabled, ALL FAK firing paths are disabled.
     maker_enabled: bool = False
-    max_maker_orders: int = 3            # Max simultaneous resting orders
+    max_maker_orders: int = 6            # Max simultaneous resting orders (3 coins × 2 sides)
     maker_poll_interval: float = 5.0     # CLOB poll frequency (seconds)
-    maker_pre_momentum: float = 0.0005   # Lower threshold to trigger maker placement
-    maker_sustain_seconds: float = 5.0   # Momentum must stay above threshold this long before placing
+    maker_pre_momentum: float = 0.0005   # Lower threshold to trigger maker placement (single-side mode)
+    maker_sustain_seconds: float = 5.0   # Momentum sustain before placing (single-side mode)
+
+    # Dual-GTD mode: rest on BOTH UP and DOWN sides at a fixed price.
+    # The fill IS the signal — whichever side fills first is the trade.
+    # No direction prediction, no momentum confirmation for placement.
+    maker_dual_mode: bool = False
+    maker_rest_price: float = 0.55       # Fixed price to rest GTD orders at
+    maker_place_elapsed: float = 120.0   # Seconds into window before placing orders
+    maker_dynamic_pricing: bool = False  # Use best_ask - 0.01 instead of fixed rest price
+    maker_max_entry_price: float = 0.65  # Cap for dynamic pricing (EV goes negative above this)
+    maker_cancel_momentum: float = 0.0008  # Cancel threshold (higher than placement to give cancel latency buffer)
+    # Queue-aware placement gate. Skip placement if bid depth at >= rest_price
+    # exceeds this threshold. Heavy queue = our order would only fill on deep
+    # dips (= adverse selection). None disables the gate.
+    maker_max_queue_ahead: float = 0.0   # 0 = disabled; positive value = skip if total bid size at ≥ rest is greater than N
 
     # Momentum lookback period in seconds
     momentum_lookback: float = 30.0
@@ -300,6 +386,19 @@ class SniperConfig:
     # 0.0 = disabled (submit at exact ask). 0.01 = 1 cent tolerance (default).
     fok_tolerance: float = 0.04
 
+    # Maximum spread (ask - bid) to allow trading. Tight spreads mean
+    # makers are confident in the price. Wide spreads = uncertainty.
+    # Data: spread <= $0.02 has 80% WR vs 67% for spread > $0.02.
+    max_spread: float = 0.03
+
+    # BTC negative filter: block alt trades that disagree with BTC's
+    # direction when BTC's ask is >= this value. 0 = disabled.
+    # Data: +54% daily EV improvement, removes 59.8% WR trades, keeps 65.7% WR.
+    btc_block_entry: float = 0.0
+    # BTC displacement threshold for the block filter. BTC must have moved
+    # at least this much from strike before the filter activates.
+    btc_block_momentum: float = 0.0003
+
     # Number of FOK retry steps after initial rejection. Each step adds +1c.
     # With tolerance=0.04 and retries=3: tries at +4c, +5c, +6c, +7c.
     fok_retry_steps: int = 3
@@ -309,6 +408,23 @@ class SniperConfig:
     # - 5 losses out of last 10 -> stop live trading entirely
     # Cannot be disabled by any automated system — only by explicit CLI flag.
     enable_circuit_breaker: bool = True
+
+    # Edge model: empirical probability model calibrated on IC data.
+    # Compares our estimated live WR to the market price to compute edge.
+    # Only trades when edge > min_edge_pct.
+    # Path to IC CSV file for calibration. Empty = disabled.
+    edge_model_path: str = ""
+    # Minimum edge (as fraction) to trade. 0.0 = any positive edge.
+    # edge = estimated_live_WR - entry_price
+    min_edge_pct: float = 0.0
+
+    # Backtest-calibrated guardrails. Thresholds set just OUTSIDE worst
+    # case seen in simulation. If ANY triggers, bot pauses (touches .bot_paused).
+    # These must be recalibrated for each new config via config_sweep.py.
+    guardrail_max_consec_losses: int = 16        # backtest max was 14
+    guardrail_max_window_loss: float = 26.0      # backtest max was $21.90
+    guardrail_max_drawdown_pct: float = 40.0     # backtest max was 39.1%
+    guardrail_balance_floor: float = 5.0         # absolute minimum
 
 
 
@@ -533,6 +649,7 @@ class MakerOrder:
     size_matched: float = 0.0
     last_polled: float = 0.0
     reserved_usdc: float = 0.0
+    condition_id: str = "" # market condition ID for trades API fill detection
 
 
 class OrderLedger:
@@ -602,6 +719,86 @@ class OrderLedger:
         """Count of LIVE orders."""
         with self._lock:
             return sum(1 for o in self._orders.values() if o.status == "LIVE")
+
+
+class DualGTDState:
+    """
+    State machine for dual-GTD per coin per window.
+
+    States:
+        IDLE       → waiting for placement conditions
+        RESTING    → orders are live on the CLOB
+        FILLED     → one side filled, holding to settlement
+        CANCELLED  → reversal cancelled, done for this window
+        DONE       → window ended, no more action
+
+    Transitions:
+        IDLE → RESTING       (placement conditions met, orders placed)
+        RESTING → FILLED     (fill detected)
+        RESTING → CANCELLED  (momentum reversed past threshold)
+        RESTING → DONE       (window ending, orders expired)
+        FILLED → DONE        (market settled)
+        CANCELLED → DONE     (window ended)
+
+    NO re-entry: CANCELLED never goes back to IDLE or RESTING.
+    """
+
+    IDLE = "IDLE"
+    RESTING = "RESTING"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    DONE = "DONE"
+
+    def __init__(self):
+        # {slug:coin → state}
+        self._states: Dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def get(self, slug: str, coin: str) -> str:
+        with self._lock:
+            return self._states.get(f"{slug}:{coin}", self.IDLE)
+
+    def set(self, slug: str, coin: str, state: str):
+        with self._lock:
+            self._states[f"{slug}:{coin}"] = state
+
+    def can_place(self, slug: str, coin: str) -> bool:
+        """Only IDLE coins can have orders placed."""
+        return self.get(slug, coin) == self.IDLE
+
+    def can_cancel(self, slug: str, coin: str) -> bool:
+        """Only RESTING coins can be cancelled."""
+        return self.get(slug, coin) == self.RESTING
+
+    def mark_resting(self, slug: str, coin: str):
+        with self._lock:
+            key = f"{slug}:{coin}"
+            if self._states.get(key, self.IDLE) == self.IDLE:
+                self._states[key] = self.RESTING
+
+    def mark_filled(self, slug: str, coin: str):
+        with self._lock:
+            key = f"{slug}:{coin}"
+            # Can fill from RESTING or CANCELLED (fill-during-cancel)
+            if self._states.get(key) in (self.RESTING, self.CANCELLED):
+                self._states[key] = self.FILLED
+
+    def mark_cancelled(self, slug: str, coin: str):
+        with self._lock:
+            key = f"{slug}:{coin}"
+            if self._states.get(key) == self.RESTING:
+                self._states[key] = self.CANCELLED
+
+    def mark_done(self, slug: str, coin: str):
+        with self._lock:
+            self._states[f"{slug}:{coin}"] = self.DONE
+
+    def cleanup(self, old_slug: str):
+        """Remove all entries for an old window."""
+        with self._lock:
+            keys = [k for k in self._states if k.startswith(f"{old_slug}:")]
+            for k in keys:
+                del self._states[k]
 
 
 @dataclass
@@ -742,11 +939,37 @@ class MomentumSniperStrategy:
 
         coinbase_feed = CoinbasePriceFeed(coins=coinbase_coins) if coinbase_coins else None
 
+        # Extra exchange feeds for first-tick aggregation (Apr-2026).
+        # Enabled via config.multi_exchange. When on, Kraken and Bybit-Spot
+        # subscribe to every supported coin; the MultiPriceFeed picks whichever
+        # exchange delivers the freshest tick per get_price call.
+        extra_feeds: list = []
+        if getattr(config, "multi_exchange", False):
+            try:
+                from lib.kraken_ws import KrakenPriceFeed, KRAKEN_SYMBOLS
+                k_coins = [c for c in config.coins if c in KRAKEN_SYMBOLS]
+                if k_coins:
+                    extra_feeds.append(KrakenPriceFeed(coins=k_coins))
+            except Exception as e:
+                logger.warning(f"KrakenPriceFeed unavailable: {e}")
+            try:
+                from lib.bybit_spot_ws import BybitSpotPriceFeed, BYBIT_SPOT_SYMBOLS
+                b_coins = [c for c in config.coins if c in BYBIT_SPOT_SYMBOLS]
+                if b_coins:
+                    extra_feeds.append(BybitSpotPriceFeed(coins=b_coins))
+            except Exception as e:
+                logger.warning(f"BybitSpotPriceFeed unavailable: {e}")
+
         # If only Coinbase coins (e.g. only HYPE), coinbase IS the primary
         if primary_feed is None and coinbase_feed is not None:
-            self.binance = coinbase_feed
+            if extra_feeds:
+                self.binance = MultiPriceFeed(coinbase_feed, None, extra_feeds=extra_feeds)
+            else:
+                self.binance = coinbase_feed
         elif coinbase_feed is not None:
-            self.binance = MultiPriceFeed(primary_feed, coinbase_feed)
+            self.binance = MultiPriceFeed(primary_feed, coinbase_feed, extra_feeds=extra_feeds)
+        elif extra_feeds:
+            self.binance = MultiPriceFeed(primary_feed, None, extra_feeds=extra_feeds)
         else:
             self.binance = primary_feed
 
@@ -849,6 +1072,48 @@ class MomentumSniperStrategy:
             threshold=config.cusum_threshold,
         ) if config.enable_cusum else None
 
+        # Edge model: empirical probability from IC data
+        self._edge_model = None
+        if config.edge_model_path:
+            self._edge_model = EdgeModel.from_csv(config.edge_model_path)
+            if self._edge_model.loaded:
+                self._event_logger.info(f"EdgeModel loaded: {self._edge_model.summary()}")
+            else:
+                self._event_logger.warning(f"EdgeModel FAILED to load from {config.edge_model_path}")
+
+        # Maker IC v1 REMOVED — replaced by Shadow Maker IC v2
+        # v1 was misleading (showed 90% WR for configs that ran at 35% live)
+        # v1 code preserved in lib/maker_collector.py but no longer called
+        self._maker_collector = None
+
+        # Shadow Maker IC v2: simulates full dual-GTD lifecycle for trustworthy backtest
+        self._shadow_maker = None
+        if config.maker_enabled or config.maker_dual_mode:
+            from lib.shadow_maker import ShadowMaker, ShadowConfig
+            # Broad sweep: 12 prices × 8 momentums × 5 placements = 480 configs
+            # max_concurrent=99 (uncapped) — simulate concurrent offline from fill timestamps
+            shadow_configs = []
+            for rp in [0.50, 0.52, 0.55, 0.58, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]:
+                for cm in [0.0003, 0.0005, 0.0006, 0.0008, 0.0010, 0.0012, 0.0015, 0.0020]:
+                    for pe in [60, 90, 120, 150, 180]:
+                        cid = f"rp{int(rp*100)}_cm{round(cm*10000)}_pe{pe}"
+                        shadow_configs.append(ShadowConfig(
+                            config_id=cid, rest_price=rp,
+                            cancel_momentum=cm, place_elapsed=float(pe),
+                            max_concurrent=99,
+                            # Bot parity — enforce same placement gates
+                            min_momentum=config.min_momentum,
+                            max_queue_ahead=config.maker_max_queue_ahead,
+                            max_entry_price=config.max_entry_price,
+                        ))
+            self._shadow_maker = ShadowMaker(
+                output_path="data/shadow_maker.csv",
+                configs=shadow_configs,
+            )
+            self._event_logger.info(
+                f"ShadowMaker started: {len(shadow_configs)} configs → data/shadow_maker.csv"
+            )
+
         # Pending signals awaiting confirmation
         self._pending_signals: Dict[str, PendingSignal] = {}
 
@@ -858,6 +1123,9 @@ class MomentumSniperStrategy:
 
         # GTD maker order ledger (Phase 1 maker system)
         self._order_ledger = OrderLedger()
+        self._gtd_state = DualGTDState()
+        self._user_ws = None  # Set in start() if credentials available
+        self._pending_ws_subs = []
         self._maker_lock = threading.Lock()  # protects balance changes for maker orders
         self._maker_momentum_first_seen: Dict[str, float] = {}  # "coin:side" -> time first crossed threshold
 
@@ -884,6 +1152,7 @@ class MomentumSniperStrategy:
         self._collector_crossed: Dict[tuple, set] = {}  # (slug, side) -> set of crossed thresholds
         self._collector_pending: list = []  # pending signals awaiting resolution
         self._collector_thresholds = [0.0003, 0.0005, 0.0007, 0.001, 0.0012, 0.0015, 0.002, 0.003, 0.005]
+        self._coll_debug_logged: set = set()  # dedup for COLL-DBG logging
         self._collector_csv = config.log_file.replace(".csv", ".collector.csv") if config.log_file else "data/live_collector.csv"
         self._collector_resolved = 0
         # Write header if file doesn't exist
@@ -1039,21 +1308,55 @@ class MomentumSniperStrategy:
                 disp = (price - state.strike_price) / state.strike_price
                 abs_disp = abs(disp)
 
-                # DEBUG: log first threshold crossing per window to verify collector works
-                if abs_disp >= 0.0003:
-                    _dbg_key = (state.current_slug, coin)
-                    if not hasattr(self, '_coll_debug_logged'):
-                        self._coll_debug_logged = set()
-                    if _dbg_key not in self._coll_debug_logged:
-                        self._coll_debug_logged.add(_dbg_key)
-                        self._event_logger.info(
-                            f"[COLL-DBG] {coin} disp={disp:+.6f} abs={abs_disp:.6f} "
-                            f"slug={state.current_slug[-15:]} startup={state.startup_slug[-15:]} "
-                            f"pending={len(self._collector_pending)}"
+                # Maker IC: runs at ALL momentum levels (needs early window data)
+                if self._shadow_maker:
+                    tte_mic = state.seconds_to_expiry()
+                    duration_mic = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                    elapsed_mic = max(0, duration_mic - tte_mic)
+                    _up_ask = self._get_best_ask_with_rest_fallback(state, 'up')
+                    _up_bid = self._get_best_bid_with_rest_fallback(state, 'up')
+                    _dn_ask = self._get_best_ask_with_rest_fallback(state, 'down')
+                    _dn_bid = self._get_best_bid_with_rest_fallback(state, 'down')
+
+                    # Book depth for queue model: sum bid sizes by price.
+                    # Only populate if we have a book snapshot for that side.
+                    _up_bid_depth: Dict[float, float] = {}
+                    _dn_bid_depth: Dict[float, float] = {}
+                    try:
+                        _ob_up = state.manager.get_orderbook('up') if state.manager else None
+                        if _ob_up and _ob_up.bids:
+                            for lvl in _ob_up.bids:
+                                _up_bid_depth[lvl.price] = _up_bid_depth.get(lvl.price, 0.0) + lvl.size
+                        _ob_dn = state.manager.get_orderbook('down') if state.manager else None
+                        if _ob_dn and _ob_dn.bids:
+                            for lvl in _ob_dn.bids:
+                                _dn_bid_depth[lvl.price] = _dn_bid_depth.get(lvl.price, 0.0) + lvl.size
+                    except Exception:
+                        pass
+
+                    # Shadow Maker IC v2: tick at ALL elapsed (shadow handles its own timing)
+                    if self._shadow_maker:
+                        self._shadow_maker.tick(
+                            coin=state.coin, slug=state.current_slug,
+                            elapsed=elapsed_mic, spot=price, strike=state.strike_price,
+                            up_ask=_up_ask, up_bid=_up_bid,
+                            down_ask=_dn_ask, down_bid=_dn_bid,
+                            up_bid_depth_at=_up_bid_depth if _up_bid_depth else None,
+                            down_bid_depth_at=_dn_bid_depth if _dn_bid_depth else None,
                         )
 
                 if abs_disp < 0.0003:  # below lowest threshold
                     return
+
+                # DEBUG: log first threshold crossing per window (once per coin per slug)
+                _dbg_key = (state.current_slug, coin)
+                if _dbg_key not in self._coll_debug_logged:
+                    self._coll_debug_logged.add(_dbg_key)
+                    self._event_logger.info(
+                        f"[COLL-DBG] {coin} disp={disp:+.6f} abs={abs_disp:.6f} "
+                        f"slug={state.current_slug[-15:]} startup={state.startup_slug[-15:]} "
+                        f"pending={len(self._collector_pending)}"
+                    )
 
                 mom_dir = "up" if disp > 0 else "down"
                 opp_dir = "down" if mom_dir == "up" else "up"
@@ -1061,33 +1364,45 @@ class MomentumSniperStrategy:
                 duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
                 elapsed = max(0, duration - tte)
 
+                # Cache ask/bid once per tick (avoid repeated lock acquisition
+                # in _get_best_ask_with_rest_fallback which starves the event loop)
+                _cached_asks = {}
+                _cached_bids = {}
                 for cs in [mom_dir, opp_dir]:
                     ck = (state.current_slug, cs)
                     if ck not in self._collector_crossed:
                         self._collector_crossed[ck] = set()
-                    for ct in self._collector_thresholds:
-                        if abs_disp >= ct and ct not in self._collector_crossed[ck]:
-                            self._collector_crossed[ck].add(ct)
-                            ca = self._get_best_ask_with_rest_fallback(state, cs)
-                            cb = self._get_best_bid_with_rest_fallback(state, cs)
-                            self._collector_pending.append({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "slug": state.current_slug,
-                                "coin": state.coin,
-                                "side": cs,
-                                "momentum_direction": mom_dir,
-                                "is_momentum_side": cs == mom_dir,
-                                "threshold": ct,
-                                "entry_price": round(ca, 4) if ca < 1.0 else 0.0,
-                                "best_bid": round(cb, 4),
-                                "momentum": round(abs_disp, 8),
-                                "elapsed": round(elapsed, 1),
-                                "_created": time.time(),
-                            })
-                # FAST-FIRE: trade on this tick if momentum passes trading threshold.
-                # The collector has ALREADY recorded this crossing above.
-                # Same disp, same price, same tick = live ⊆ collector guaranteed.
+                    # Check if any new thresholds crossed before fetching prices
+                    new_thresholds = [ct for ct in self._collector_thresholds
+                                      if abs_disp >= ct and ct not in self._collector_crossed[ck]]
+                    if not new_thresholds:
+                        continue
+                    # Fetch ask/bid once per side per tick
+                    if cs not in _cached_asks:
+                        _cached_asks[cs] = self._get_best_ask_with_rest_fallback(state, cs)
+                        _cached_bids[cs] = self._get_best_bid_with_rest_fallback(state, cs)
+                    ca = _cached_asks[cs]
+                    cb = _cached_bids[cs]
+                    for ct in new_thresholds:
+                        self._collector_crossed[ck].add(ct)
+                        self._collector_pending.append({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "slug": state.current_slug,
+                            "coin": state.coin,
+                            "side": cs,
+                            "momentum_direction": mom_dir,
+                            "is_momentum_side": cs == mom_dir,
+                            "threshold": ct,
+                            "entry_price": round(ca, 4) if ca < 1.0 else 0.0,
+                            "best_bid": round(cb, 4),
+                            "momentum": round(abs_disp, 8),
+                            "elapsed": round(elapsed, 1),
+                            "_created": time.time(),
+                        })
                 if abs_disp < self.config.min_momentum:
+                    return
+                # GTD-only mode: skip FAK firing entirely, let _manage_maker_orders handle placement
+                if self.config.maker_enabled:
                     return
                 if not state.startup_slug or state.current_slug == state.startup_slug:
                     return
@@ -1095,8 +1410,27 @@ class MomentumSniperStrategy:
                     return
                 if self._is_paused():
                     return
+                # Don't fire in the last 10s of window — market is settling,
+                # ask/bid are unreliable, orders get rejected as invalid
+                if tte < 10:
+                    return
 
                 side = mom_dir  # trade in momentum direction
+
+                # BTC negative filter: block alt trades that disagree with
+                # BTC's direction when BTC has a confident signal (entry >= $0.50).
+                # Data: alts agreeing with BTC = 65.7% WR, disagreeing = 59.8% WR.
+                # Simulation: +54% daily EV improvement, no change to min balance.
+                if coin not in ("BTC", "ETH") and self.config.btc_block_entry > 0:
+                    btc_state = self.coin_states.get("BTC")
+                    if btc_state and btc_state.strike_price > 0:
+                        btc_spot = self.binance.get_price("BTC")
+                        btc_disp = (btc_spot - btc_state.strike_price) / btc_state.strike_price
+                        btc_dir = "up" if btc_disp > 0 else "down"
+                        if abs(btc_disp) >= self.config.btc_block_momentum:
+                            btc_ask = self._get_best_ask_with_rest_fallback(btc_state, btc_dir)
+                            if btc_ask >= self.config.btc_block_entry and side != btc_dir:
+                                return  # alt disagrees with confident BTC — block
 
                 # Block if we already have a position on EITHER side
                 # (prevents hedging — trading UP then DOWN in same window)
@@ -1107,11 +1441,36 @@ class MomentumSniperStrategy:
                 if best_ask <= 0 or best_ask > self.config.max_entry_price or best_ask < self.config.min_entry_price:
                     return
 
+                # Spread filter — tight spread = makers committed to price
+                best_bid = self._get_best_bid_with_rest_fallback(state, side)
+                if best_bid > 0 and (best_ask - best_bid) > self.config.max_spread:
+                    return
+
                 # TTE check
                 _ff_duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
                 _ff_tte = state.seconds_to_expiry()
                 if _ff_tte < (_ff_duration - self.config.max_window_elapsed) or _ff_tte > (_ff_duration - self.config.min_window_elapsed):
                     return
+
+                # Edge model: check empirical edge before firing
+                if self._edge_model and self._edge_model.loaded:
+                    _edge = self._edge_model.get_edge(best_ask, elapsed, abs_disp)
+                    if _edge is None:
+                        # No IC data for this bucket — skip (unknown territory)
+                        self._event_logger.info(
+                            f"[EDGE-SKIP] {coin} {side} ep={best_ask:.2f} el={elapsed:.0f}s "
+                            f"mom={abs_disp:.5f} — no IC data for bucket"
+                        )
+                        return
+                    if _edge < self.config.min_edge_pct:
+                        _detail = self._edge_model.get_detail(best_ask, elapsed, abs_disp)
+                        self._event_logger.info(
+                            f"[EDGE-BLOCK] {coin} {side} ep={best_ask:.2f} el={elapsed:.0f}s "
+                            f"mom={abs_disp:.5f} ic_wr={_detail['ic_wr']:.1%} "
+                            f"live_wr={_detail['est_live_wr']:.1%} "
+                            f"edge={_edge:+.1%} < min={self.config.min_edge_pct:.1%}"
+                        )
+                        return
 
                 # Dedup: one signal per market/side
                 snipe_key = f"{state.current_slug}:{side}"
@@ -1128,6 +1487,20 @@ class MomentumSniperStrategy:
                     self._snipe_in_flight.discard(snipe_key)
                     return
 
+                # Book-imbalance confirmation gate (Apr-2026).
+                _imb_ok, _imb_ratio, _imb_reason = self._check_book_imbalance(state, side)
+                if not _imb_ok:
+                    self._event_logger.info(
+                        f"[IMBAL-SKIP] {coin} {side} our_ratio={_imb_ratio:.2%} "
+                        f"< min={self.config.imbalance_min_ratio:.0%} — book disagrees"
+                    )
+                    self._snipe_in_flight.discard(snipe_key)
+                    return
+                if _imb_reason == "agree":
+                    self._event_logger.info(
+                        f"[IMBAL-OK] {coin} {side} our_ratio={_imb_ratio:.2%}"
+                    )
+
                 # Set position sentinel BEFORE queuing — prevents race where
                 # a second tick fires the opposite side before the signal
                 # thread processes the first. This is in the callback thread.
@@ -1137,11 +1510,15 @@ class MomentumSniperStrategy:
                     state.down_tokens = 0.01
 
                 signal_time = time.time()
+                # Capture edge for logging (None if model not loaded)
+                _signal_edge = _edge if (self._edge_model and self._edge_model.loaded) else None
 
                 if self._fast_order:
                     _t_queued = time.time()
                     def _signal_task(state=state, side=side, best_ask=best_ask,
-                                     disp=disp, signal_time=signal_time, snipe_key=snipe_key):
+                                     disp=disp, signal_time=signal_time, snipe_key=snipe_key,
+                                     sig_edge=_signal_edge):
+                        fast_success = False
                         try:
                             buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
                                             self.config.max_entry_price)
@@ -1158,9 +1535,21 @@ class MomentumSniperStrategy:
 
                             # Sentinel already set in callback thread above
 
-                            result = self._fast_order._place_order_sync(
-                                token_id, buy_price, 5.0, "BUY", "FAK", 1000,
-                            )
+                            # Try pre-signed order first (~23ms) then fall back to full sign (~280ms)
+                            result = None
+                            presigned_cache = getattr(self, '_presigned_cache', {})
+                            ladder = presigned_cache.get((state.coin, side))
+                            if ladder:
+                                price_key = int(buy_price * 100)
+                                body_str = ladder.get(price_key)
+                                if body_str:
+                                    result = self._fast_order.post_presigned_order(body_str)
+
+                            # Fall back to full sign if no pre-signed match
+                            if result is None:
+                                result = self._fast_order._place_order_sync(
+                                    token_id, buy_price, self.config.min_size_tokens, "BUY", "FAK", 1000,
+                                )
                             has_error = bool(result.get("error", ""))
                             has_order_id = bool(result.get("orderID", ""))
                             taking = float(result.get("takingAmount", 0) or 0)
@@ -1175,6 +1564,16 @@ class MomentumSniperStrategy:
                             )
 
                             if not fast_success:
+                                # Log rejection details for adverse selection analysis
+                                current_ask = state.manager.get_best_ask(side)
+                                current_bid = state.manager.get_best_bid(side)
+                                spread = current_ask - current_bid if current_bid > 0 else 0
+                                self._event_logger.info(
+                                    f"[FAK-REJECT] {state.coin} {side} bid=${buy_price:.2f} "
+                                    f"ask_now=${current_ask:.2f} spread=${spread:.2f} "
+                                    f"mom={abs_disp:.5f} el={elapsed:.0f}s "
+                                    f"error={result.get('error','')[:80]} lat={total_lat:.0f}ms"
+                                )
                                 if side == "up":
                                     state.up_tokens = 0
                                 else:
@@ -1197,10 +1596,11 @@ class MomentumSniperStrategy:
                             self.stats.pending += 1
                             self.stats.total_wagered += actual_cost
 
+                            edge_str = f"{sig_edge:+.1%}" if sig_edge is not None else "N/A"
                             self._event_logger.info(
                                 f"SNIPE {state.coin} {side.upper()} @ {buy_price:.2f} "
                                 f"x{filled_tokens:.0f} (${actual_cost:.2f}) "
-                                f"edge=0.00 [FAST-FIRE] strike={getattr(state, '_strike_source', '?')} "
+                                f"edge={edge_str} [FAST-FIRE] strike={getattr(state, '_strike_source', '?')} "
                                 f"lat={total_lat:.0f}ms"
                             )
 
@@ -1236,9 +1636,13 @@ class MomentumSniperStrategy:
                             elif side == "down" and state.down_tokens == 0.01:
                                 state.down_tokens = 0
                         finally:
-                            self._snipe_in_flight.discard(snipe_key)
+                            # Only discard snipe key on SUCCESS so failed signals
+                            # don't retry on every subsequent tick (was causing 96%
+                            # of rejections to be retry spam on the same failed order)
+                            if fast_success:
+                                self._snipe_in_flight.discard(snipe_key)
 
-                    self._fast_order._signal_queue.put(_signal_task)
+                    self._fast_order._signal_pool.submit(_signal_task)
                 else:
                     self._snipe_in_flight.discard(snipe_key)
 
@@ -1248,13 +1652,23 @@ class MomentumSniperStrategy:
             if abs(disp) < self.config.min_momentum:
                 return
 
+            # GTD-only mode: skip tick-loop FAK firing
+            if self.config.maker_enabled:
+                return
+
             side = "up" if disp > 0 else "down"
 
-            # LEADER FILTER REMOVED — collector data shows unfiltered signals
-            # deliver 73% WR (n=63) while the leader filter let through only 3
-            # signals at 33% WR. The filter was blocking winners, not losers.
-            # Previous rationale ("aligned=82%, contradicting=37%") was from a
-            # different time period / config. Re-evaluate with more data later.
+            # BTC negative filter (tick-loop path) — same as fast-fire path
+            if coin not in ("BTC", "ETH") and self.config.btc_block_entry > 0:
+                btc_state = self.coin_states.get("BTC")
+                if btc_state and btc_state.strike_price > 0:
+                    btc_spot = self.binance.get_price("BTC")
+                    btc_disp = (btc_spot - btc_state.strike_price) / btc_state.strike_price
+                    btc_dir = "up" if btc_disp > 0 else "down"
+                    if abs(btc_disp) >= 0.0003:  # BTC has a signal (IC-validated)
+                        btc_ask = self._get_best_ask_with_rest_fallback(btc_state, btc_dir)
+                        if btc_ask >= self.config.btc_block_entry and side != btc_dir:
+                            return
 
             if side == "up" and state.has_up_position:
                 return
@@ -1265,11 +1679,41 @@ class MomentumSniperStrategy:
             if best_ask <= 0 or best_ask > self.config.max_entry_price or best_ask < self.config.min_entry_price:
                 return
 
+            # Spread filter — tight spread = makers committed to price
+            best_bid = self._get_best_bid_with_rest_fallback(state, side)
+            if best_bid > 0 and (best_ask - best_bid) > self.config.max_spread:
+                return
+
             # TTE check (cheap arithmetic)
             _duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
             tte = state.seconds_to_expiry()
             if tte < (_duration - self.config.max_window_elapsed) or tte > (_duration - self.config.min_window_elapsed):
                 return
+            if tte < 10:
+                return  # Market settling, orders rejected as invalid
+
+            # Edge model check (tick-loop path)
+            if self._edge_model and self._edge_model.loaded:
+                _elapsed_tl = _duration - tte
+                _abs_disp_tl = abs(disp)
+                _edge_tl = self._edge_model.get_edge(best_ask, _elapsed_tl, _abs_disp_tl)
+                if _edge_tl is None:
+                    return
+                if _edge_tl < self.config.min_edge_pct:
+                    return
+
+            # Book-imbalance confirmation gate (Apr-2026 — tick-loop path).
+            _imb_ok, _imb_ratio, _imb_reason = self._check_book_imbalance(state, side)
+            if not _imb_ok:
+                self._event_logger.info(
+                    f"[IMBAL-SKIP] {coin} {side} our_ratio={_imb_ratio:.2%} "
+                    f"< min={self.config.imbalance_min_ratio:.0%} — book disagrees (tick-loop)"
+                )
+                return
+            if _imb_reason == "agree":
+                self._event_logger.info(
+                    f"[IMBAL-OK] {coin} {side} our_ratio={_imb_ratio:.2%} (tick-loop)"
+                )
 
             # Dedup: one signal per market/side in flight
             snipe_key = f"{state.current_slug}:{side}"
@@ -1291,6 +1735,7 @@ class MomentumSniperStrategy:
                 # (serial execution prevents race conditions)
                 _t_queued = time.time()
                 def _signal_task():
+                    fast_success = False
                     try:
                         _t_start = time.time()
                         _queue_wait = (_t_start - _t_queued) * 1000
@@ -1321,13 +1766,24 @@ class MomentumSniperStrategy:
                         else:
                             state.down_tokens = 0.01  # sentinel
 
-                        # FAK execution — fill-and-kill at best ask + tolerance.
-                        # Taker fees are 0 bps on 5m crypto markets (confirmed from
-                        # CLOB docs and live trade data: bet_size = price × tokens exactly).
+                        # FAK execution — try pre-signed first (~23ms) then fall back
+                        # to full sign (~270ms). Pre-signed cache is built at market
+                        # transition with every $0.01 from min to max entry price.
                         _t_pre_order = time.time()
-                        result = self._fast_order._place_order_sync(
-                            token_id, buy_price, 5.0, "BUY", "FAK", 1000,
-                        )
+                        result = None
+                        presigned_cache = getattr(self, '_presigned_cache', {})
+                        ladder = presigned_cache.get((state.coin, side))
+                        if ladder:
+                            price_key = int(buy_price * 100)
+                            body_str = ladder.get(price_key)
+                            if body_str:
+                                result = self._fast_order.post_presigned_order(body_str)
+
+                        # Fall back to full sign if no pre-signed match
+                        if result is None:
+                            result = self._fast_order._place_order_sync(
+                                token_id, buy_price, self.config.min_size_tokens, "BUY", "FAK", 1000,
+                            )
                         _t_post_order = time.time()
                         _order_ms = (_t_post_order - _t_pre_order) * 1000
                         _pre_order_ms = (_t_pre_order - _t_start) * 1000
@@ -1349,6 +1805,16 @@ class MomentumSniperStrategy:
                         )
 
                         if not fast_success:
+                            # Log rejection details for adverse selection analysis
+                            current_ask = state.manager.get_best_ask(side)
+                            current_bid = state.manager.get_best_bid(side)
+                            spread = current_ask - current_bid if current_bid > 0 else 0
+                            self._event_logger.info(
+                                f"[FAK-REJECT] {state.coin} {side} bid=${buy_price:.2f} "
+                                f"ask_now=${current_ask:.2f} spread=${spread:.2f} "
+                                f"mom={abs(disp):.5f} el={300 - tte:.0f}s "
+                                f"error={result.get('error','')[:80]} lat={total_lat:.0f}ms"
+                            )
                             if side == "up":
                                 state.up_tokens = 0
                             else:
@@ -1418,10 +1884,11 @@ class MomentumSniperStrategy:
                         elif side == "down" and state.down_tokens == 0.01:
                             state.down_tokens = 0
                     finally:
-                        self._snipe_in_flight.discard(snipe_key)
-                        pass  # position tracked via state.up_tokens/down_tokens
+                        # Only discard on success — prevents retry spam
+                        if fast_success:
+                            self._snipe_in_flight.discard(snipe_key)
 
-                self._fast_order._signal_queue.put(_signal_task)
+                self._fast_order._signal_pool.submit(_signal_task)
             else:
                 # No FastOrder — fallback to tick loop
                 self._snipe_in_flight.discard(snipe_key)
@@ -1604,6 +2071,8 @@ class MomentumSniperStrategy:
                                         "success"
                                     )
                                     await self._record_maker_fill(filled_order, matched)
+                                    if self.config.maker_dual_mode:
+                                        await self._cancel_opposite_side(filled_order)
 
                         # Also check taker_order_id (if our GTD crossed as taker)
                         taker_oid = event.get("taker_order_id", "")
@@ -1619,6 +2088,8 @@ class MomentumSniperStrategy:
                                         "success"
                                     )
                                     await self._record_maker_fill(filled_order, size)
+                                    if self.config.maker_dual_mode:
+                                        await self._cancel_opposite_side(filled_order)
 
                     # Subscribe to all current markets
                     condition_ids = []
@@ -1704,6 +2175,35 @@ class MomentumSniperStrategy:
                 return cached[2]  # best_bid from REST
         return best_bid
 
+    def _check_book_imbalance(self, state: 'CoinMarketState', side: str):
+        """Check Polymarket bid-depth imbalance as a confirmatory gate before fire.
+
+        Returns (ok: bool, our_ratio: float, reason: str).
+        When imbalance_min_ratio is 0 or book data is missing, always returns ok=True.
+        When set, fail iff our_side's bid depth is less than min_ratio of total bid depth
+        across both sides — i.e. the book disagrees with our momentum direction.
+
+        Rationale: informed participants accumulate bid depth on the side they expect
+        to win. Our momentum signal + book agreement = stronger confirmation.
+        """
+        min_ratio = self.config.imbalance_min_ratio
+        if min_ratio <= 0:
+            return True, 0.0, "disabled"
+        up_ob = state.manager.get_orderbook('up') if state.manager else None
+        down_ob = state.manager.get_orderbook('down') if state.manager else None
+        if not up_ob or not down_ob or not up_ob.bids or not down_ob.bids:
+            return True, 0.0, "no_book"
+        up_depth = sum(lvl.size for lvl in up_ob.bids)
+        down_depth = sum(lvl.size for lvl in down_ob.bids)
+        total = up_depth + down_depth
+        if total < 10:
+            return True, 0.0, "thin_book"  # Don't block on under-populated books
+        our_depth = up_depth if side == "up" else down_depth
+        our_ratio = our_depth / total
+        if our_ratio >= min_ratio:
+            return True, our_ratio, "agree"
+        return False, our_ratio, "disagree"
+
     def _register_callbacks(self, coin: str, manager: MarketManager):
         """Register market change callbacks for a coin."""
         @manager.on_market_change
@@ -1719,6 +2219,36 @@ class MomentumSniperStrategy:
                         token_id=trade.asset_id,
                         size=float(trade.size),
                         side=trade.side,
+                    )
+                except Exception:
+                    pass
+
+        # Shadow queue model: feed SELL trade events (= counterparty hitting our
+        # side of the book) so shadow can decrement queue_ahead for resting orders.
+        if self._shadow_maker:
+            @manager.on_trade_event
+            def on_trade_shadow(trade, _coin=coin, _manager=manager):
+                try:
+                    # Only SELL trades affect our bid-side queue
+                    if getattr(trade, 'side', '') != 'SELL':
+                        return
+                    current_mkt = _manager.current_market
+                    if not current_mkt:
+                        return
+                    # Map asset_id → outcome side (up/down) via token_ids
+                    trade_side = None
+                    for s in ('up', 'down'):
+                        if current_mkt.token_ids.get(s) == trade.asset_id:
+                            trade_side = s
+                            break
+                    if not trade_side:
+                        return
+                    self._shadow_maker.on_trade(
+                        slug=_manager.current_slug or '',
+                        coin=_coin,
+                        traded_outcome_side=trade_side,
+                        trade_price=float(trade.price),
+                        trade_size=float(trade.size),
                     )
                 except Exception:
                     pass
@@ -1739,6 +2269,14 @@ class MomentumSniperStrategy:
         state.current_slug = slug
         state.market_start_time = time.time()
         strike_source = "unknown"
+
+        # Subscribe UserWS to new market for real-time fill detection
+        # Always queue — UserWS might not exist yet during startup but will be
+        # created shortly after. The tick loop processes the queue when WS is ready.
+        cid = getattr(market, 'condition_id', '')
+        if cid:
+            self._pending_ws_subs.append(cid)
+            self._event_logger.info(f"[USER-WS] Queued {state.coin} {cid[:16]}... (pending={len(self._pending_ws_subs)})")
 
         # Parse market start/end time from slug or end_date
         market_start_ts = 0
@@ -1973,6 +2511,10 @@ class MomentumSniperStrategy:
         """
         opportunities = []
 
+        # GTD-only mode: skip find_opportunities entirely (maker handles placement)
+        if self.config.maker_enabled:
+            return []
+
         # Circuit breaker: stop trading after N consecutive losses
         if self._circuit_breaker_tripped:
             return []
@@ -2192,6 +2734,11 @@ class MomentumSniperStrategy:
                 if best_ask < coin_min_entry:
                     continue
 
+                # Spread filter — tight spread = makers committed to price
+                _tick_bid = self._get_best_bid_with_rest_fallback(state, side)
+                if _tick_bid > 0 and (best_ask - _tick_bid) > self.config.max_spread:
+                    continue
+
                 # Never buy the opposite side of an existing position.
                 if side == "up" and state.has_down_position:
                     continue
@@ -2251,6 +2798,25 @@ class MomentumSniperStrategy:
                                         "elapsed": round(_elapsed, 1),
                                         "_created": time.time(),
                                     })
+
+                    # Edge model check (tick-loop evaluate path)
+                    if self._edge_model and self._edge_model.loaded:
+                        _edge_ev = self._edge_model.get_edge(best_ask, _elapsed, _abs_disp)
+                        if _edge_ev is None:
+                            self._event_logger.info(
+                                f"[EDGE-SKIP] {state.coin} {side} ep={best_ask:.2f} el={_elapsed:.0f}s "
+                                f"mom={_abs_disp:.5f} — no IC data for bucket"
+                            )
+                            continue
+                        if _edge_ev < self.config.min_edge_pct:
+                            _detail_ev = self._edge_model.get_detail(best_ask, _elapsed, _abs_disp)
+                            self._event_logger.info(
+                                f"[EDGE-BLOCK] {state.coin} {side} ep={best_ask:.2f} el={_elapsed:.0f}s "
+                                f"mom={_abs_disp:.5f} ic_wr={_detail_ev['ic_wr']:.1%} "
+                                f"live_wr={_detail_ev['est_live_wr']:.1%} "
+                                f"edge={_edge_ev:+.1%} < min={self.config.min_edge_pct:.1%}"
+                            )
+                            continue
 
                     # VPIN data collection (log alongside signal, no filtering)
                     _vpin_val = None
@@ -2403,7 +2969,7 @@ class MomentumSniperStrategy:
         if self.config.observe_only:
             # Paper trading with realistic simulation
             fair_prob = 0.0  # No FV model — pure momentum
-            num_tokens = 5.0
+            num_tokens = self.config.min_size_tokens
             buy_price = round(entry_price, 2)
 
             # FOK rejection simulation: log depth but don't skip.
@@ -2488,7 +3054,7 @@ class MomentumSniperStrategy:
         else:
             # Conservative: always bet exactly 5 tokens (Polymarket minimum).
             # Cheapest way to get data on whether the edge is real.
-            num_tokens = 5.0
+            num_tokens = self.config.min_size_tokens
             bet_usdc = num_tokens * entry_price
             # Polymarket rejects orders below $1.00 USDC
             if bet_usdc < 1.0:
@@ -2500,7 +3066,7 @@ class MomentumSniperStrategy:
                 self.log(f"BALANCE FLOOR: ${self._available_balance():.2f} - ${bet_usdc:.2f} would drop below ${self.config.balance_floor:.2f} floor. Skipping.", "warning")
                 return False
 
-        if num_tokens < 5.0:
+        if num_tokens < self.config.min_size_tokens:
             # Not enough for Polymarket minimum order size
             return False
 
@@ -2858,6 +3424,40 @@ class MomentumSniperStrategy:
         # Resolve integrated collector signals (runs even with no trades pending)
         if self._collector_pending:
             self._resolve_collector_pending(gamma)
+        # Flush maker IC resolved records to CSV
+        # Maker IC v1 removed — shadow v2 handles resolution below
+        if self._shadow_maker:
+            # Self-resolve: the shadow has fills for windows the live bot didn't trade.
+            # Resolve them independently via Gamma API.
+            unresolved_slugs = set()
+            for order in self._shadow_maker._pending:
+                if order.state == "FILLED" and not order.outcome:
+                    unresolved_slugs.add(order.slug)
+            # Also check _orders for FILLED but not yet moved to pending
+            for order in self._shadow_maker._orders.values():
+                if order.state == "FILLED" and not order.outcome:
+                    unresolved_slugs.add(order.slug)
+
+            if unresolved_slugs:
+                from src.gamma_client import GammaClient
+                gamma = GammaClient()
+                for slug in unresolved_slugs:
+                    try:
+                        market_data = gamma.get_market_by_slug(slug)
+                        if not market_data:
+                            continue
+                        prices = gamma.parse_prices(market_data)
+                        up_price = prices.get("up", 0)
+                        down_price = prices.get("down", 0)
+                        if up_price > 0.9:
+                            self._shadow_maker.resolve(slug, "up")
+                        elif down_price > 0.9:
+                            self._shadow_maker.resolve(slug, "down")
+                    except Exception:
+                        pass
+
+            self._shadow_maker.flush()
+            self._event_logger.info(f"[SHADOW-IC] {self._shadow_maker.get_stats()}")
             # Memory safety: drop signals older than 10 min that failed to resolve
             # (market expired but Gamma API never returned result)
             if len(self._collector_pending) > 500:
@@ -2900,6 +3500,12 @@ class MomentumSniperStrategy:
 
                 side_won = (record.side == winning_side)
                 payout = record.num_tokens * 1.0 if side_won else 0.0
+
+                # Maker IC: resolve simulated fills for this market
+                # Maker IC v1 removed
+                if self._shadow_maker:
+                    self._shadow_maker.resolve(record.market_slug, winning_side)
+                    self._shadow_maker.flush()
 
                 # Diagnostic: log raw prices for settlement verification
                 self._event_logger.info(
@@ -3010,6 +3616,11 @@ class MomentumSniperStrategy:
 
             winner = slug_results.get(slug)
             if winner is not None:
+                # Maker IC: resolve simulated fills for this settled market
+                # Maker IC v1 removed
+                if self._shadow_maker:
+                    self._shadow_maker.resolve(slug, winner)
+
                 outcome = "won" if winner == sig["side"] else "lost"
                 row = [
                     sig["timestamp"], sig["slug"], sig["coin"], sig["side"],
@@ -3057,6 +3668,72 @@ class MomentumSniperStrategy:
                     level="error",
                 )
 
+    def _check_guardrails(self):
+        """Check backtest-calibrated guardrails. Pause if anything exceeds
+        what was seen in simulation — indicates an unseen regime."""
+        import os
+
+        # 1. Consecutive losses
+        if not hasattr(self, '_guardrail_consec_losses'):
+            self._guardrail_consec_losses = 0
+            self._guardrail_peak_balance = self._balance
+            self._guardrail_window_pnl = {}  # slug -> cumulative pnl
+
+        # Track consecutive losses from _cb_recent_outcomes
+        consec = 0
+        for o in reversed(self._cb_recent_outcomes):
+            if not o:
+                consec += 1
+            else:
+                break
+        self._guardrail_consec_losses = consec
+
+        # Track peak balance
+        if self._balance > self._guardrail_peak_balance:
+            self._guardrail_peak_balance = self._balance
+
+        # 1. Max consecutive losses
+        if (self.config.guardrail_max_consec_losses > 0 and
+                self._guardrail_consec_losses >= self.config.guardrail_max_consec_losses):
+            self._event_logger.error(
+                f"[GUARDRAIL] {self._guardrail_consec_losses} consecutive losses "
+                f"(limit: {self.config.guardrail_max_consec_losses}). PAUSING BOT."
+            )
+            self._pause_bot("guardrail: consecutive losses")
+            return
+
+        # 2. Balance floor
+        if (self.config.guardrail_balance_floor > 0 and
+                self._balance <= self.config.guardrail_balance_floor):
+            self._event_logger.error(
+                f"[GUARDRAIL] Balance ${self._balance:.2f} below floor "
+                f"${self.config.guardrail_balance_floor:.2f}. PAUSING BOT."
+            )
+            self._pause_bot("guardrail: balance floor")
+            return
+
+        # 3. Drawdown from peak
+        if self._guardrail_peak_balance > 0 and self.config.guardrail_max_drawdown_pct > 0:
+            drawdown_pct = (self._guardrail_peak_balance - self._balance) / self._guardrail_peak_balance * 100
+            if drawdown_pct >= self.config.guardrail_max_drawdown_pct:
+                self._event_logger.error(
+                    f"[GUARDRAIL] Drawdown {drawdown_pct:.1f}% from peak ${self._guardrail_peak_balance:.2f} "
+                    f"(limit: {self.config.guardrail_max_drawdown_pct}%). PAUSING BOT."
+                )
+                self._pause_bot("guardrail: max drawdown")
+                return
+
+    def _pause_bot(self, reason: str):
+        """Touch .bot_paused to stop trading. Process stays alive for IC."""
+        import os
+        pause_path = os.path.join(os.path.dirname(self.config.log_file or "data/x"), ".bot_paused")
+        try:
+            with open(pause_path, "w") as f:
+                f.write(reason)
+            self._event_logger.error(f"[GUARDRAIL] Bot paused: {reason}")
+        except Exception as e:
+            self._event_logger.error(f"[GUARDRAIL] Failed to pause: {e}")
+
     def _settle_shadow_pending(self, gamma):
         """Resolve shadow records that are paper-only (no live trade).
 
@@ -3095,6 +3772,15 @@ class MomentumSniperStrategy:
         if not state:
             return
 
+        # Subscribe UserWS to new market for fill detection
+        has_mgr = bool(state.manager)
+        has_mkt = bool(state.manager and state.manager.current_market) if has_mgr else False
+        cid = getattr(state.manager.current_market, 'condition_id', '') if has_mkt else ''
+        self._event_logger.info(f"[USER-WS-DBG] {coin} market_change: mgr={has_mgr} mkt={has_mkt} cid={cid[:16] if cid else 'NONE'}")
+        if cid:
+            self._pending_ws_subs.append(cid)
+            self._event_logger.info(f"[USER-WS] Queued {coin} {cid[:16]}...")
+
         # Clear integrated collector dedup for old market (both callback and trade paths)
         for side in ("up", "down"):
             self._collector_crossed.pop((old_slug, side), None)
@@ -3103,6 +3789,10 @@ class MomentumSniperStrategy:
         # Reset maker sustain timers for this coin on market change
         self._maker_momentum_first_seen.pop(f"{coin}:up", None)
         self._maker_momentum_first_seen.pop(f"{coin}:down", None)
+
+        # Shadow Maker IC: clean up state for old market
+        if self._shadow_maker:
+            self._shadow_maker.on_market_change(old_slug)
 
         # Handle maker orders on market change (cancel unfilled, record filled)
         if self.config.maker_enabled:
@@ -3178,6 +3868,10 @@ class MomentumSniperStrategy:
                         f"${pnl:+.2f} | Session: ${self.stats.realized_pnl:+.2f}{cusum_str}",
                         "success" if side_won else "warning"
                     )
+
+                    # Backtest-calibrated guardrails — pause if anything
+                    # exceeds what was seen in simulation
+                    self._check_guardrails()
                 # Shadow log: also resolve any paper-only shadow records for this market
                 if self.shadow_logger:
                     self.shadow_logger.resolve_all_for_market(old_slug, winning_side)
@@ -3215,6 +3909,62 @@ class MomentumSniperStrategy:
                         self.bot._official_client.get_tick_size(tid)
                     except Exception:
                         pass
+
+        # Immediate REST book fetch for new market — pre-warm BOTH the REST
+        # cache AND the WS orderbook cache. This eliminates the 0.5-3s gap
+        # where WS has no data for new token IDs after market transition.
+        # Without this, signals hitting get_best_ask() return 1.0 (empty book).
+        if state.manager.current_market and hasattr(self, '_rest_cache_lock'):
+            token_ids = state.manager.token_ids
+            for side_name in ("up", "down"):
+                tid = token_ids.get(side_name, "")
+                if tid:
+                    try:
+                        book = self.bot.clob_client.get_order_book(tid)
+                        asks = book.get("asks", [])
+                        bids = book.get("bids", [])
+                        ba = min(float(a.get("price", 1)) for a in asks) if asks else 0.0
+                        bb = max(float(b.get("price", 0)) for b in bids) if bids else 0.0
+                        # Populate REST cache
+                        with self._rest_cache_lock:
+                            self._rest_book_cache[tid] = (time.time(), ba, bb)
+                        # Inject directly into WS orderbook cache so
+                        # get_best_ask() returns real data immediately
+                        if state.manager.ws and asks:
+                            snapshot = OrderbookSnapshot(
+                                asset_id=tid,
+                                market="",
+                                timestamp=int(time.time()),
+                                bids=[OrderbookLevel(price=float(b["price"]), size=float(b["size"])) for b in bids],
+                                asks=[OrderbookLevel(price=float(a["price"]), size=float(a["size"])) for a in asks],
+                            )
+                            snapshot.bids.sort(key=lambda x: x.price, reverse=True)
+                            snapshot.asks.sort(key=lambda x: x.price)
+                            state.manager.ws._orderbooks[tid] = snapshot
+                    except Exception:
+                        pass
+
+        # Pre-sign order ladder for instant execution (~23ms instead of ~280ms).
+        # Signs FAK orders at every $0.01 from min to max entry price.
+        # On signal, we just POST the matching pre-signed body — no signing delay.
+        if self._fast_order and state.manager.current_market:
+            if not hasattr(self, '_presigned_cache'):
+                self._presigned_cache = {}
+            token_ids = state.manager.token_ids
+            for side_name in ("up", "down"):
+                tid = token_ids.get(side_name)
+                if tid:
+                    try:
+                        ladder = self._fast_order.presign_price_ladder(
+                            tid, 5.0, "BUY",
+                            self.config.min_entry_price,
+                            self.config.max_entry_price,
+                            step=0.01,
+                            fee_rate_bps=1000,
+                        )
+                        self._presigned_cache[(coin, side_name)] = ladder
+                    except Exception as e:
+                        self._event_logger.warning(f"[PRESIGN] {coin} {side_name} failed: {e}")
 
         # Clear signal logger dedup for old market
         if self.signal_logger and old_slug:
@@ -3315,19 +4065,16 @@ class MomentumSniperStrategy:
     async def _manage_maker_orders(self):
         """Place/monitor/cancel GTD maker orders for all coins.
 
-        Runs every tick when maker_enabled is True. For each coin:
-        - Check if pre-momentum threshold crossed
-        - TTE is in the configured window
-        - No existing position or LIVE maker order for this coin/side
-        - Place GTD order below the ask with correct pricing
-        - Cancel when momentum reverses, market changes, or TTE exceeded
+        Two modes:
+        - Single-side (maker_dual_mode=False): momentum-confirmed, one side only
+        - Dual-GTD (maker_dual_mode=True): rest on BOTH sides at fixed price,
+          fill IS the signal, cancel opposite on fill
         """
-        if self.config.observe_only or not self.config.maker_enabled:
+        if not self.config.maker_enabled:
             return
         if self._is_paused():
             return
 
-        # Respect max_maker_orders limit
         live_count = self._order_ledger.count_live()
 
         # --- Cancel orders that should no longer be live ---
@@ -3336,33 +4083,35 @@ class MomentumSniperStrategy:
             should_cancel = False
             cancel_reason = ""
 
-            # Market changed
+            # Market changed — cancel in all modes
             if not state or state.current_slug != order.market_slug:
                 should_cancel = True
                 cancel_reason = "market changed"
 
-            # TTE exceeded (max_window_elapsed)
-            elif self.config.max_window_elapsed > 0:
-                duration = 300 if self.config.timeframe == "5m" else 900
+            # Window ending — not enough time for fill
+            elif state:
                 tte = state.seconds_to_expiry()
-                min_tte = duration - self.config.max_window_elapsed
-                if tte < min_tte:
+                if tte < 20:
                     should_cancel = True
-                    cancel_reason = "TTE exceeded max_window_elapsed"
+                    cancel_reason = "window ending"
 
-            # Momentum reversed
-            elif state and state.strike_price > 0:
-                spot = self.binance.get_price(order.coin)
-                disp = (spot - state.strike_price) / state.strike_price
-                if order.side == "up" and disp < 0.0001:
-                    should_cancel = True
-                    cancel_reason = "momentum reversed (up→flat/down)"
-                elif order.side == "down" and disp > -0.0001:
-                    should_cancel = True
-                    cancel_reason = "momentum reversed (down→flat/up)"
+            # Momentum reversed — cancel in ALL modes
+            # Uses maker_cancel_momentum (higher than placement threshold) to give
+            # the 3-6s CLOB cancel latency a buffer before momentum fully reverses.
+            if not should_cancel:
+                if state and state.strike_price > 0:
+                    spot = self.binance.get_price(order.coin)
+                    disp = (spot - state.strike_price) / state.strike_price
+                    cancel_mom = self.config.maker_cancel_momentum
+                    if order.side == "up" and disp < cancel_mom:
+                        should_cancel = True
+                        cancel_reason = "momentum reversed (up→flat/down)"
+                    elif order.side == "down" and disp > -cancel_mom:
+                        should_cancel = True
+                        cancel_reason = "momentum reversed (down→flat/up)"
 
-            # Position already acquired (FAK filled before maker)
-            if state:
+            # Position already held on this side — cancel in all modes
+            if not should_cancel and state:
                 if order.side == "up" and state.has_up_position:
                     should_cancel = True
                     cancel_reason = "position already held"
@@ -3373,16 +4122,338 @@ class MomentumSniperStrategy:
             if should_cancel:
                 await self._cancel_maker_order(order, cancel_reason)
                 live_count = self._order_ledger.count_live()
+                # State machine: mark cancelled (prevents re-placement)
+                if "reversed" in cancel_reason and state:
+                    self._gtd_state.mark_cancelled(order.market_slug, order.coin)
 
-        # Maker placement disabled — FAK-only execution.
-        # Taker fees are 0 bps on 5m crypto markets, so maker has no economic
-        # advantage. Maker orders also suffer from adverse selection on thin
-        # one-directional books during confirmed momentum.
+        # --- GTD Placement ---
+        if self.config.maker_dual_mode:
+            # DUAL-GTD: Rest on BOTH UP and DOWN at fixed price.
+            # No momentum check. No direction prediction.
+            # The fill IS the signal — whichever side fills is the trade.
+            rest_price = self.config.maker_rest_price
+            num_tokens = self.config.min_size_tokens
+            cost_per_side = rest_price * num_tokens
+
+            # Count EVERYTHING: filled positions + coins with resting orders
+            active_positions = sum(1 for s in self.coin_states.values()
+                                   if s.has_up_position or s.has_down_position)
+            coins_with_orders = len(set(o.coin for o in self._order_ledger.get_live_orders()))
+            total_active = active_positions + coins_with_orders
+
+            # Hard stop: only 1 coin active at a time (positions + resting combined)
+            if total_active >= self.config.max_concurrent_positions:
+                return  # don't even loop through coins
+
+            for coin, state in self.coin_states.items():
+                if not state.current_slug or state.current_slug == state.startup_slug:
+                    continue
+
+                # STATE MACHINE: only IDLE coins can have orders placed
+                if not self._gtd_state.can_place(state.current_slug, coin):
+                    continue
+
+                if state.has_up_position or state.has_down_position:
+                    continue
+                if self._order_ledger.get_live_orders_for_coin(coin):
+                    continue
+
+                # Elapsed check
+                duration = GammaClient.TIMEFRAME_SECONDS.get(self.config.timeframe, 300)
+                tte = state.seconds_to_expiry()
+                elapsed = duration - tte
+                if elapsed < self.config.maker_place_elapsed:
+                    continue
+                if tte < 30:
+                    continue
+
+                # Momentum check BEFORE placing — don't place if momentum
+                # is below cancel threshold (would be immediately cancelled)
+                spot = self.binance.get_price(coin)
+                if spot > 0 and state.strike_price > 0:
+                    disp = (spot - state.strike_price) / state.strike_price
+                    abs_disp = abs(disp)
+                    # At least one side needs momentum above cancel threshold
+                    if abs_disp < self.config.maker_cancel_momentum:
+                        continue
+
+                # Capital: need to afford BOTH sides (skip in observe mode)
+                total_cost = cost_per_side * 2
+                if not self.config.observe_only and (total_cost > self._balance or cost_per_side < 1.0):
+                    continue
+
+                # Respect max_maker_orders (each coin uses 2 slots)
+                if live_count + 2 > self.config.max_maker_orders:
+                    continue
+
+                # Get token IDs for both sides
+                up_token = state.manager.token_ids.get("up")
+                down_token = state.manager.token_ids.get("down")
+                if not up_token or not down_token:
+                    continue
+
+                expiry_ts = int(time.time() + tte + 60)
+
+                # Determine momentum direction for side filtering
+                mom_direction = "up" if disp > 0 else "down"
+
+                # Place BOTH sides (skip sides that would cross the book)
+                placed_count = 0
+                for side, token_id in [("up", up_token), ("down", down_token)]:
+                    if self.config.observe_only:
+                        placed_count += 1
+                        continue
+
+                    # Dynamic pricing: ONLY place on the momentum-aligned side.
+                    # The anti-momentum side has a low ask that would fill instantly
+                    # against momentum — that's adverse selection, not edge.
+                    if self.config.maker_dynamic_pricing and side != mom_direction:
+                        self._event_logger.info(
+                            f"[GTD-SKIP] {coin} {side} anti-momentum (mom={mom_direction}) — skipped"
+                        )
+                        continue
+
+                    # Get current ask for this side
+                    side_ask = self._get_best_ask_with_rest_fallback(state, side)
+
+                    # Dynamic pricing: place at best_ask - 0.01 (one tick below ask)
+                    if self.config.maker_dynamic_pricing:
+                        if side_ask <= 0 or side_ask >= 1.0:
+                            self._event_logger.info(
+                                f"[GTD-SKIP] {coin} {side} ask=${side_ask:.2f} invalid (no book data)"
+                            )
+                            continue
+                        side_rest_price = round(side_ask - 0.01, 2)
+                        # Cap at max entry price
+                        side_rest_price = min(side_rest_price, self.config.maker_max_entry_price)
+                        # Floor: never place below $0.05
+                        if side_rest_price < 0.05:
+                            self._event_logger.info(
+                                f"[GTD-SKIP] {coin} {side} dynamic_price=${side_rest_price:.2f} too low (ask=${side_ask:.2f})"
+                            )
+                            continue
+                        side_cost = side_rest_price * num_tokens
+                        if not self.config.observe_only and side_cost > self._balance:
+                            continue
+                        self._event_logger.info(
+                            f"[GTD-DYN] {coin} {side} ask=${side_ask:.2f} → rest=${side_rest_price:.2f} "
+                            f"(gap=${side_ask - side_rest_price:.2f})"
+                        )
+                    else:
+                        side_rest_price = rest_price
+                        side_cost = cost_per_side
+                        # Pre-check: don't place if our rest price >= ask (would cross book)
+                        if side_ask > 0 and side_ask <= side_rest_price:
+                            self._event_logger.info(
+                                f"[GTD-SKIP] {coin} {side} ask=${side_ask:.2f} <= rest=${side_rest_price:.2f} (would cross)"
+                            )
+                            continue
+
+                    # Queue-aware placement gate + telemetry. Compute our
+                    # queue_ahead at rest_price on this side. Skip if exceeding
+                    # configured max (direct AS defense — heavy queue means
+                    # we only fill when dip is deep = adverse selection).
+                    _queue_ahead = 0.0
+                    _bid_at_place = 0.0
+                    _ob = state.manager.get_orderbook(side) if state.manager else None
+                    if _ob and _ob.bids:
+                        for _lvl in _ob.bids:
+                            if _lvl.price >= side_rest_price:
+                                _queue_ahead += _lvl.size
+                        _bid_at_place = _ob.best_bid
+                    if self.config.maker_max_queue_ahead > 0 and _queue_ahead > self.config.maker_max_queue_ahead:
+                        self._event_logger.info(
+                            f"[GTD-SKIP-QUEUE] {coin} {side} queue_ahead={_queue_ahead:.1f} > "
+                            f"max={self.config.maker_max_queue_ahead:.1f} (AS risk)"
+                        )
+                        continue
+                    # Per-placement telemetry for post-hoc calibration.
+                    self._event_logger.info(
+                        f"[GTD-PLACE-STATS] {coin} {side} rest=${side_rest_price:.4f} "
+                        f"ask=${side_ask:.4f} bid=${_bid_at_place:.4f} "
+                        f"queue_ahead={_queue_ahead:.2f} momentum={disp:+.6f} elapsed={elapsed:.1f}"
+                    )
+
+                    try:
+                        result = await asyncio.to_thread(
+                            self._fast_order._place_order_sync,
+                            token_id, side_rest_price, num_tokens, "BUY", "GTD", 1000,
+                            expiration=expiry_ts,
+                        )
+                        order_id = result.get("orderID", "")
+                        has_error = bool(result.get("error", "") or result.get("errorMsg", ""))
+
+                        if order_id and not has_error:
+                            self._balance -= side_cost
+                            cid = getattr(state.manager.current_market, 'condition_id', '') if state.manager and state.manager.current_market else ''
+                            order = MakerOrder(
+                                coin=coin, side=side, order_id=order_id,
+                                token_id=token_id, price=side_rest_price,
+                                size=num_tokens, market_slug=state.current_slug,
+                                placed_at=time.time(), expiry_ts=expiry_ts,
+                                reserved_usdc=side_cost,
+                                condition_id=cid,
+                            )
+                            self._order_ledger.add_order(order)
+                            live_count += 1
+                            placed_count += 1
+                        else:
+                            error_msg = (result.get("errorMsg", "") or result.get("error", "unknown"))[:80]
+                            self._event_logger.info(
+                                f"[GTD-FAIL] {coin} {side} @ ${side_rest_price:.2f}: {error_msg}"
+                            )
+                            # "crosses book" may have filled as taker despite postOnly rejection
+                            # Check if CLOB returned takingAmount (partial/full fill on rejection)
+                            taking = float(result.get("takingAmount", 0) or 0)
+                            if taking > 0:
+                                self._event_logger.warning(
+                                    f"[GTD-CROSSFILL] {coin} {side.upper()} filled {taking} tokens "
+                                    f"on 'crosses book' rejection! Recording position."
+                                )
+                                self._balance -= side_rest_price * taking
+                                if side == "up":
+                                    state.up_tokens += taking
+                                    state.up_cost += side_rest_price * taking
+                                else:
+                                    state.down_tokens += taking
+                                    state.down_cost += side_rest_price * taking
+                                state.last_trade_time = time.time()
+                                self.stats.trades += 1
+                                self.stats.pending += 1
+                                self._gtd_state.mark_filled(state.current_slug, coin)
+                                self.log(
+                                    f"SNIPE {coin} {side.upper()} @ {side_rest_price:.2f} "
+                                    f"x{taking:.0f} (${side_rest_price*taking:.2f}) MAKER-CROSS",
+                                    "success"
+                                )
+                    except Exception as e:
+                        self._event_logger.warning(
+                            f"[GTD-ERROR] {coin} {side} placement failed: {e}"
+                        )
+
+                if placed_count > 0:
+                    # State machine: IDLE → RESTING
+                    self._gtd_state.mark_resting(state.current_slug, coin)
+                    # Summarize actual placed prices from ledger
+                    placed_orders = self._order_ledger.get_live_orders_for_coin(coin)
+                    placed_prices = [f"${o.price:.2f}" for o in placed_orders]
+                    total_reserved = sum(o.reserved_usdc for o in placed_orders)
+                    price_str = "/".join(placed_prices) if placed_prices else f"${rest_price:.2f}"
+                    mode = "DYN" if self.config.maker_dynamic_pricing else "FIX"
+                    self._event_logger.info(
+                        f"[DUAL-GTD] {coin} placed {placed_count} orders @ {price_str} [{mode}] "
+                        f"x{num_tokens:.0f} el={elapsed:.0f}s expiry={int(tte)}s "
+                        f"reserved=${total_reserved:.2f}"
+                    )
+                    self.log(
+                        f"[DUAL-GTD] {coin} resting @ {price_str} [{mode}] "
+                        f"(${total_reserved:.2f} reserved)",
+                        "info"
+                    )
+
+    async def _check_trades_for_fill(self, order: MakerOrder) -> bool:
+        """Authoritative fill detection for a single maker order.
+
+        The CLOB /data/trades endpoint only returns trades where the wallet
+        is the TAKER — it silently misses maker fills. Apr-2026 reconciliation
+        against Polymarket on-chain activity showed 22/37 maker fills were
+        missed by /data/trades alone. This function now checks BOTH sources:
+
+          1. CLOB /data/trades by order_id — catches any taker hits.
+          2. data-api /activity?type=TRADE by asset+price+time — catches
+             maker fills (our order rests, someone else takes it).
+
+        Returns True if a fill was detected and recorded.
+        """
+        # --- Check 1: CLOB /data/trades (order_id match) ---
+        condition_id = order.condition_id
+        if not condition_id:
+            state = self.coin_states.get(order.coin)
+            if state and state.manager and state.manager.current_market:
+                condition_id = getattr(state.manager.current_market, 'condition_id', '')
+
+        if condition_id:
+            try:
+                trades = await self.bot.get_trades_for_market(condition_id)
+                for trade in trades:
+                    maker_orders = trade.get("maker_orders", [])
+                    for mo in maker_orders:
+                        if mo.get("order_id") == order.order_id:
+                            matched = float(mo.get("matched_amount", 0) or 0)
+                            if matched > 0:
+                                filled_order = self._order_ledger.mark_filled(order.order_id, matched)
+                                if filled_order:
+                                    self.log(
+                                        f"[MAKER] {order.coin} {order.side.upper()} FILLED "
+                                        f"{matched} tokens (detected via CLOB trades)",
+                                        "warning"
+                                    )
+                                    await self._record_maker_fill(filled_order, matched)
+                                    if self.config.maker_dual_mode:
+                                        await self._cancel_opposite_side(filled_order)
+                                return True
+                    if trade.get("taker_order_id") == order.order_id:
+                        size = float(trade.get("size", 0) or 0)
+                        if size > 0:
+                            filled_order = self._order_ledger.mark_filled(order.order_id, size)
+                            if filled_order:
+                                self.log(
+                                    f"[MAKER] {order.coin} {order.side.upper()} FILLED "
+                                    f"{size} tokens as taker (detected via CLOB trades)",
+                                    "warning"
+                                )
+                                await self._record_maker_fill(filled_order, size)
+                                if self.config.maker_dual_mode:
+                                    await self._cancel_opposite_side(filled_order)
+                            return True
+            except Exception as e:
+                self._event_logger.warning(
+                    f"[MAKER] CLOB trades check failed for {order.coin}: {e}"
+                )
+
+        # --- Check 2: data-api /activity (asset + price + time match) ---
+        # Activity records don't include our order_id; match by fingerprint.
+        try:
+            acts = await self.bot.get_recent_activity_trades(limit=100)
+            # Aggregate partial fills for this asset+price within the order's lifetime
+            matched_total = 0.0
+            # Look at activity records from (placed_at - 2s) to now
+            now = time.time()
+            window_lo = (order.placed_at or (now - 600)) - 2
+            for t in acts:
+                if t.get("type") != "TRADE": continue
+                if t.get("side") != "BUY": continue
+                if str(t.get("asset", "")) != str(order.token_id): continue
+                tp = float(t.get("price", 0) or 0)
+                if abs(tp - order.price) > 0.015: continue
+                ts = float(t.get("timestamp", 0) or 0)
+                if ts < window_lo: continue
+                if ts > now + 5: continue
+                matched_total += float(t.get("size", 0) or 0)
+            if matched_total > 0:
+                filled_order = self._order_ledger.mark_filled(order.order_id, matched_total)
+                if filled_order:
+                    self.log(
+                        f"[MAKER] {order.coin} {order.side.upper()} FILLED "
+                        f"{matched_total:.3f} tokens (detected via data-api activity)",
+                        "warning"
+                    )
+                    await self._record_maker_fill(filled_order, matched_total)
+                    if self.config.maker_dual_mode:
+                        await self._cancel_opposite_side(filled_order)
+                return True
+        except Exception as e:
+            self._event_logger.warning(
+                f"[MAKER] Activity check failed for {order.coin}: {e}"
+            )
+        return False
 
     async def _poll_maker_orders(self):
         """Poll CLOB for fill status on all LIVE maker orders.
 
-        Runs every maker_poll_interval seconds per order.
+        Uses two methods:
+        1. get_order() — fast but can return stale size_matched=0
+        2. get_trades(market=condition_id) — authoritative, catches ghost fills
         """
         if not self.config.maker_enabled:
             return
@@ -3409,12 +4480,20 @@ class MomentumSniperStrategy:
                     filled_order = self._order_ledger.mark_filled(order.order_id, size_matched)
                     if filled_order:
                         await self._record_maker_fill(filled_order, size_matched)
+                        if self.config.maker_dual_mode:
+                            await self._cancel_opposite_side(filled_order)
                     continue
 
                 if clob_status in ("CANCELLED", "DEAD", "EXPIRED"):
+                    # SAFETY NET: before returning capital, verify no late fill.
+                    # CLOB can report EXPIRED while a fill is still propagating; skipping
+                    # this check is how historical ghosts were missed in _poll_maker_orders.
+                    fill_found = await self._check_trades_for_fill(order)
+                    if fill_found:
+                        # _check_trades_for_fill already recorded the fill and cleaned up.
+                        continue
                     cancelled_order = self._order_ledger.mark_cancelled(order.order_id)
                     if cancelled_order:
-                        # Return reserved capital
                         with self._maker_lock:
                             self._balance += cancelled_order.reserved_usdc
                         self.log(
@@ -3422,8 +4501,14 @@ class MomentumSniperStrategy:
                             f"CLOB status={clob_status} — returned ${cancelled_order.reserved_usdc:.2f}",
                             "info"
                         )
-                    # Clean up from ledger
                     self._order_ledger.remove_order(order.order_id)
+                    continue
+
+                # get_order shows LIVE with size_matched=0 — but order may
+                # have filled and CLOB hasn't propagated yet.
+                # Check trades API (CLOB + /activity) as authoritative fallback.
+                if now - order.placed_at > 10:
+                    await self._check_trades_for_fill(order)
 
             except Exception as e:
                 self._event_logger.warning(
@@ -3432,31 +4517,137 @@ class MomentumSniperStrategy:
                 )
 
     async def _cancel_maker_order(self, order: MakerOrder, reason: str = ""):
-        """Cancel a maker order and handle fill checks."""
-        try:
-            await self.bot.cancel_order(order.order_id)
-        except Exception:
-            pass
+        """Cancel a maker order with robust fill detection.
 
-        # Post-cancel fill check (order may have filled between our check and cancel)
-        await asyncio.sleep(0.5)
-        try:
-            order_data = await asyncio.to_thread(
-                self.bot._official_client.get_order, order.order_id
-            )
-            matched = float((order_data or {}).get("size_matched", 0) or 0)
-            if matched > 0:
-                filled_order = self._order_ledger.mark_filled(order.order_id, matched)
-                if filled_order:
-                    self.log(
-                        f"[MAKER] {order.coin} {order.side.upper()} FILLED {matched} "
-                        f"tokens during cancel! Recording position.",
-                        "warning"
-                    )
-                    await self._record_maker_fill(filled_order, matched)
+        For reversal cancels: FAST PATH — send cancel immediately, then verify.
+        Every second of pre-check is a second the order is live and exposed to
+        adverse fills from sellers dumping during momentum reversal.
+
+        For other cancels (window ending, market changed): full pre-check path.
+
+        Post-cancel: retry loop (3 attempts, 3s apart) checking
+        get_order + trades API for delayed CLOB propagation.
+        """
+        # Don't cancel orders less than 15 seconds old
+        age = time.time() - order.placed_at
+        if age < 15 and "window ending" not in reason and "market changed" not in reason:
+            return
+
+        is_reversal = "reversed" in reason
+
+        self._event_logger.info(
+            f"[CANCEL-DBG] {order.coin} {order.side} START reason={reason} "
+            f"{'FAST' if is_reversal else 'NORMAL'} oid={order.order_id[:16]}"
+        )
+
+        # For reversal cancels: skip pre-checks, send cancel IMMEDIATELY.
+        # Pre-checks cost 3-6 seconds during which the order is live and exposed.
+        # If the order was already filled, the cancel will fail harmlessly and
+        # Step 3 will detect the fill.
+        if not is_reversal:
+            # Non-reversal cancels: safe to pre-check (no urgency)
+            # Step 1: Check if already filled BEFORE sending cancel (get_order)
+            try:
+                pre_check = await asyncio.to_thread(
+                    self.bot._official_client.get_order, order.order_id
+                )
+                matched = float((pre_check or {}).get("size_matched", 0) or 0)
+                status = (pre_check or {}).get("status", "")
+                self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step1-order: status={status} matched={matched}")
+                if matched > 0 or status == "MATCHED":
+                    filled_order = self._order_ledger.mark_filled(order.order_id, matched or order.size)
+                    if filled_order:
+                        self.log(
+                            f"[MAKER] {order.coin} {order.side.upper()} FILLED {matched or order.size} "
+                            f"tokens (caught PRE-cancel via get_order).",
+                            "warning"
+                        )
+                        await self._record_maker_fill(filled_order, matched or order.size)
+                        if self.config.maker_dual_mode:
+                            await self._cancel_opposite_side(filled_order)
+                    return
+            except Exception as e:
+                self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step1-order FAILED: {e}")
+
+            # Step 1b: Check trades API pre-cancel (authoritative)
+            if await self._check_trades_for_fill(order):
+                self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step1-trades: FILL FOUND")
                 return
-        except Exception:
-            pass
+
+        # Step 2: Send cancel (FIRST action for reversal cancels).
+        # Record timestamps for latency telemetry — enables post-hoc measurement
+        # of real cancel latency (send → CLOB-confirmed CANCELLED) to replace
+        # shadow's fixed 3s assumption.
+        _cancel_sent_ts = time.time()
+        try:
+            cancel_result = await self.bot.cancel_order(order.order_id)
+            _cancel_resp_ts = time.time()
+            _resp_ms = int((_cancel_resp_ts - _cancel_sent_ts) * 1000)
+            self._event_logger.info(
+                f"[CANCEL-LAT] {order.coin} {order.side} oid={order.order_id[:16]} "
+                f"resp_ms={_resp_ms} success={getattr(cancel_result, 'success', '?')}"
+            )
+            self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step2: cancel sent")
+        except Exception as e:
+            self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step2 FAILED: {e}")
+
+        # Step 3: Post-cancel retry loop — CLOB propagation can take 5-15s
+        # Check 3 times with 3s delays (total ~9s window)
+        fill_detected = False
+        for attempt in range(3):
+            await asyncio.sleep(3.0)
+
+            # 3a: Check get_order for updated status
+            try:
+                order_data = await asyncio.to_thread(
+                    self.bot._official_client.get_order, order.order_id
+                )
+                matched = float((order_data or {}).get("size_matched", 0) or 0)
+                status = (order_data or {}).get("status", "")
+                _elapsed_since_send = int((time.time() - _cancel_sent_ts) * 1000)
+                self._event_logger.info(
+                    f"[CANCEL-DBG] {order.coin} Step3.{attempt+1}-order: "
+                    f"status={status} matched={matched} since_send_ms={_elapsed_since_send}"
+                )
+                # Telemetry: first time we observe CANCELLED/DEAD status, record latency
+                if status in ("CANCELLED", "DEAD"):
+                    self._event_logger.info(
+                        f"[CANCEL-LAT] {order.coin} {order.side} oid={order.order_id[:16]} "
+                        f"confirmed_ms={_elapsed_since_send} status={status}"
+                    )
+                if matched > 0 or status == "MATCHED":
+                    fill_detected = True
+                    break
+            except Exception as e:
+                self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step3.{attempt+1}-order FAILED: {e}")
+
+            # 3b: Check trades API (authoritative)
+            if await self._check_trades_for_fill(order):
+                self._event_logger.info(f"[CANCEL-DBG] {order.coin} Step3.{attempt+1}-trades: FILL FOUND")
+                return  # _check_trades_for_fill already recorded it
+
+            # If order is confirmed cancelled/dead, no need to keep checking
+            try:
+                if status in ("CANCELLED", "DEAD", "EXPIRED"):
+                    self._event_logger.info(
+                        f"[CANCEL-DBG] {order.coin} Step3.{attempt+1}: confirmed {status}, stopping"
+                    )
+                    break
+            except Exception:
+                pass
+
+        if fill_detected:
+            filled_order = self._order_ledger.mark_filled(order.order_id, order.size)
+            if filled_order:
+                self.log(
+                    f"[MAKER] {order.coin} {order.side.upper()} FILLED {order.size} "
+                    f"tokens (caught post-cancel retry)!",
+                    "warning"
+                )
+                await self._record_maker_fill(filled_order, order.size)
+                if self.config.maker_dual_mode:
+                    await self._cancel_opposite_side(filled_order)
+            return
 
         # Order was not filled — cancel and return capital
         cancelled_order = self._order_ledger.mark_cancelled(order.order_id)
@@ -3469,11 +4660,109 @@ class MomentumSniperStrategy:
                 f" (returned ${cancelled_order.reserved_usdc:.2f})",
                 "info"
             )
+
+        # Schedule a delayed ghost-fill re-check for fast-cancelled orders.
+        # The CLOB API is eventually consistent — fills can take 15-30s to
+        # propagate. The fast cancel path checks too quickly. This background
+        # task re-checks 30s later via the trades API (authoritative).
+        if is_reversal:
+            async def _delayed_ghost_check(oid, o_coin, o_side, o_size, o_price, o_reserved, cid, o_token_id, o_placed_at, o_slug):
+                await asyncio.sleep(30)
+                try:
+                    # Check 1: CLOB /data/trades by order_id (catches taker fills).
+                    trades_data = await self.bot.get_trades_for_market(cid) if cid else []
+                    if not trades_data:
+                        from py_clob_client.clob_types import TradeParams
+                        trades_data = await asyncio.to_thread(
+                            self.bot._official_client.get_trades, TradeParams()
+                        )
+                        if isinstance(trades_data, dict):
+                            trades_data = trades_data.get("data", [])
+                    for trade in (trades_data or []):
+                        for mo in trade.get("maker_orders", []):
+                            if mo.get("order_id") == oid:
+                                matched = float(mo.get("matched_amount", 0) or 0)
+                                if matched > 0:
+                                    self._event_logger.info(
+                                        f"[GHOST-FIX] {o_coin} {o_side} DELAYED FILL (CLOB) matched={matched}"
+                                    )
+                                    with self._maker_lock:
+                                        self._balance -= o_reserved
+                                    ghost_order = MakerOrder(
+                                        coin=o_coin, side=o_side, order_id=oid,
+                                        token_id=o_token_id, price=o_price,
+                                        size=o_size, reserved_usdc=o_reserved,
+                                        market_slug=o_slug, placed_at=o_placed_at,
+                                        expiry_ts=0, condition_id=cid,
+                                    )
+                                    await self._record_maker_fill(ghost_order, matched)
+                                    return
+
+                    # Check 2: data-api /activity (catches maker fills — the real ghost gap).
+                    acts = await self.bot.get_recent_activity_trades(limit=100)
+                    matched_total = 0.0
+                    import time as _t
+                    now = _t.time()
+                    window_lo = (o_placed_at or (now - 600)) - 2
+                    for t in acts or []:
+                        if t.get("type") != "TRADE": continue
+                        if t.get("side") != "BUY": continue
+                        if str(t.get("asset", "")) != str(o_token_id): continue
+                        tp = float(t.get("price", 0) or 0)
+                        if abs(tp - o_price) > 0.015: continue
+                        ts = float(t.get("timestamp", 0) or 0)
+                        if ts < window_lo: continue
+                        if ts > now + 5: continue
+                        matched_total += float(t.get("size", 0) or 0)
+                    if matched_total > 0:
+                        self._event_logger.info(
+                            f"[GHOST-FIX] {o_coin} {o_side} DELAYED FILL (activity) matched={matched_total:.3f}"
+                        )
+                        with self._maker_lock:
+                            self._balance -= o_reserved
+                        ghost_order = MakerOrder(
+                            coin=o_coin, side=o_side, order_id=oid,
+                            token_id=o_token_id, price=o_price,
+                            size=o_size, reserved_usdc=o_reserved,
+                            market_slug=o_slug, placed_at=o_placed_at,
+                            expiry_ts=0, condition_id=cid,
+                        )
+                        await self._record_maker_fill(ghost_order, matched_total)
+                        return
+
+                    self._event_logger.info(
+                        f"[GHOST-FIX] {o_coin} {o_side} delayed check: no fill "
+                        f"(CLOB={len(trades_data or [])} activity={len(acts or [])})"
+                    )
+                except Exception as e:
+                    self._event_logger.info(f"[GHOST-FIX] {o_coin} {o_side} delayed check FAILED: {e}")
+
+            condition_id = ""
+            if hasattr(order, 'condition_id') and order.condition_id:
+                condition_id = order.condition_id
+            elif state and state.manager and state.manager.current_market:
+                condition_id = getattr(state.manager.current_market, 'condition_id', '')
+
+            asyncio.create_task(_delayed_ghost_check(
+                order.order_id, order.coin, order.side,
+                order.size, order.price, order.reserved_usdc,
+                condition_id,
+                order.token_id, order.placed_at, order.market_slug,
+            ))
+            self._event_logger.info(
+                f"[GHOST-FIX] {order.coin} {order.side} scheduled delayed re-check in 30s"
+            )
+
         self._order_ledger.remove_order(order.order_id)
 
         # Maker V2 FAK fallback: maker didn't fill, try FAK if signal still valid.
-        # Only attempt if cancellation wasn't due to reversal or market change.
-        if reason and ("reversal" in reason or "market changed" in reason or "paused" in reason):
+        # DISABLED in dual mode — no FAK should ever fire
+        if self.config.maker_dual_mode:
+            return
+        if reason and ("reversed" in reason or "reversal" in reason
+                       or "market changed" in reason
+                       or "paused" in reason or "opposite side filled" in reason
+                       or "window ending" in reason):
             return
         state = self.coin_states.get(order.coin)
         if not state or state.current_slug != order.market_slug:
@@ -3502,9 +4791,13 @@ class MomentumSniperStrategy:
         if not state:
             return
 
+        # State machine: mark FILLED (prevents any re-placement or re-cancellation)
+        self._gtd_state.mark_filled(order.market_slug, order.coin)
+
         # Check if momentum still supports this direction (reversal detection)
+        # In dual mode, fills on either side are expected — skip reversal warning
         spot = self.binance.get_price(order.coin)
-        if spot > 0 and state.strike_price > 0:
+        if not self.config.maker_dual_mode and spot > 0 and state.strike_price > 0:
             fill_disp = (spot - state.strike_price) / state.strike_price
             reversal = (order.side == "up" and fill_disp < 0) or (order.side == "down" and fill_disp > 0)
             if reversal:
@@ -3565,21 +4858,43 @@ class MomentumSniperStrategy:
         # Clean up from ledger
         self._order_ledger.remove_order(order.order_id)
 
+    async def _cancel_opposite_side(self, filled_order: MakerOrder):
+        """After one side fills, cancel LIVE orders on the opposite side for the same coin."""
+        opposite = "down" if filled_order.side == "up" else "up"
+        for order in self._order_ledger.get_live_orders_for_coin_side(filled_order.coin, opposite):
+            await self._cancel_maker_order(order, f"opposite side filled ({filled_order.side})")
+
+        # Detect dual-fill: both sides now have positions
+        state = self.coin_states.get(filled_order.coin)
+        if state and state.has_up_position and state.has_down_position:
+            self._event_logger.warning(
+                f"[DUAL-FILL] {filled_order.coin} — BOTH sides filled! "
+                f"UP cost=${state.up_cost:.2f} DOWN cost=${state.down_cost:.2f} "
+                f"Total=${state.up_cost + state.down_cost:.2f} (guaranteed $1 payout, "
+                f"loss=${state.up_cost + state.down_cost - filled_order.size:.2f})"
+            )
+
     async def _handle_maker_orders_on_market_change(self, old_slug: str):
         """Handle maker orders when a market transitions.
 
         For each LIVE order on the old market:
-        - Final CLOB status check
+        - Final CLOB status check (get_order + trades API)
         - If filled: record position and log trade
         - If not filled: cancel, return reserved capital
         """
+        # Clean up state machine for old window
+        self._gtd_state.cleanup(old_slug)
+        if hasattr(self, '_cancelled_this_window'):
+            self._cancelled_this_window.pop(old_slug, None)
         live_orders = [o for o in self._order_ledger.get_orders_for_market(old_slug)
                        if o.status == "LIVE"]
         if not live_orders:
             return
 
         for order in live_orders:
-            # Final CLOB check
+            fill_found = False
+
+            # Check 1: get_order (may be stale but check anyway)
             try:
                 order_data = await asyncio.to_thread(
                     self.bot._official_client.get_order, order.order_id
@@ -3590,13 +4905,20 @@ class MomentumSniperStrategy:
                     if filled_order:
                         self.log(
                             f"[MAKER] {order.coin} {order.side.upper()} FILLED {matched} "
-                            f"tokens on market change — recording position.",
+                            f"tokens on market change (get_order).",
                             "warning"
                         )
                         await self._record_maker_fill(filled_order, matched)
-                    continue
+                    fill_found = True
             except Exception:
                 pass
+
+            # Check 2: trades API (authoritative — catches ghost fills)
+            if not fill_found:
+                fill_found = await self._check_trades_for_fill(order)
+
+            if fill_found:
+                continue
 
             # Not filled — cancel and return capital
             try:
@@ -3831,7 +5153,7 @@ class MomentumSniperStrategy:
         if not token_id:
             return
 
-        num_tokens = 5.0  # min-size
+        num_tokens = self.config.min_size_tokens  # min-size
         buy_price = round(ask, 2)
 
         result = await self.bot.place_order(
@@ -3911,6 +5233,16 @@ class MomentumSniperStrategy:
         # Pre-signal speculative GTC management (legacy maker orders)
         if self.config.speculative_enabled:
             await self._manage_speculative_order()
+
+        # Process pending UserWS subscriptions from callback thread
+        if hasattr(self, '_pending_ws_subs') and self._pending_ws_subs and hasattr(self, '_user_ws') and self._user_ws:
+            subs = self._pending_ws_subs[:]
+            self._pending_ws_subs.clear()
+            try:
+                await self._user_ws.subscribe_more(subs)
+                self._event_logger.info(f"[USER-WS] Queued subscribe sent for {len(subs)} markets")
+            except Exception:
+                pass
 
         # GTD maker order management (Phase 1)
         if self.config.maker_enabled:
@@ -4209,6 +5541,18 @@ class MomentumSniperStrategy:
     async def stop(self):
         """Stop the strategy."""
         self.running = False
+
+        # CRITICAL: Cancel ALL open orders on the CLOB before shutting down.
+        # Without this, GTD orders remain live on the CLOB after the bot dies,
+        # can fill undetected (ghost fills), and drain the balance.
+        if self.config.maker_enabled and hasattr(self, 'bot') and self.bot and self.bot._official_client:
+            try:
+                self.log("[SHUTDOWN] Cancelling all open orders on CLOB...", "warning")
+                result = self.bot._official_client.cancel_all()
+                cancelled = result.get("canceled", []) if isinstance(result, dict) else []
+                self.log(f"[SHUTDOWN] Cancelled {len(cancelled)} orders", "warning")
+            except Exception as e:
+                self.log(f"[SHUTDOWN] cancel_all failed: {e}", "error")
 
         # Stop all market managers
         for state in self.coin_states.values():
