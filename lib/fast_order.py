@@ -85,10 +85,10 @@ class FastOrderClient:
         # Signal queue — WS callback and tick loop put work here
         self._signal_queue = queue.Queue()
 
-        # Parallel signal threads — 7 workers so all coins can fire simultaneously.
-        # Each thread gets its own HTTP connection via thread-local storage.
+        # Parallel signal threads — 14 workers (7 coins × 2 sides max concurrent
+        # fires). Each thread gets its own HTTP connection via thread-local storage.
         self._signal_pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=7, thread_name_prefix="fastorder-signal"
+            max_workers=14, thread_name_prefix="fastorder-signal"
         )
 
         # Single keepalive thread pings one connection to detect staleness
@@ -122,18 +122,18 @@ class FastOrderClient:
         except Exception as e:
             logger.warning(f"Failed to derive L2 creds: {e}")
 
-        # Pre-warm ALL 7 worker thread connections at startup.
+        # Pre-warm ALL 14 worker thread connections at startup.
         # Without this, the first signal on each thread hits a cold connection
         # (TLS handshake = ~200ms extra). Warming them all eliminates this.
         def _warmup():
             self._get_http()  # Creates + warms connection for this thread
-        warmup_futures = [self._signal_pool.submit(_warmup) for _ in range(7)]
+        warmup_futures = [self._signal_pool.submit(_warmup) for _ in range(14)]
         for f in warmup_futures:
             try:
                 f.result(timeout=10)
             except Exception:
                 pass
-        logger.info(f"FastOrder: 7 worker connections pre-warmed (DNS={_CLOB_IP})")
+        logger.info(f"FastOrder: 14 worker connections pre-warmed (DNS={_CLOB_IP})")
 
         # Start keepalive pinger
         self._keepalive_executor.submit(self._keepalive_sync)
