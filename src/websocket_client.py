@@ -358,9 +358,10 @@ class MarketWebSocket:
             return False
 
         if replace:
-            # Clear old subscriptions and cached data
+            # Clear old subscriptions but KEEP cached orderbooks until new
+            # data arrives. Wiping the cache immediately creates a gap where
+            # get_best_ask() returns 1.0 (default), causing FAK rejections.
             self._subscribed_assets.clear()
-            self._orderbooks.clear()
 
         self._subscribed_assets.update(asset_ids)
         logger.info(f"subscribe() called with {len(asset_ids)} assets, is_connected={self.is_connected}, ws={self._ws is not None}")
@@ -854,20 +855,34 @@ class UserWebSocket:
             return False
 
     async def subscribe_more(self, condition_ids: List[str]) -> bool:
-        """Subscribe to additional markets without replacing existing."""
+        """Subscribe to additional markets by re-sending full auth subscription.
+
+        The Polymarket User channel does NOT support incremental subscribe
+        (that's only for the Market channel with assets_ids). We must re-send
+        the full auth + markets message with ALL condition_ids.
+        """
         if not self.is_connected or not condition_ids:
             return False
 
         self._subscribed_markets.update(condition_ids)
 
+        # Re-send full auth subscription with all markets
         sub_msg = {
-            "markets": condition_ids,
-            "operation": "subscribe",
+            "auth": {
+                "apiKey": self.api_key,
+                "secret": self.api_secret,
+                "passphrase": self.api_passphrase,
+            },
+            "markets": list(self._subscribed_markets),
+            "type": "USER",
         }
 
         try:
             await self._ws.send(json.dumps(sub_msg))
-            logger.info(f"User WS subscribed to {len(condition_ids)} more markets")
+            logger.info(
+                f"User WS re-subscribed with {len(condition_ids)} new + "
+                f"{len(self._subscribed_markets)} total markets"
+            )
             return True
         except Exception as e:
             logger.error(f"User WS subscribe_more failed: {e}")

@@ -50,6 +50,7 @@ class MarketInfo:
     token_ids: Dict[str, str]
     prices: Dict[str, float]
     accepting_orders: bool
+    condition_id: str = ""
 
     @property
     def up_token(self) -> str:
@@ -299,6 +300,14 @@ class MarketManager:
         if old_key is not None and new_key is not None and new_key <= old_key:
             return False
 
+        # Don't switch to a market whose window hasn't started yet.
+        # The Gamma API returns future windows as acceptingOrders=true
+        # before they actually begin, causing trades on unopened markets.
+        import time
+        new_start = new_market.slug_timestamp()
+        if new_start and time.time() < new_start:
+            return False
+
         return True
 
     def discover_market(self, update_state: bool = True) -> Optional[MarketInfo]:
@@ -323,6 +332,7 @@ class MarketManager:
             token_ids=market_data.get("token_ids", {}),
             prices=market_data.get("prices", {}),
             accepting_orders=market_data.get("accepting_orders", False),
+            condition_id=market_data.get("condition_id", "") or market_data.get("conditionId", "") or (market_data.get("raw", {}) or {}).get("conditionId", ""),
         )
 
         if update_state:
@@ -414,6 +424,11 @@ class MarketManager:
                 # Check if market changed and resubscribe
                 new_tokens = set(market.token_ids.values())
                 if new_tokens == old_tokens:
+                    if market.slug != old_slug:
+                        _logger.warning(
+                            f"{self.coin} SLUG CHANGED but tokens SAME: {old_slug} -> {market.slug} "
+                            f"(tokens: {list(new_tokens)[0][-15:] if new_tokens else '?'})"
+                        )
                     self._update_current_market(market)
                     continue
 
@@ -424,6 +439,7 @@ class MarketManager:
                     continue
 
                 if not self._should_switch_market(old_market, market):
+                    _logger.warning(f"{self.coin} MARKET CHANGE REJECTED by _should_switch: {old_slug} -> {market.slug}")
                     continue
 
                 # Market changed — update state. WS resubscribe deferred to avoid blocking.

@@ -669,47 +669,25 @@ class TradingBot:
         return results
 
     async def cancel_order(self, order_id: str) -> OrderResult:
-        """
-        Cancel a specific order.
-
-        Args:
-            order_id: Order ID to cancel
-
-        Returns:
-            OrderResult with cancellation status
-        """
+        """Cancel a specific order via the official py-clob-client (derived L2 creds)."""
+        if not self._official_client:
+            return OrderResult(success=False, order_id=order_id, message="official client unavailable")
         try:
-            response = await self._run_in_thread(self.clob_client.cancel_order, order_id)
+            response = await self._run_in_thread(self._official_client.cancel, order_id)
             logger.info(f"Order cancelled: {order_id}")
-            return OrderResult(
-                success=True,
-                order_id=order_id,
-                message="Order cancelled",
-                data=response
-            )
+            return OrderResult(success=True, order_id=order_id, message="Order cancelled", data=response)
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
-            return OrderResult(
-                success=False,
-                order_id=order_id,
-                message=str(e)
-            )
+            return OrderResult(success=False, order_id=order_id, message=str(e))
 
     async def cancel_all_orders(self) -> OrderResult:
-        """
-        Cancel all open orders.
-
-        Returns:
-            OrderResult with cancellation status
-        """
+        """Cancel all open orders via the official client."""
+        if not self._official_client:
+            return OrderResult(success=False, message="official client unavailable")
         try:
-            response = await self._run_in_thread(self.clob_client.cancel_all_orders)
+            response = await self._run_in_thread(self._official_client.cancel_all)
             logger.info("All orders cancelled")
-            return OrderResult(
-                success=True,
-                message="All orders cancelled",
-                data=response
-            )
+            return OrderResult(success=True, message="All orders cancelled", data=response)
         except Exception as e:
             logger.error(f"Failed to cancel orders: {e}")
             return OrderResult(success=False, message=str(e))
@@ -719,28 +697,17 @@ class TradingBot:
         market: Optional[str] = None,
         asset_id: Optional[str] = None
     ) -> OrderResult:
-        """
-        Cancel orders for a specific market.
-
-        Args:
-            market: Condition ID of the market (optional)
-            asset_id: Token/asset ID (optional)
-
-        Returns:
-            OrderResult with cancellation status
-        """
+        """Cancel orders for a market via the official client."""
+        if not self._official_client:
+            return OrderResult(success=False, message="official client unavailable")
         try:
             response = await self._run_in_thread(
-                self.clob_client.cancel_market_orders,
-                market,
-                asset_id,
+                self._official_client.cancel_market_orders,
+                market or "",
+                asset_id or "",
             )
             logger.info(f"Market orders cancelled (market: {market or 'all'}, asset: {asset_id or 'all'})")
-            return OrderResult(
-                success=True,
-                message=f"Orders cancelled for market {market or 'all'}",
-                data=response
-            )
+            return OrderResult(success=True, message=f"Orders cancelled for market {market or 'all'}", data=response)
         except Exception as e:
             logger.error(f"Failed to cancel market orders: {e}")
             return OrderResult(success=False, message=str(e))
@@ -797,6 +764,77 @@ class TradingBot:
             return trades
         except Exception as e:
             logger.error(f"Failed to get trades: {e}")
+            return []
+
+    async def get_trades_for_market(self, condition_id: str) -> List[Dict[str, Any]]:
+        """
+        Get recent trades for a specific market using the official client.
+
+        Uses TradeParams(market=condition_id) for authoritative fill detection.
+        Unlike get_order() which can return stale size_matched=0, trades are
+        the definitive record of fills.
+
+        Args:
+            condition_id: Market condition ID
+
+        Returns:
+            List of trades for this market
+        """
+        if not self._official_client:
+            return []
+        try:
+            from py_clob_client.clob_types import TradeParams
+            params = TradeParams(market=condition_id)
+            result = await self._run_in_thread(self._official_client.get_trades, params)
+            # Handle paginated response
+            if isinstance(result, dict) and "data" in result:
+                return result.get("data", [])
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            logger.error(f"Failed to get trades for market {condition_id[:16]}: {e}")
+            return []
+
+    async def get_recent_activity_trades(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get recent on-chain trades for this wallet from the data-api /activity endpoint.
+
+        The CLOB /data/trades endpoint only returns trades where the wallet is the
+        taker — it misses maker-side fills. The data-api /activity?type=TRADE endpoint
+        returns all trades (maker and taker), making it the authoritative source for
+        ghost-fill detection.
+
+        Returns raw activity records; callers match on asset + price + timestamp
+        since activity records don't include our own order_id.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            aiohttp = None
+        user = self.config.safe_address
+        url = (
+            f"https://data-api.polymarket.com/activity"
+            f"?user={user}&type=TRADE&limit={limit}"
+        )
+        try:
+            if aiohttp is not None:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            logger.warning(f"data-api /activity returned {resp.status}")
+                            return []
+                        data = await resp.json()
+            else:
+                import requests
+                resp = await self._run_in_thread(
+                    lambda: requests.get(url, timeout=10)
+                )
+                if resp.status_code != 200:
+                    return []
+                data = resp.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error(f"Failed to get activity trades: {e}")
             return []
 
     async def get_order_book(self, token_id: str) -> Dict[str, Any]:

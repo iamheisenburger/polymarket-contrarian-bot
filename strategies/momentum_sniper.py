@@ -1751,6 +1751,31 @@ class MomentumSniperStrategy:
                                      sig_edge=_signal_edge):
                         fast_success = False
                         try:
+                            # FRESH-BOOK GUARD (restored after A/B test): removing it
+                            # caused 100% FAK rejection on 4 consecutive fires because
+                            # bot bid against stale WS ask while real ask had moved.
+                            # Guard pulls live CLOB book, uses fresh ask for bid calc,
+                            # skip-caps if real ask > configured cap.
+                            _fresh_ask = None
+                            _tid_refresh = state.manager.token_ids.get(side, '')
+                            if _tid_refresh:
+                                try:
+                                    _fb = self.bot.clob_client.get_order_book(_tid_refresh)
+                                    _fask = sorted(float(a.get('price', 1)) for a in (_fb.get('asks') or []) if float(a.get('size', 0)) > 0)
+                                    if _fask:
+                                        best_ask = _fask[0]
+                                        _fresh_ask = _fask[0]
+                                except Exception:
+                                    pass
+                            if _fresh_ask is not None and _fresh_ask > self.config.max_entry_price:
+                                self._event_logger.info(
+                                    f"[SKIP-CAP] {state.coin} {side} fresh_ask=${_fresh_ask:.2f} > "
+                                    f"cap=${self.config.max_entry_price:.2f} mom={abs_disp:.5f} el={elapsed:.0f}s"
+                                )
+                                if side == "up": state.up_tokens = 0
+                                else: state.down_tokens = 0
+                                self._snipe_in_flight.discard(snipe_key)
+                                return
                             buy_price = min(round(best_ask + self.config.fok_tolerance, 2),
                                             self.config.max_entry_price)
                             if buy_price < self.config.min_entry_price or self._balance < 1.0:
@@ -1810,14 +1835,11 @@ class MomentumSniperStrategy:
                             )
 
                             if not fast_success:
-                                # Log rejection details for adverse selection analysis
-                                current_ask = state.manager.get_best_ask(side)
-                                current_bid = state.manager.get_best_bid(side)
-                                spread = current_ask - current_bid if current_bid > 0 else 0
+                                # Rejection log without synchronous post-fetch.
+                                _ws_ask = state.manager.get_best_ask(side)
                                 self._event_logger.info(
                                     f"[FAK-REJECT] {state.coin} {side} bid=${buy_price:.2f} "
-                                    f"ask_now=${current_ask:.2f} spread=${spread:.2f} "
-                                    f"mom={abs_disp:.5f} el={elapsed:.0f}s "
+                                    f"ws_ask=${_ws_ask:.2f} mom={abs_disp:.5f} el={elapsed:.0f}s "
                                     f"error={result.get('error','')[:80]} lat={total_lat:.0f}ms"
                                 )
                                 if side == "up":
@@ -3445,6 +3467,13 @@ class MomentumSniperStrategy:
         _pre_order_spot = self.binance.get_price(state.coin)
         _pre_order_momentum = (_pre_order_spot - state.strike_price) / state.strike_price if state.strike_price > 0 else 0
 
+        # ASYNC FIRE PATH DISABLED: all real fires route through signal_task
+        # (WS-callback thread pool, presigned) to eliminate triple-POST on one
+        # signal and the guaranteed-fail SDK fallback (fee_rate_bps=0).
+        # This path now only fires in observe_only/paper mode (handled above).
+        if self._fast_order is not None:
+            return False
+
         # Place FOK (Fill Or Kill) order with price tolerance to reduce rejections.
         # The tolerance is applied to the submission price (not the edge calc).
         # Shadow logger captures original ask as paper entry price.
@@ -3494,7 +3523,8 @@ class MomentumSniperStrategy:
             ob_snapshot = " | ".join(f"${p:.2f}x{s:.0f}" for p, s in top_levels)
             self.log(
                 f"[FILL] {state.coin} {side.upper()} submitting FAK @ ${buy_price:.2f} "
-                f"(ask=${original_ask:.2f} +{tolerance:.2f}tol) book=[{ob_snapshot}]",
+                f"(ws_ask=${original_ask:.2f} fresh_ask=${(_fresh_ask_async or 0):.2f} +{tolerance:.2f}tol) "
+                f"ws_book=[{ob_snapshot}]",
                 "info"
             )
 
@@ -3580,24 +3610,34 @@ class MomentumSniperStrategy:
         order_latency_ms = (order_end - order_start) * 1000
         total_latency_ms = (order_end - signal_time) * 1000 if signal_time else 0
 
-        # Log rejection diagnostics — understand WHY fills fail
+        # Log rejection diagnostics — HONEST labels from fresh CLOB, not stale WS.
         if not result.success:
             max_price_tried = round(original_ask + tolerance, 2)  # FAK max (no GTC)
-            ob_now = state.manager.get_orderbook(side)
-            if ob_now and ob_now.asks:
-                current_best = ob_now.asks[0].price
-                current_depth = sum(a.size for a in ob_now.asks[:3])
-                if current_best > max_price_tried:
-                    reason = f"PRICE_MOVED (best now ${current_best:.2f}, max tried ${max_price_tried:.2f})"
-                elif current_depth < 2:
-                    reason = f"NO_DEPTH (only {current_depth:.0f} tokens in top 3 levels)"
-                else:
-                    reason = f"SCOOPED (book has ${current_best:.2f}x{current_depth:.0f} but fill failed — someone faster)"
+            _post_ask_async = None
+            _post_depth = 0.0
+            try:
+                _pfb = await asyncio.to_thread(self.bot.clob_client.get_order_book, token_id)
+                _pa = sorted(((float(a.get('price', 1)), float(a.get('size', 0))) for a in (_pfb.get('asks') or []) if float(a.get('size', 0)) > 0), key=lambda x: x[0])
+                if _pa:
+                    _post_ask_async = _pa[0][0]
+                    _post_depth = sum(s for _, s in _pa[:3])
+            except Exception:
+                pass
+            if _guard_err_async:
+                reason = f"GUARD_FAIL({_guard_err_async})"
+            elif _fresh_ask_async is not None and _fresh_ask_async > buy_price:
+                reason = f"PRICE_ABOVE_CAP (pre=${_fresh_ask_async:.2f}>bid=${buy_price:.2f}, cap=${self.config.max_entry_price:.2f})"
+            elif _post_ask_async is None:
+                reason = "BOOK_EMPTY (post-POST fresh fetch returned no asks)"
+            elif _post_ask_async > buy_price:
+                reason = f"FLIGHT_RACE (pre=${_fresh_ask_async or 0:.2f}→post=${_post_ask_async:.2f}>bid=${buy_price:.2f})"
+            elif _post_depth < 2:
+                reason = f"NO_DEPTH (post_depth={_post_depth:.0f} tokens top-3)"
             else:
-                reason = "NO_BOOK (orderbook empty)"
+                reason = f"MATCH_ENGINE_MISS (pre=${(_fresh_ask_async or 0):.2f} post=${_post_ask_async:.2f} depth={_post_depth:.0f} bid=${buy_price:.2f})"
             self.log(
-                f"[REJECT] {state.coin} {side.upper()} ALL attempts failed: {reason} "
-                f"(tried ${original_ask:.2f} to ${min(max_price_tried, self.config.max_entry_price):.2f}, "
+                f"[REJECT] {state.coin} {side.upper()} {reason} "
+                f"(ws_ask=${original_ask:.2f} tried=${min(max_price_tried, self.config.max_entry_price):.2f}, "
                 f"{order_latency_ms:.0f}ms total)",
                 "warning"
             )
