@@ -96,6 +96,16 @@ pub struct PaamConfig {
     /// "favorite is rising fast, we keep bidding higher" failure mode.
     pub chase_drift_threshold: f64,
     pub chase_window_s: f64,
+    /// Directional-edge gate. A side is only quoted if our theo predicts the
+    /// outcome by at least this many P-units MORE than our target bid pays.
+    /// edge_up   = theo_p_up - target_up_bid     (must be >= min_theo_edge)
+    /// edge_down = (1 - theo_p_up) - target_down_bid (must be >= min_theo_edge)
+    /// Without this gate the strategy bids PM-best-bid + 1c regardless of
+    /// theo agreement, which structurally loses when PM is right and theo
+    /// disagrees (observed 2026-05-15 live: paid $0.70 for UP that theo
+    /// said was worth $0.54, lost $3.50 on the fill). 0.02 = require we
+    /// believe the bid has at least 2c of fair-value edge.
+    pub min_theo_edge: f64,
 }
 
 impl PaamConfig {
@@ -121,6 +131,7 @@ impl PaamConfig {
             max_discovery_delay_s: 30.0,
             chase_drift_threshold: 0.05,
             chase_window_s: 30.0,
+            min_theo_edge: 0.02,
         }
     }
 }
@@ -337,6 +348,38 @@ impl Quoter for PaamQuoter {
             // Target = best bid + 1c.
             let target_bid = ((bid_s + self.cfg.bid_improvement) * 100.0).round() / 100.0;
 
+            // Directional-edge gate. Skip placement if our theo disagrees
+            // with this side at the target bid. P&L per fill = (outcome - target_bid)
+            // where outcome ∈ {0,1}. Expected P&L per fill = p_side - target_bid.
+            // Quoting when E[pnl] < min_theo_edge is structurally losing.
+            // Skip on missing theo too (can't reason about edge).
+            let theo_edge_ok = match ctx.theo_p_up {
+                Some(theo) => {
+                    let p_side = match side {
+                        BinarySide::Up => theo,
+                        BinarySide::Down => 1.0 - theo,
+                    };
+                    (p_side - target_bid) >= self.cfg.min_theo_edge
+                }
+                None => false,
+            };
+            if !theo_edge_ok {
+                // Cancel any existing orders on this side (theo no longer supports it).
+                for (oid, _) in qs.open_orders.iter() {
+                    out.push(QuoteIntent::Cancel {
+                        slug: m.slug.clone(),
+                        side,
+                        order_id: oid.clone(),
+                        reason: "paam_negative_theo_edge",
+                    });
+                }
+                out.push(QuoteIntent::Hold {
+                    slug: m.slug.clone(),
+                    reason: "paam_negative_theo_edge",
+                });
+                continue;
+            }
+
             // postOnly sanity: must be strictly below the ask.
             if target_bid <= 0.05 || target_bid >= ask_s {
                 for (oid, _) in qs.open_orders.iter() {
@@ -504,11 +547,25 @@ mod tests {
         elapsed: f64,
         tte: f64,
     ) -> QuoterContext<'a> {
+        // Default: theo at 0.51 — gives just barely enough edge on both
+        // sides for the typical test targets (~0.49 UP / ~0.46 DOWN). Tests
+        // that need a specific theo use `ctx_theo` below.
+        ctx_theo(m, up, down, elapsed, tte, Some(0.51))
+    }
+
+    fn ctx_theo<'a>(
+        m: &'a MarketState,
+        up: (f64, f64),
+        down: (f64, f64),
+        elapsed: f64,
+        tte: f64,
+        theo_p_up: Option<f64>,
+    ) -> QuoterContext<'a> {
         QuoterContext {
             market: m,
             up_book: up,
             down_book: down,
-            theo_p_up: None,
+            theo_p_up,
             spot: None,
             elapsed_s: elapsed,
             tte_s: tte,
@@ -673,5 +730,72 @@ mod tests {
         let has_down = places.iter().any(|i| matches!(i, QuoteIntent::Place { side, .. } if *side == BinarySide::Down));
         assert!(!has_up, "UP must skip (bid below min_bid)");
         assert!(has_down, "DOWN should place");
+    }
+
+    #[test]
+    fn theo_disagrees_with_up_side_blocks_placement() {
+        // Regression for 2026-05-15 live loss: PM bids UP at 0.69, our theo
+        // says UP=0.54. Target would be 0.70. UP-edge = 0.54 - 0.70 = -0.16.
+        // The gate must block this placement entirely on the UP side, and
+        // DOWN should still be evaluated.
+        let q = PaamQuoter::new();
+        let m = empty_market();
+        let intents = q.decide(&ctx_theo(
+            &m,
+            (0.69, 0.99),  // PM thinks UP is the favorite
+            (0.20, 0.99),
+            100.0,
+            200.0,
+            Some(0.54),    // our theo strongly disagrees
+        ));
+        let up_places: Vec<_> = intents.iter().filter(|i| matches!(i,
+            QuoteIntent::Place { side, .. } if *side == BinarySide::Up
+        )).collect();
+        assert_eq!(up_places.len(), 0,
+            "UP placement must be blocked: theo says 0.54 < target 0.70");
+        let has_neg_edge_hold = intents.iter().any(|i|
+            matches!(i, QuoteIntent::Hold { reason, .. }
+                if *reason == "paam_negative_theo_edge")
+        );
+        assert!(has_neg_edge_hold,
+            "expected paam_negative_theo_edge hold reason");
+    }
+
+    #[test]
+    fn theo_missing_blocks_all_placements() {
+        // Without theo we can't reason about edge — must not place.
+        let q = PaamQuoter::new();
+        let m = empty_market();
+        let intents = q.decide(&ctx_theo(
+            &m,
+            (0.48, 0.55),
+            (0.45, 0.52),
+            100.0,
+            200.0,
+            None,
+        ));
+        let places: Vec<_> = intents.iter().filter(|i|
+            matches!(i, QuoteIntent::Place { .. })
+        ).collect();
+        assert_eq!(places.len(), 0, "no placements when theo is None");
+    }
+
+    #[test]
+    fn theo_supports_one_side_only() {
+        // Theo strongly favors UP (0.65), targets are 0.49/0.46. UP-edge =
+        // 0.65 - 0.49 = 0.16 (PASS). DOWN-edge = 0.35 - 0.46 = -0.11 (FAIL).
+        let q = PaamQuoter::new();
+        let m = empty_market();
+        let intents = q.decide(&ctx_theo(
+            &m, (0.48, 0.55), (0.45, 0.52), 100.0, 200.0, Some(0.65)
+        ));
+        let up_places: usize = intents.iter().filter(|i|
+            matches!(i, QuoteIntent::Place { side, .. } if *side == BinarySide::Up)
+        ).count();
+        let down_places: usize = intents.iter().filter(|i|
+            matches!(i, QuoteIntent::Place { side, .. } if *side == BinarySide::Down)
+        ).count();
+        assert_eq!(up_places, 1, "UP must place (positive edge)");
+        assert_eq!(down_places, 0, "DOWN must skip (negative edge)");
     }
 }
